@@ -132,11 +132,11 @@ def root() -> dict[str, Any]:
 
 def _current_trading_mode() -> str:
     raw = (_read_env_value("TRADING_MODE") or "").strip().lower()
-    if raw in {"paper", "sim", "live"}:
+    if raw in {"sim", "live"}:
         return raw
     # Backward-compat fallback
     paper = (_read_env_value("PAPER_MODE") or "true").lower() == "true"
-    return "paper" if paper else "live"
+    return "sim" if paper else "live"
 
 
 def _current_paper_mode() -> bool:
@@ -261,13 +261,13 @@ def set_mode(req: ModeRequest) -> dict[str, Any]:
 
 @api.post("/bot/trading_mode")
 def set_trading_mode(req: TradingModeRequest) -> dict[str, Any]:
-    """Set one of: paper | sim | live. Caller should restart the bot."""
+    """Set one of: sim | live. Caller should restart the bot."""
     mode = req.mode.lower().strip()
-    if mode not in {"paper", "sim", "live"}:
+    if mode not in {"sim", "live"}:
         raise HTTPException(status_code=400, detail=f"unsupported mode: {mode}")
     _update_env_value("TRADING_MODE", mode)
     # Keep legacy flag aligned for any downstream callers
-    _update_env_value("PAPER_MODE", "true" if mode == "paper" else "false")
+    _update_env_value("PAPER_MODE", "true" if mode == "sim" else "false")
     return {
         "trading_mode": mode,
         "note": "Restart the bot for the change to take effect.",

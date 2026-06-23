@@ -219,9 +219,8 @@ class _HybridSmartApiClient(_LiveSmartApiClient):
 def _select_client_cls():
     if config.TRADING_MODE == "live":
         return _LiveSmartApiClient
-    if config.TRADING_MODE == "sim":
-        return _HybridSmartApiClient
-    return _PaperSmartApiClient
+    # default for "sim" (or any unrecognized value)
+    return _HybridSmartApiClient
 
 
 SmartApiClient = _select_client_cls()

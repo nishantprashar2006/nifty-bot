@@ -7,13 +7,12 @@ import {
 import {
   ActivityIcon, PowerIcon, PauseIcon, RotateCwIcon, ShieldAlertIcon,
   TrendingUpIcon, TrendingDownIcon, CircleDotIcon, DatabaseIcon,
-  TargetIcon, WalletIcon, PercentIcon, BriefcaseIcon, PencilIcon,
+  TargetIcon, WalletIcon, PercentIcon, BriefcaseIcon,
   Trash2Icon,
 } from "lucide-react";
 import { Card } from "./components/ui/card";
 import { Button } from "./components/ui/button";
 import { Badge } from "./components/ui/badge";
-import { Input } from "./components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import {
@@ -43,6 +42,10 @@ const SUP_COLORS = {
   UNKNOWN: "text-zinc-500",
 };
 
+// All dates/times in this app are displayed in IST regardless of the
+// viewer's timezone (VPN, browser locale). We force `timeZone: Asia/Kolkata`.
+const IST_TZ = "Asia/Kolkata";
+
 function fmtINR(n) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
   const sign = n < 0 ? "-" : "";
@@ -53,7 +56,9 @@ function fmtINR(n) {
 function fmtTime(iso) {
   if (!iso) return "—";
   try {
-    return new Date(iso).toLocaleTimeString("en-IN", { hour12: false });
+    return new Intl.DateTimeFormat("en-IN", {
+      timeZone: IST_TZ, hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    }).format(new Date(iso));
   } catch {
     return iso;
   }
@@ -62,7 +67,21 @@ function fmtTime(iso) {
 function fmtDateTime(iso) {
   if (!iso) return "—";
   try {
-    return new Date(iso).toLocaleString("en-IN", { hour12: false });
+    return new Intl.DateTimeFormat("en-IN", {
+      timeZone: IST_TZ, year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    }).format(new Date(iso)) + " IST";
+  } catch {
+    return iso;
+  }
+}
+
+function fmtDateShort(iso) {
+  if (!iso) return "—";
+  try {
+    return new Intl.DateTimeFormat("en-IN", {
+      timeZone: IST_TZ, day: "2-digit", month: "short",
+    }).format(new Date(iso));
   } catch {
     return iso;
   }
@@ -195,23 +214,7 @@ function App() {
     }
   };
 
-  const saveCapital = async () => {
-    const v = Number(capInput);
-    if (!v || v <= 0) {
-      toast.error("Capital must be a positive number");
-      return;
-    }
-    try {
-      await axios.post(`${API}/bot/paper_capital`, { capital: v });
-      toast.success(`Paper capital set to ${fmtINR(v)}`, {
-        description: "Restart the bot to apply.",
-      });
-      setEditingCap(false);
-      await fetchAll();
-    } catch (err) {
-      toast.error(`Failed: ${err?.response?.data?.detail || err.message}`);
-    }
-  };
+  const saveCapital = null; void saveCapital;  // removed: no PAPER mode
 
   const resetHistory = async () => {
     try {
@@ -257,10 +260,9 @@ function App() {
           </div>
 
           <div className="flex items-center gap-4">
-            {/* Trading mode — 3-way segmented control */}
+            {/* Trading mode — 2-way segmented control (SIM ↔ LIVE) */}
             <div className="flex items-center border border-zinc-800 bg-zinc-900/60 rounded-none divide-x divide-zinc-800" data-testid="mode-control">
               {[
-                { id: "paper", label: "PAPER", active: "bg-amber-600/80 text-zinc-950" },
                 { id: "sim",   label: "SIM",   active: "bg-blue-600/80 text-zinc-950" },
                 { id: "live",  label: "LIVE",  active: "bg-red-600/80 text-zinc-50" },
               ].map((m) => {
@@ -271,7 +273,7 @@ function App() {
                     data-testid={`mode-${m.id}`}
                     disabled={busy || isActive}
                     onClick={() => requestModeChange(m.id)}
-                    className={`px-3 py-1.5 text-xs font-mono font-semibold tracking-wider transition-colors disabled:cursor-default ${
+                    className={`px-4 py-1.5 text-xs font-mono font-semibold tracking-wider transition-colors disabled:cursor-default ${
                       isActive ? m.active : "text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60"
                     }`}
                   >
@@ -342,61 +344,7 @@ function App() {
                 </div>
               </div>
 
-              {/* Paper-mode editable capital */}
-              {status?.trading_mode === "paper" && (
-                <div className="mt-6 pt-5 border-t border-zinc-800 flex items-center gap-3 flex-wrap">
-                  <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-mono">Paper starting capital</div>
-                  {!editingCap ? (
-                    <>
-                      <span data-testid="paper-capital-value" className="font-mono text-amber-300 text-sm">
-                        {fmtINR(status?.paper_starting_capital)}
-                      </span>
-                      <Button
-                        data-testid="btn-edit-capital"
-                        size="sm"
-                        variant="outline"
-                        onClick={() => {
-                          setCapInput(String(status?.paper_starting_capital ?? 200000));
-                          setEditingCap(true);
-                        }}
-                        className="h-7 rounded-none border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-200 font-mono"
-                      >
-                        <PencilIcon className="h-3 w-3 mr-1.5" /> Edit
-                      </Button>
-                    </>
-                  ) : (
-                    <>
-                      <Input
-                        data-testid="input-capital"
-                        type="number"
-                        value={capInput}
-                        onChange={(e) => setCapInput(e.target.value)}
-                        className="h-7 w-36 rounded-none border-zinc-700 bg-zinc-900 text-amber-200 font-mono focus-visible:ring-amber-600"
-                        placeholder="200000"
-                      />
-                      <Button
-                        data-testid="btn-save-capital"
-                        size="sm"
-                        onClick={saveCapital}
-                        className="h-7 rounded-none bg-amber-600 hover:bg-amber-500 text-zinc-950 font-mono"
-                      >
-                        Save
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => setEditingCap(false)}
-                        className="h-7 rounded-none border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 font-mono"
-                      >
-                        Cancel
-                      </Button>
-                    </>
-                  )}
-                  <span className="text-[10px] font-mono text-zinc-600">
-                    (restart the bot to apply)
-                  </span>
-                </div>
-              )}
+              {/* Paper-mode editable capital removed — SIM uses real Angel cash */}
             </Card>
           </motion.div>
 
@@ -434,10 +382,6 @@ function App() {
                 <div className="flex items-center gap-2 text-zinc-500">
                   <ShieldAlertIcon className="h-3.5 w-3.5" /> Loading mode…
                 </div>
-              ) : status.trading_mode === "paper" ? (
-                <div className="flex items-center gap-2 text-amber-400">
-                  <ShieldAlertIcon className="h-3.5 w-3.5" /> PAPER — no Angel connection, simulated everything
-                </div>
               ) : status.trading_mode === "sim" ? (
                 <div className="flex items-center gap-2 text-blue-400">
                   <ShieldAlertIcon className="h-3.5 w-3.5" /> SIM — real Angel data, simulated order fills (safe)
@@ -461,26 +405,53 @@ function App() {
           </Card>
         </section>
 
-        {/* Current position banner (if any) */}
-        {openPos && (
-          <Card
-            data-testid="open-position-card"
-            className="border-emerald-700/50 bg-emerald-950/20 p-5 rounded-none flex items-center justify-between flex-wrap gap-4"
-          >
-            <div className="flex items-center gap-4">
-              <BriefcaseIcon className="h-5 w-5 text-emerald-400" />
-              <div>
-                <div className="text-[10px] uppercase tracking-[0.2em] text-emerald-400 font-mono">Open position</div>
-                <div className="font-mono text-zinc-100">
-                  {openPos.direction} · qty {openPos.qty} · entry {fmtINR(openPos.entry_price)}
-                </div>
+        {/* Position card — always visible */}
+        <Card
+          data-testid="position-card"
+          className={`p-5 rounded-none flex items-center justify-between flex-wrap gap-4 ${
+            openPos ? "border-emerald-700/50 bg-emerald-950/20" : "border-zinc-800 bg-zinc-950/70"
+          }`}
+        >
+          <div className="flex items-center gap-4">
+            <BriefcaseIcon className={`h-5 w-5 ${openPos ? "text-emerald-400" : "text-zinc-600"}`} />
+            <div>
+              <div className={`text-[10px] uppercase tracking-[0.2em] font-mono ${
+                openPos ? "text-emerald-400" : "text-zinc-500"
+              }`}>
+                {openPos ? "Open position" : "No open position"}
               </div>
+              {openPos ? (
+                <div className="font-mono text-zinc-100 mt-1">
+                  <span className={openPos.direction === "CALL" ? "text-emerald-300" : "text-red-300"}>
+                    {openPos.direction}
+                  </span>
+                  <span className="text-zinc-500"> · </span>
+                  qty <span className="text-zinc-200">{openPos.qty}</span>
+                  <span className="text-zinc-500"> · </span>
+                  entry <span className="text-zinc-200">{fmtINR(openPos.entry_price)}</span>
+                </div>
+              ) : (
+                <div className="font-mono text-xs text-zinc-500 mt-1">
+                  bot will fire one when entry + confirmation gates pass
+                </div>
+              )}
             </div>
-            <div className="text-xs font-mono text-zinc-500">
-              opened {fmtDateTime(openPos.entry_time)}
+          </div>
+          <div className="text-right">
+            <div className="text-[10px] uppercase tracking-[0.2em] font-mono text-zinc-500">Closed trades</div>
+            <div className="font-mono text-zinc-200 mt-1">
+              <span data-testid="closed-trades-count">{closedTrades}</span>
+              <span className="text-zinc-500"> · today </span>
+              <span className="text-zinc-200">{status?.trades_today ?? 0}</span>
+              <span className="text-zinc-500">/4</span>
             </div>
-          </Card>
-        )}
+            {openPos && (
+              <div className="text-[10px] font-mono text-zinc-500 mt-1">
+                opened {fmtDateTime(openPos.entry_time)}
+              </div>
+            )}
+          </div>
+        </Card>
 
         {/* Stats row */}
         <section className="grid grid-cols-2 lg:grid-cols-4 gap-4">
@@ -541,14 +512,14 @@ function App() {
                       dataKey="t"
                       type="number"
                       domain={["dataMin", "dataMax"]}
-                      tickFormatter={(v) => new Date(v).toLocaleDateString("en-IN", { day: "2-digit", month: "short" })}
+                      tickFormatter={(v) => fmtDateShort(v)}
                       stroke="#52525b"
                       style={{ fontSize: 11, fontFamily: "monospace" }}
                     />
                     <YAxis stroke="#52525b" style={{ fontSize: 11, fontFamily: "monospace" }} />
                     <Tooltip
                       contentStyle={{ background: "#0a0a0a", border: "1px solid #27272a", fontFamily: "monospace", fontSize: 12 }}
-                      labelFormatter={(v) => new Date(v).toLocaleString("en-IN")}
+                      labelFormatter={(v) => fmtDateTime(v)}
                       formatter={(v) => fmtINR(v)}
                     />
                     <Line type="monotone" dataKey="peak" stroke="#71717a" strokeWidth={1.5} dot={false} strokeDasharray="4 4" />

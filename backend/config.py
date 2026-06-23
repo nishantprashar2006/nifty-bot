@@ -133,22 +133,21 @@ class ExitReason(Enum):
 # ────────────────────────────────────────────────────────────────────
 # 11. Environment-driven toggles
 # ────────────────────────────────────────────────────────────────────
-# Three trading modes:
-#   • paper — no Angel connection, in-memory simulated everything
+# Two trading modes:
 #   • sim   — REAL Angel websocket data + REAL cash read, SIMULATED order fills
 #   • live  — real everything (real orders fire to NSE/NFO)
 _raw_mode = os.getenv("TRADING_MODE", "").strip().lower()
-if _raw_mode in {"paper", "sim", "live"}:
+if _raw_mode in {"sim", "live"}:
     TRADING_MODE: str = _raw_mode
 else:
-    # Backward-compat: derive from PAPER_MODE flag
-    TRADING_MODE = "paper" if os.getenv("PAPER_MODE", "true").lower() == "true" else "live"
+    # Backward-compat: derive from legacy PAPER_MODE flag; default to sim
+    TRADING_MODE = "sim" if os.getenv("PAPER_MODE", "true").lower() == "true" else "live"
 
 # Convenience flags used across the codebase
-USE_LIVE_BROKER: bool = TRADING_MODE in {"sim", "live"}   # real Angel REST + WS login
-USE_LIVE_DATA: bool = TRADING_MODE in {"sim", "live"}     # subscribe to real ticks
-SIMULATE_ORDERS: bool = TRADING_MODE in {"paper", "sim"}  # synthesise fills locally
-PAPER_MODE: bool = TRADING_MODE == "paper"                # kept for legacy callers
+USE_LIVE_BROKER: bool = True                              # both modes use Angel
+USE_LIVE_DATA: bool = True                                # both modes need real ticks
+SIMULATE_ORDERS: bool = TRADING_MODE == "sim"             # sim → fake fills
+PAPER_MODE: bool = TRADING_MODE == "sim"                  # legacy alias
 
 LOG_LEVEL: str = os.getenv("BOT_LOG_LEVEL", "INFO").upper()
 DB_PATH: str = os.getenv("BOT_DB_PATH", "/app/backend/data_store/nifty_bot.db")
