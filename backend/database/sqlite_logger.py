@@ -76,6 +76,17 @@ class SqliteLogger:
         """,
         "CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_curve(timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_equity_mode ON equity_curve(trading_mode)",
+        """
+        CREATE TABLE IF NOT EXISTS commands (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT NOT NULL,
+            action      TEXT NOT NULL,
+            payload     TEXT NOT NULL DEFAULT '{}',
+            status      TEXT NOT NULL DEFAULT 'pending',
+            result      TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status)",
     ]
 
     def __init__(self, db_path: str) -> None:
@@ -95,11 +106,15 @@ class SqliteLogger:
             cur = self._conn.cursor()
             for stmt in self._SCHEMA:
                 cur.execute(stmt)
-            # Idempotent column add for legacy DBs
-            try:
-                cur.execute("ALTER TABLE equity_curve ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'paper'")
-            except sqlite3.OperationalError:
-                pass  # column already exists
+            # Idempotent column adds for legacy DBs
+            for ddl in (
+                "ALTER TABLE equity_curve ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'paper'",
+                "ALTER TABLE trades ADD COLUMN source TEXT NOT NULL DEFAULT 'auto'",
+            ):
+                try:
+                    cur.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
             cur.close()
 
     @contextmanager
@@ -144,12 +159,13 @@ class SqliteLogger:
         qty: int,
         entry_price: float,
         entry_time: Optional[str] = None,
+        source: str = "auto",
     ) -> None:
         with self._cursor() as cur:
             cur.execute(
                 "INSERT INTO trades(trade_id, entry_time, direction, qty, "
-                "entry_price) VALUES (?, ?, ?, ?, ?)",
-                (trade_id, entry_time or _utc_iso(), direction, qty, entry_price),
+                "entry_price, source) VALUES (?, ?, ?, ?, ?, ?)",
+                (trade_id, entry_time or _utc_iso(), direction, qty, entry_price, source),
             )
 
     def update_trade_exit(
@@ -239,6 +255,42 @@ class SqliteLogger:
                 self._conn.close()
             except sqlite3.Error:
                 pass
+
+    # ───────────────────────────────────────────────────────── commands queue
+    def enqueue_command(self, action: str, payload: str = "{}") -> int:
+        """Insert a pending command for the bot to pick up. Returns row id."""
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO commands(timestamp, action, payload, status) "
+                "VALUES (?, ?, ?, 'pending')",
+                (_utc_iso(), action, payload),
+            )
+            return int(cur.lastrowid)
+
+    def fetch_pending_command(self) -> Optional[tuple[int, str, str]]:
+        """Atomically grab one pending command and mark it 'running'."""
+        with self._cursor() as cur:
+            row = cur.execute(
+                "SELECT id, action, payload FROM commands WHERE status='pending' "
+                "ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+            if not row:
+                return None
+            cmd_id, action, payload = row
+            cur.execute(
+                "UPDATE commands SET status='running' WHERE id=? AND status='pending'",
+                (cmd_id,),
+            )
+            if cur.rowcount == 0:
+                return None  # raced
+            return cmd_id, action, payload
+
+    def complete_command(self, cmd_id: int, ok: bool, result: str = "") -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE commands SET status=?, result=? WHERE id=?",
+                ("done" if ok else "failed", result, cmd_id),
+            )
 
 
 _singleton: Optional[SqliteLogger] = None

@@ -58,14 +58,22 @@ def _ensure_tables() -> None:
             peak_equity REAL NOT NULL, drawdown_pct REAL NOT NULL,
             effective_lots INTEGER NOT NULL,
             trading_mode TEXT NOT NULL DEFAULT 'paper')""",
+        """CREATE TABLE IF NOT EXISTS commands (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
+            action TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending', result TEXT)""",
     ]
     with _conn() as c:
         for s in schema:
             c.execute(s)
-        try:
-            c.execute("ALTER TABLE equity_curve ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'paper'")
-        except sqlite3.OperationalError:
-            pass
+        for ddl in (
+            "ALTER TABLE equity_curve ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'paper'",
+            "ALTER TABLE trades ADD COLUMN source TEXT NOT NULL DEFAULT 'auto'",
+        ):
+            try:
+                c.execute(ddl)
+            except sqlite3.OperationalError:
+                pass
 
 
 _ensure_tables()
@@ -81,11 +89,15 @@ class ModeRequest(BaseModel):
 
 
 class TradingModeRequest(BaseModel):
-    mode: str   # "paper" | "sim" | "live"
+    mode: str   # "sim" | "live"
 
 
 class PaperCapitalRequest(BaseModel):
     capital: float
+
+
+class ManualEntryRequest(BaseModel):
+    direction: str   # "CALL" | "PUT"
 
 
 # ──────────────────────────────────────────────────── .env helpers
@@ -244,6 +256,67 @@ def bot_stats() -> dict[str, Any]:
         "worst_trade": float(row["worst_trade"] or 0.0),
         "open_position": dict(open_row) if open_row else None,
     }
+
+
+@api.post("/bot/manual_entry")
+def manual_entry(req: ManualEntryRequest) -> dict[str, Any]:
+    """Queue a discretionary CALL or PUT entry. The bot picks this up on its
+    next loop tick (≤ 0.5 s) and runs it through the same FSM rails as auto
+    entries: sizing, premium-spike guard, ATR-based SL/TP, OCO target/stop,
+    ≥5 pt trailing, 30-min hold limit, 15:10 IST square-off, and post-exit
+    cooldown."""
+    direction = req.direction.upper().strip()
+    if direction not in {"CALL", "PUT"}:
+        raise HTTPException(status_code=400, detail="direction must be CALL or PUT")
+    with _conn() as c:
+        open_row = c.execute(
+            "SELECT trade_id FROM trades WHERE exit_time IS NULL LIMIT 1"
+        ).fetchone()
+    if open_row:
+        raise HTTPException(status_code=409, detail="another position is already open")
+    try:
+        sup = subprocess.run(
+            ["supervisorctl", "status", "nifty_bot"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:
+        sup = ""
+    if "RUNNING" not in sup:
+        raise HTTPException(status_code=409, detail="bot is not running — start it first")
+
+    import json
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO commands(timestamp, action, payload, status) "
+            "VALUES (?, 'manual_entry', ?, 'pending')",
+            (datetime.now(timezone.utc).isoformat(), json.dumps({"direction": direction})),
+        )
+        cmd_id = cur.lastrowid
+    return {"queued": True, "cmd_id": cmd_id, "direction": direction}
+
+
+@api.get("/bot/commands")
+def list_commands(limit: int = 10) -> list[dict[str, Any]]:
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, timestamp, action, payload, status, result FROM commands "
+            "ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@api.post("/bot/panic_exit")
+def panic_exit() -> dict[str, Any]:
+    """Force-close any open position via the bot's FORCED_EXIT path."""
+    import json
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO commands(timestamp, action, payload, status) "
+            "VALUES (?, 'panic_exit', ?, 'pending')",
+            (datetime.now(timezone.utc).isoformat(), json.dumps({})),
+        )
+        return {"queued": True, "cmd_id": cur.lastrowid}
+
 
 
 @api.post("/bot/mode")

@@ -95,6 +95,9 @@ class NiftyOptionsBot:
 
         # entry-bar bookkeeping for confirmation
         self._pending_signal: Optional[dict] = None  # {'direction', 'bar_ts'}
+        # Source ('auto' | 'manual') of the currently pending entry so the trade
+        # record can be tagged on fill.
+        self._pending_source: Optional[str] = None
 
     # ────────────────────────────────────────────────────────── lifecycle
     def start(self) -> None:
@@ -192,6 +195,75 @@ class NiftyOptionsBot:
         except Exception:
             logger.exception("ATM contract resolution failed.")
 
+    # ────────────────────────────────────────────────────── manual entries
+    def _handle_manual_entry(self, direction: config.Direction) -> tuple[bool, str]:
+        """Fire a discretionary entry. Enforces the same single-position lock,
+        sizing, ATR-based SL/TP, OCO, trailing, and cooldown as auto entries."""
+        # Hard guards — same single-position lock used by auto entries
+        if self.state is config.State.SHUTDOWN:
+            return False, "bot is in SHUTDOWN"
+        if self.positions.has_open_position or self.positions.has_pending_entry:
+            return False, "another position is already open/pending"
+        if self.positions.in_cooldown(direction):
+            return False, f"{direction.value} is in directional cooldown after a recent stop"
+        breach = self._trip_circuit_breakers()
+        if breach:
+            return False, f"circuit breaker: {breach}"
+        # Need an ATM contract picked
+        contract = self._ce if direction is config.Direction.LONG else self._pe
+        if contract is None:
+            self._refresh_atm_contracts()
+            contract = self._ce if direction is config.Direction.LONG else self._pe
+        if contract is None:
+            return False, "ATM contract not yet resolved"
+        # ATR for SL/TP — fall back to 10 premium points if the option series
+        # is too fresh to compute a real ATR(14).
+        option_bars = self.candles.series(contract.token, 3).closed_bars()
+        snap = self.indicators.build_snapshot(
+            self.candles.series(config.NIFTY_SPOT_TOKEN, 3).closed_bars(),
+            self.candles.series(config.NIFTY_SPOT_TOKEN, 15).closed_bars(),
+            option_bars,
+        )
+        atr_pts = snap.atr_3m or 10.0
+        sl_pts, tp_pts = self.sizer.stops_from_atr(atr_pts)
+        ok = self._place_entry(direction, contract, sl_pts, tp_pts, source="manual")
+        if ok:
+            return True, f"manual {direction.value} placed with ATR={atr_pts:.2f}"
+        return False, "broker rejected the entry"
+
+    def _drain_command_queue(self) -> None:
+        """Pull one pending command per loop tick and execute it. Manual entries
+        share the same FSM rails, so the bot stays at the strict single-position lock."""
+        cmd = self.db.fetch_pending_command()
+        if not cmd:
+            return
+        cmd_id, action, payload = cmd
+        try:
+            import json
+            data = json.loads(payload) if payload else {}
+            if action == "manual_entry":
+                d = (data.get("direction") or "").upper()
+                direction = config.Direction.LONG if d == "CALL" else (
+                    config.Direction.SHORT if d == "PUT" else None
+                )
+                if direction is None:
+                    self.db.complete_command(cmd_id, False, "unknown direction")
+                    return
+                ok, msg = self._handle_manual_entry(direction)
+                self.db.complete_command(cmd_id, ok, msg)
+                logger.info("Manual command #%d → %s (%s)", cmd_id, "OK" if ok else "FAIL", msg)
+            elif action == "panic_exit":
+                if self.positions.has_open_position:
+                    self._transition(config.State.FORCED_EXIT)
+                    self.db.complete_command(cmd_id, True, "FORCED_EXIT triggered")
+                else:
+                    self.db.complete_command(cmd_id, False, "no open position to exit")
+            else:
+                self.db.complete_command(cmd_id, False, f"unknown action {action}")
+        except Exception as exc:
+            logger.exception("Command #%d failed", cmd_id)
+            self.db.complete_command(cmd_id, False, str(exc))
+
     def _shutdown(self) -> None:
         try:
             if self.ws is not None:
@@ -285,8 +357,11 @@ class NiftyOptionsBot:
                 self._transition(config.State.FORCED_EXIT)
                 return
             pos = self.positions.promote_to_open(ev.fill_price)
+            source = self._pending_source if self._pending_source else "auto"
+            self._pending_source = None
             self.db.insert_trade_entry(
-                pos.trade_id, pos.direction.value, pos.qty, pos.entry_price
+                pos.trade_id, pos.direction.value, pos.qty, pos.entry_price,
+                source=source,
             )
             self._place_protective_legs(pos.target_price, pos.stop_price)
             self._transition(config.State.POSITION_OPEN)
@@ -299,7 +374,8 @@ class NiftyOptionsBot:
 
     # ────────────────────────────────────────────────────────── order flow
     def _place_entry(
-        self, direction: config.Direction, contract: OptionContract, sl_pts: float, tp_pts: float
+        self, direction: config.Direction, contract: OptionContract, sl_pts: float, tp_pts: float,
+        source: str = "auto",
     ) -> bool:
         quote = self._last_option_quote.get(contract.token)
         if not quote and not config.SIMULATE_ORDERS:
@@ -350,10 +426,11 @@ class NiftyOptionsBot:
                 stop_price=stop_px,
             )
         )
+        self._pending_source = source
         self._transition(config.State.ORDER_PENDING)
         logger.info(
-            "Entry sent  %s  qty=%d  lim=₹%.2f  tgt=₹%.2f  sl=₹%.2f  order=%s",
-            contract.symbol, qty, limit_px, target_px, stop_px, order_id,
+            "Entry sent [%s]  %s  qty=%d  lim=₹%.2f  tgt=₹%.2f  sl=₹%.2f  order=%s",
+            source.upper(), contract.symbol, qty, limit_px, target_px, stop_px, order_id,
         )
 
         # PAPER / SIM mode: synthesise an immediate fill so the FSM advances
@@ -506,7 +583,7 @@ class NiftyOptionsBot:
 
         atr_pts = snap.atr_3m or 5.0  # graceful default in early session
         sl_pts, tp_pts = self.sizer.stops_from_atr(atr_pts)
-        ok = self._place_entry(sig["direction"], contract, sl_pts, tp_pts)
+        ok = self._place_entry(sig["direction"], contract, sl_pts, tp_pts, source="auto")
         self._pending_signal = None
         if not ok:
             self._transition(config.State.IDLE)
@@ -610,6 +687,10 @@ class NiftyOptionsBot:
         while not self._stop.is_set():
             try:
                 self.broker.validate_session()
+
+                # Pull at most one pending command per tick (manual entries,
+                # panic exits, etc.) before stepping the FSM.
+                self._drain_command_queue()
 
                 breach = self._trip_circuit_breakers()
                 if breach and self.state is not config.State.SHUTDOWN:

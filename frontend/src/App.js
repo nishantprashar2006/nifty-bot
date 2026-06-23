@@ -8,7 +8,7 @@ import {
   ActivityIcon, PowerIcon, PauseIcon, RotateCwIcon, ShieldAlertIcon,
   TrendingUpIcon, TrendingDownIcon, CircleDotIcon, DatabaseIcon,
   TargetIcon, WalletIcon, PercentIcon, BriefcaseIcon,
-  Trash2Icon,
+  Trash2Icon, ArrowUpRightIcon, ArrowDownRightIcon, XOctagonIcon,
 } from "lucide-react";
 import { Card } from "./components/ui/card";
 import { Button } from "./components/ui/button";
@@ -127,6 +127,9 @@ function App() {
   // Reset confirmation
   const [confirmReset, setConfirmReset] = useState(false);
 
+  // Manual entry confirmation
+  const [confirmManual, setConfirmManual] = useState(null);  // null | "CALL" | "PUT"
+
   const fetchAll = useCallback(async () => {
     try {
       const [s, st, t, e, tr] = await Promise.all([
@@ -224,6 +227,39 @@ function App() {
       await fetchAll();
     } catch (err) {
       toast.error(`Reset failed: ${err?.response?.data?.detail || err.message}`);
+    }
+  };
+
+  const placeManualEntry = async (direction) => {
+    setConfirmManual(null);
+    if (busy) return;
+    setBusy(true);
+    try {
+      const { data } = await axios.post(`${API}/bot/manual_entry`, { direction });
+      toast.success(`${direction} entry queued (#${data.cmd_id})`, {
+        description: "Bot will place it on its next tick — same SL/TP/Trail rails as auto.",
+      });
+      await fetchAll();
+    } catch (err) {
+      toast.error(`Manual entry failed`, {
+        description: err?.response?.data?.detail || err.message,
+      });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const panicExit = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await axios.post(`${API}/bot/panic_exit`);
+      toast.success("Panic exit queued — flattening to cash");
+      await fetchAll();
+    } catch (err) {
+      toast.error(`Panic exit failed: ${err?.response?.data?.detail || err.message}`);
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -412,9 +448,9 @@ function App() {
             openPos ? "border-emerald-700/50 bg-emerald-950/20" : "border-zinc-800 bg-zinc-950/70"
           }`}
         >
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-4 flex-1 min-w-0">
             <BriefcaseIcon className={`h-5 w-5 ${openPos ? "text-emerald-400" : "text-zinc-600"}`} />
-            <div>
+            <div className="min-w-0">
               <div className={`text-[10px] uppercase tracking-[0.2em] font-mono ${
                 openPos ? "text-emerald-400" : "text-zinc-500"
               }`}>
@@ -429,27 +465,65 @@ function App() {
                   qty <span className="text-zinc-200">{openPos.qty}</span>
                   <span className="text-zinc-500"> · </span>
                   entry <span className="text-zinc-200">{fmtINR(openPos.entry_price)}</span>
+                  {openPos.source === "manual" && (
+                    <span className="ml-2 px-1.5 py-0.5 text-[10px] border border-amber-700 text-amber-300 font-mono">
+                      MANUAL
+                    </span>
+                  )}
                 </div>
               ) : (
                 <div className="font-mono text-xs text-zinc-500 mt-1">
-                  bot will fire one when entry + confirmation gates pass
+                  bot will fire one automatically — or use the manual entry buttons →
                 </div>
               )}
             </div>
           </div>
-          <div className="text-right">
-            <div className="text-[10px] uppercase tracking-[0.2em] font-mono text-zinc-500">Closed trades</div>
-            <div className="font-mono text-zinc-200 mt-1">
-              <span data-testid="closed-trades-count">{closedTrades}</span>
-              <span className="text-zinc-500"> · today </span>
-              <span className="text-zinc-200">{status?.trades_today ?? 0}</span>
-              <span className="text-zinc-500">/4</span>
-            </div>
-            {openPos && (
-              <div className="text-[10px] font-mono text-zinc-500 mt-1">
-                opened {fmtDateTime(openPos.entry_time)}
-              </div>
+
+          {/* Right side: manual entry / panic / counters */}
+          <div className="flex items-center gap-3 flex-wrap">
+            {openPos ? (
+              <Button
+                data-testid="btn-panic-exit"
+                onClick={panicExit}
+                disabled={busy}
+                className="rounded-none bg-red-600 hover:bg-red-500 text-zinc-50 font-mono font-semibold disabled:opacity-40"
+              >
+                <XOctagonIcon className="h-4 w-4 mr-2" /> Panic Exit
+              </Button>
+            ) : (
+              <>
+                <Button
+                  data-testid="btn-buy-call"
+                  onClick={() => setConfirmManual("CALL")}
+                  disabled={busy || sup !== "RUNNING"}
+                  className="rounded-none bg-emerald-600 hover:bg-emerald-500 text-zinc-950 font-mono font-semibold disabled:opacity-40"
+                >
+                  <ArrowUpRightIcon className="h-4 w-4 mr-2" /> Buy Call
+                </Button>
+                <Button
+                  data-testid="btn-buy-put"
+                  onClick={() => setConfirmManual("PUT")}
+                  disabled={busy || sup !== "RUNNING"}
+                  className="rounded-none bg-red-600 hover:bg-red-500 text-zinc-50 font-mono font-semibold disabled:opacity-40"
+                >
+                  <ArrowDownRightIcon className="h-4 w-4 mr-2" /> Buy Put
+                </Button>
+              </>
             )}
+            <div className="text-right border-l border-zinc-800 pl-3">
+              <div className="text-[10px] uppercase tracking-[0.2em] font-mono text-zinc-500">Closed trades</div>
+              <div className="font-mono text-zinc-200 mt-1">
+                <span data-testid="closed-trades-count">{closedTrades}</span>
+                <span className="text-zinc-500"> · today </span>
+                <span className="text-zinc-200">{status?.trades_today ?? 0}</span>
+                <span className="text-zinc-500">/4</span>
+              </div>
+              {openPos && (
+                <div className="text-[10px] font-mono text-zinc-500 mt-1">
+                  opened {fmtDateTime(openPos.entry_time)}
+                </div>
+              )}
+            </div>
           </div>
         </Card>
 
@@ -548,6 +622,7 @@ function App() {
                     <TableHeader>
                       <TableRow className="border-zinc-800 hover:bg-transparent">
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Trade ID</TableHead>
+                        <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Src</TableHead>
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Dir</TableHead>
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Qty</TableHead>
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Entry</TableHead>
@@ -561,6 +636,15 @@ function App() {
                       {trades.map((t) => (
                         <TableRow key={t.trade_id} className="border-zinc-800 hover:bg-zinc-900/40 font-mono text-sm">
                           <TableCell className="text-zinc-400">{t.trade_id}</TableCell>
+                          <TableCell>
+                            <span className={`px-1.5 py-0.5 text-[10px] border ${
+                              t.source === "manual"
+                                ? "border-amber-700 text-amber-300"
+                                : "border-zinc-700 text-zinc-400"
+                            }`}>
+                              {(t.source || "auto").toUpperCase()}
+                            </span>
+                          </TableCell>
                           <TableCell>
                             <span className={t.direction === "CALL" ? "text-emerald-300" : "text-red-300"}>
                               {t.direction}
@@ -674,6 +758,60 @@ function App() {
               className="rounded-none bg-amber-600 hover:bg-amber-500 text-zinc-950 font-mono font-semibold"
             >
               Yes, wipe
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Manual entry confirmation dialog */}
+      <AlertDialog open={confirmManual !== null} onOpenChange={(o) => !o && setConfirmManual(null)}>
+        <AlertDialogContent className={`bg-zinc-950 rounded-none font-mono ${
+          confirmManual === "CALL" ? "border-emerald-800" : "border-red-800"
+        }`}>
+          <AlertDialogHeader>
+            <AlertDialogTitle className={`flex items-center gap-2 ${
+              confirmManual === "CALL" ? "text-emerald-300" : "text-red-300"
+            }`}>
+              {confirmManual === "CALL"
+                ? <><ArrowUpRightIcon className="h-5 w-5" /> Buy Call (manual entry)</>
+                : <><ArrowDownRightIcon className="h-5 w-5" /> Buy Put (manual entry)</>
+              }
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-zinc-400 text-sm leading-relaxed">
+              The bot will buy the <span className="text-amber-300">ATM weekly {confirmManual}</span> contract immediately.
+              {status?.trading_mode === "live"
+                ? <span className="block mt-1 text-red-300">Mode is LIVE — this places a REAL order on NSE/NFO.</span>
+                : <span className="block mt-1 text-blue-300">Mode is SIM — order is simulated.</span>
+              }
+              <ul className="list-disc list-inside mt-3 space-y-1 text-zinc-300">
+                <li>same sizing (drawdown-aware + premium-spike guard)</li>
+                <li>same SL/TP from option ATR (1× / 2×)</li>
+                <li>same ≥5pt trailing stop</li>
+                <li>same 30-min max hold + 15:10 IST square-off</li>
+                <li>auto-cooldown after exit; counts toward the 4-trade daily cap</li>
+              </ul>
+              <span className="block mt-3 text-zinc-500">
+                Single-position lock applies — auto entries are blocked until this one exits.
+              </span>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel
+              data-testid="cancel-manual"
+              className="rounded-none border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-200 font-mono"
+            >
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              data-testid="confirm-manual"
+              onClick={() => placeManualEntry(confirmManual)}
+              className={`rounded-none font-mono font-semibold text-zinc-950 ${
+                confirmManual === "CALL"
+                  ? "bg-emerald-600 hover:bg-emerald-500"
+                  : "bg-red-600 hover:bg-red-500"
+              }`}
+            >
+              Confirm {confirmManual}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
