@@ -60,13 +60,24 @@ class WebSocketManager:
         self,
         feed_token: str,
         client_id: str,
+        jwt: str = "",
         on_tick: Optional[Callable[[Tick], None]] = None,
         on_order: Optional[Callable[[OrderEvent], None]] = None,
+        is_shutdown: Optional[Callable[[], bool]] = None,
+        heartbeat_armed: Optional[Callable[[], bool]] = None,
+        token_subscriptions: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         self._feed_token = feed_token
         self._client_id = client_id
+        self._jwt = jwt
         self._on_tick = on_tick
         self._on_order = on_order
+        self._is_shutdown = is_shutdown or (lambda: False)
+        # Heartbeat trips only when this returns True. Default → never (safer:
+        # we DON'T want stale-feed alarms when the bot is just idling outside
+        # market hours).
+        self._heartbeat_armed = heartbeat_armed or (lambda: False)
+        self._token_subs = token_subscriptions or []
 
         self.tick_queue: "queue.Queue[Tick]" = queue.Queue(maxsize=10_000)
         self.order_queue: "queue.Queue[OrderEvent]" = queue.Queue(maxsize=10_000)
@@ -81,7 +92,7 @@ class WebSocketManager:
     # --------------------------------------------------------------- lifecycle
     def start(self) -> None:
         self._stop.clear()
-        if config.PAPER_MODE:
+        if not config.USE_LIVE_DATA:
             logger.info("WS in PAPER mode — no live sockets opened.")
             return
         self._tick_thread = threading.Thread(
@@ -137,22 +148,31 @@ class WebSocketManager:
         while not self._stop.is_set():
             try:
                 ws = SmartWebSocketV2(
-                    auth_token=None,
+                    auth_token=self._jwt,
                     api_key=config.ANGEL_API_KEY,
                     client_code=self._client_id,
                     feed_token=self._feed_token,
                 )
 
-                def on_data(_wsapp: Any, msg: Any) -> None:
+                def on_data(*args, **_kw) -> None:
+                    # SmartAPI SDK passes (wsapp, message, type, continue_flag);
+                    # we only care about the message body which is args[1] (or last).
                     try:
+                        msg = args[1] if len(args) >= 2 else (args[0] if args else {})
+                        if not isinstance(msg, dict):
+                            return
+                        buys = msg.get("best_5_buy_data") or []
+                        sells = msg.get("best_5_sell_data") or []
+                        bid = float((buys[0].get("price", 0) if buys else 0)) / 100
+                        ask = float((sells[0].get("price", 0) if sells else 0)) / 100
                         self._publish_tick(
                             Tick(
                                 token=str(msg.get("token", "")),
                                 ltp=float(msg.get("last_traded_price", 0.0)) / 100,
                                 volume=int(msg.get("volume_trade_for_the_day", 0)),
                                 oi=int(msg.get("open_interest", 0)),
-                                bid=float(msg.get("best_5_buy_data", [{}])[0].get("price", 0)) / 100,
-                                ask=float(msg.get("best_5_sell_data", [{}])[0].get("price", 0)) / 100,
+                                bid=bid,
+                                ask=ask,
                                 ts=time.time(),
                             )
                         )
@@ -162,6 +182,22 @@ class WebSocketManager:
                 ws.on_data = on_data
                 ws.on_error = lambda *a, **kw: logger.warning("ws-tick error: %s", a)
                 ws.on_close = lambda *a, **kw: logger.warning("ws-tick closed")
+
+                # Subscribe to instrument tokens after the socket opens
+                def on_open(*_a, **_kw) -> None:
+                    if not self._token_subs:
+                        return
+                    try:
+                        ws.subscribe(
+                            correlation_id=f"nifty-bot-{int(time.time())}",
+                            mode=3,                    # snap quote (full depth)
+                            token_list=self._token_subs,
+                        )
+                        logger.info("WS subscribed to %d instrument groups", len(self._token_subs))
+                    except Exception:
+                        logger.exception("ws subscribe failed")
+
+                ws.on_open = on_open
                 ws.connect()  # blocking until closed
                 attempt = 0
             except Exception as exc:
@@ -194,20 +230,29 @@ class WebSocketManager:
         while not self._stop.is_set():
             try:
                 ws = SmartWebSocketOrderUpdate(
-                    auth_token=None,
+                    auth_token=self._jwt,
                     api_key=config.ANGEL_API_KEY,
                     client_code=self._client_id,
                     feed_token=self._feed_token,
                 )
 
-                def on_data(_wsapp: Any, msg: Any) -> None:
+                def on_data(*args, **_kw) -> None:
                     try:
+                        msg = args[1] if len(args) >= 2 else (args[0] if args else {})
+                        if isinstance(msg, str):
+                            import json as _json
+                            try:
+                                msg = _json.loads(msg)
+                            except _json.JSONDecodeError:
+                                return
+                        if not isinstance(msg, dict):
+                            return
                         self._publish_order(
                             OrderEvent(
                                 order_id=str(msg.get("orderid", "")),
                                 status=str(msg.get("status", "")).lower(),
-                                fill_price=float(msg.get("price", 0.0)),
-                                avg_price=float(msg.get("averageprice", 0.0)),
+                                fill_price=float(msg.get("price", 0.0) or 0.0),
+                                avg_price=float(msg.get("averageprice", 0.0) or 0.0),
                                 text=str(msg.get("text", "")),
                                 ts=time.time(),
                             )
@@ -229,6 +274,11 @@ class WebSocketManager:
     # --------------------------------------------------------------- watchdog
     def _heartbeat_watchdog(self) -> None:
         while not self._stop.is_set():
+            # Only fire when explicitly armed (e.g. holding a position). Avoids
+            # noisy FORCED_EXIT ↔ COOLDOWN loops outside market hours.
+            if self._is_shutdown() or not self._heartbeat_armed():
+                time.sleep(2)
+                continue
             silence = time.time() - self._last_tick_ts
             if silence >= config.WS_HEARTBEAT_TIMEOUT_SEC:
                 logger.critical(

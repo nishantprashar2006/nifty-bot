@@ -17,7 +17,7 @@ import time
 import uuid
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # Local package imports
 sys.path.insert(0, str(Path(__file__).parent))
@@ -121,19 +121,25 @@ class NiftyOptionsBot:
             sized.drawdown_pct * 100, sized.daily_loss_cap, sized.daily_profit_lock,
         )
 
-        # Scrip master + ATM picks (only if live; paper mode skips network)
-        if not config.PAPER_MODE:
+        # Scrip master + ATM picks (only when using a live broker)
+        if config.USE_LIVE_BROKER:
             try:
                 self.option_selector.load()
+                self._refresh_atm_contracts()
             except Exception:
-                logger.exception("Scrip master load failed; continuing without ATM picks.")
+                logger.exception("Scrip master / ATM picks failed; bot will idle.")
 
         # WebSocket layer
+        token_subs = self._build_token_subscriptions()
         self.ws = WebSocketManager(
             feed_token=self.broker.get_feed_token(),
             client_id=config.ANGEL_CLIENT_ID,
+            jwt=self.broker.get_jwt(),
             on_tick=self._on_tick,
             on_order=self._on_order,
+            is_shutdown=lambda: self.state is config.State.SHUTDOWN,
+            heartbeat_armed=lambda: self.positions.has_open_position,
+            token_subscriptions=token_subs,
         )
         self.ws.start()
 
@@ -146,6 +152,45 @@ class NiftyOptionsBot:
     def _on_signal(self, *_args) -> None:
         logger.warning("Signal received — initiating graceful shutdown.")
         self._stop.set()
+
+    def _build_token_subscriptions(self) -> list[dict[str, Any]]:
+        """Compose the NSE_CM tokens (spot + VIX) the bot needs. ATM CE/PE on
+        NSE_FO are added later once the option_selector has resolved them."""
+        nse_cm_tokens: list[str] = []
+        if config.NIFTY_SPOT_TOKEN:
+            nse_cm_tokens.append(config.NIFTY_SPOT_TOKEN)
+        if config.INDIA_VIX_TOKEN:
+            nse_cm_tokens.append(config.INDIA_VIX_TOKEN)
+        nse_fo_tokens: list[str] = []
+        if self._ce:
+            nse_fo_tokens.append(self._ce.token)
+        if self._pe:
+            nse_fo_tokens.append(self._pe.token)
+
+        subs: list[dict[str, Any]] = []
+        if nse_cm_tokens:
+            subs.append({"exchangeType": 1, "tokens": nse_cm_tokens})  # 1 = NSE_CM
+        if nse_fo_tokens:
+            subs.append({"exchangeType": 2, "tokens": nse_fo_tokens})  # 2 = NSE_FO
+        return subs
+
+    def _refresh_atm_contracts(self) -> None:
+        """Pick ATM CE/PE for the nearest expiry using current Nifty spot LTP."""
+        try:
+            spot = self.broker.ltp("NSE", "NIFTY", config.NIFTY_SPOT_TOKEN)
+        except Exception:
+            logger.exception("Spot LTP fetch failed; cannot pick ATM contracts.")
+            return
+        try:
+            ce, pe = self.option_selector.select_atm(spot)
+            self._ce = ce
+            self._pe = pe
+            logger.info(
+                "ATM picks → CE=%s (token=%s), PE=%s (token=%s) [spot=%.2f]",
+                ce.symbol, ce.token, pe.symbol, pe.token, spot,
+            )
+        except Exception:
+            logger.exception("ATM contract resolution failed.")
 
     def _shutdown(self) -> None:
         try:
@@ -211,6 +256,9 @@ class NiftyOptionsBot:
         self.candles.series(t.token, 3).ingest_tick(t.ltp, t.volume)
 
     def _on_order(self, ev: OrderEvent) -> None:
+        # Once terminal, ignore everything (prevents SHUTDOWN ↔ FORCED_EXIT loop)
+        if self.state is config.State.SHUTDOWN:
+            return
         if ev.status == "heartbeat_lapse":
             logger.critical("Heartbeat lapse — routing to FORCED_EXIT")
             self._transition(config.State.FORCED_EXIT)
@@ -254,7 +302,7 @@ class NiftyOptionsBot:
         self, direction: config.Direction, contract: OptionContract, sl_pts: float, tp_pts: float
     ) -> bool:
         quote = self._last_option_quote.get(contract.token)
-        if not quote and not config.PAPER_MODE:
+        if not quote and not config.SIMULATE_ORDERS:
             logger.info("No quote for %s yet; skipping.", contract.symbol)
             return False
         premium = (quote or {}).get("ltp", 100.0)
@@ -308,8 +356,8 @@ class NiftyOptionsBot:
             contract.symbol, qty, limit_px, target_px, stop_px, order_id,
         )
 
-        # PAPER mode: synthesise an immediate fill so the FSM advances
-        if config.PAPER_MODE and self.ws is not None:
+        # PAPER / SIM mode: synthesise an immediate fill so the FSM advances
+        if config.SIMULATE_ORDERS and self.ws is not None:
             self.ws.force_order(
                 OrderEvent(order_id=order_id, status="complete",
                            fill_price=limit_px, avg_price=limit_px,
@@ -450,7 +498,7 @@ class NiftyOptionsBot:
             bid=q.get("bid", 0.0), ask=q.get("ask", 0.0),
             volume=q.get("volume", 0), open_interest=q.get("oi", 0),
         )
-        if not liq.ok and not config.PAPER_MODE:
+        if not liq.ok and not config.SIMULATE_ORDERS:
             logger.info("Liquidity FAIL → %s", liq.reasons)
             self._pending_signal = None
             self._transition(config.State.IDLE)

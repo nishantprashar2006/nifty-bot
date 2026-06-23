@@ -37,7 +37,8 @@ class PositionSizer:
 
     def update_equity_and_size(self, current_equity: float) -> SizingResult:
         """Run the full 6-step sequence and persist an equity_curve row."""
-        prev = self._db.latest_equity()
+        import config as _cfg
+        prev = self._db.latest_equity(trading_mode=_cfg.TRADING_MODE)
         prev_peak = prev[0] if prev else current_equity
         peak_equity = max(prev_peak, current_equity)
         drawdown = (
@@ -65,6 +66,7 @@ class PositionSizer:
             peak_equity=peak_equity,
             drawdown_pct=drawdown,
             effective_lots=effective_lots,
+            trading_mode=_cfg.TRADING_MODE,
         )
 
         return SizingResult(

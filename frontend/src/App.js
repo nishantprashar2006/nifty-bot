@@ -8,13 +8,12 @@ import {
   ActivityIcon, PowerIcon, PauseIcon, RotateCwIcon, ShieldAlertIcon,
   TrendingUpIcon, TrendingDownIcon, CircleDotIcon, DatabaseIcon,
   TargetIcon, WalletIcon, PercentIcon, BriefcaseIcon, PencilIcon,
+  Trash2Icon,
 } from "lucide-react";
 import { Card } from "./components/ui/card";
 import { Button } from "./components/ui/button";
 import { Badge } from "./components/ui/badge";
-import { Switch } from "./components/ui/switch";
 import { Input } from "./components/ui/input";
-import { Label } from "./components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import {
@@ -100,10 +99,14 @@ function App() {
 
   // Live-toggle confirmation dialog
   const [confirmLive, setConfirmLive] = useState(false);
+  const [pendingMode, setPendingMode] = useState(null);
 
   // Editable paper capital
   const [editingCap, setEditingCap] = useState(false);
   const [capInput, setCapInput] = useState("");
+
+  // Reset confirmation
+  const [confirmReset, setConfirmReset] = useState(false);
 
   const fetchAll = useCallback(async () => {
     try {
@@ -164,6 +167,34 @@ function App() {
     }
   };
 
+  const applyTradingMode = async (mode) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await axios.post(`${API}/bot/trading_mode`, { mode });
+      toast.success(`Switched to ${mode.toUpperCase()} mode`, {
+        description: "Restarting bot to apply change…",
+      });
+      try { await axios.post(`${API}/bot/control`, { action: "restart" }); } catch (_) { /* ignore */ }
+      await fetchAll();
+    } catch (err) {
+      toast.error(`Mode change failed: ${err?.response?.data?.detail || err.message}`);
+    } finally {
+      setBusy(false);
+      setConfirmLive(false);
+      setPendingMode(null);
+    }
+  };
+
+  const requestModeChange = (mode) => {
+    if (mode === "live") {
+      setPendingMode("live");
+      setConfirmLive(true);
+    } else {
+      applyTradingMode(mode);
+    }
+  };
+
   const saveCapital = async () => {
     const v = Number(capInput);
     if (!v || v <= 0) {
@@ -179,6 +210,17 @@ function App() {
       await fetchAll();
     } catch (err) {
       toast.error(`Failed: ${err?.response?.data?.detail || err.message}`);
+    }
+  };
+
+  const resetHistory = async () => {
+    try {
+      await axios.post(`${API}/bot/reset_history?scope=current_mode`);
+      toast.success(`History wiped for ${status?.trading_mode?.toUpperCase()} mode`);
+      setConfirmReset(false);
+      await fetchAll();
+    } catch (err) {
+      toast.error(`Reset failed: ${err?.response?.data?.detail || err.message}`);
     }
   };
 
@@ -215,24 +257,28 @@ function App() {
           </div>
 
           <div className="flex items-center gap-4">
-            {/* Mode toggle */}
-            <div className="flex items-center gap-2 px-3 py-1.5 border border-zinc-800 bg-zinc-900/60 rounded-none">
-              <span className={`text-xs font-mono ${status?.paper_mode ? "text-amber-300" : "text-zinc-500"}`}>
-                PAPER
-              </span>
-              <Switch
-                data-testid="switch-mode"
-                checked={status ? !status.paper_mode : false}
-                disabled={busy || status === null}
-                onCheckedChange={(checked) => {
-                  if (checked) setConfirmLive(true);   // PAPER → LIVE needs confirm
-                  else setMode(true);                  // LIVE → PAPER no confirm
-                }}
-                className="data-[state=checked]:bg-red-600 data-[state=unchecked]:bg-amber-600"
-              />
-              <span className={`text-xs font-mono ${status && !status.paper_mode ? "text-red-300" : "text-zinc-500"}`}>
-                LIVE
-              </span>
+            {/* Trading mode — 3-way segmented control */}
+            <div className="flex items-center border border-zinc-800 bg-zinc-900/60 rounded-none divide-x divide-zinc-800" data-testid="mode-control">
+              {[
+                { id: "paper", label: "PAPER", active: "bg-amber-600/80 text-zinc-950" },
+                { id: "sim",   label: "SIM",   active: "bg-blue-600/80 text-zinc-950" },
+                { id: "live",  label: "LIVE",  active: "bg-red-600/80 text-zinc-50" },
+              ].map((m) => {
+                const isActive = status?.trading_mode === m.id;
+                return (
+                  <button
+                    key={m.id}
+                    data-testid={`mode-${m.id}`}
+                    disabled={busy || isActive}
+                    onClick={() => requestModeChange(m.id)}
+                    className={`px-3 py-1.5 text-xs font-mono font-semibold tracking-wider transition-colors disabled:cursor-default ${
+                      isActive ? m.active : "text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60"
+                    }`}
+                  >
+                    {m.label}
+                  </button>
+                );
+              })}
             </div>
 
             <Badge
@@ -280,7 +326,7 @@ function App() {
                 </div>
                 <div>
                   <div className="text-[10px] uppercase tracking-wider text-zinc-500">
-                    {status?.paper_mode ? "Paper Equity" : "Live Cash (RMS)"}
+                    {status?.trading_mode === "paper" ? "Paper Equity" : "Live Cash (RMS)"}
                   </div>
                   <div className="text-zinc-100">{eqSnap ? fmtINR(eqSnap.current_equity) : "—"}</div>
                 </div>
@@ -297,7 +343,7 @@ function App() {
               </div>
 
               {/* Paper-mode editable capital */}
-              {status?.paper_mode && (
+              {status?.trading_mode === "paper" && (
                 <div className="mt-6 pt-5 border-t border-zinc-800 flex items-center gap-3 flex-wrap">
                   <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-mono">Paper starting capital</div>
                   {!editingCap ? (
@@ -384,13 +430,33 @@ function App() {
               </Button>
             </div>
             <div className="mt-5 text-[11px] font-mono text-zinc-500 leading-relaxed border-t border-zinc-800 pt-4 space-y-2">
-              <div className={`flex items-center gap-2 ${status === null ? "text-zinc-500" : status.paper_mode ? "text-amber-400" : "text-red-400"}`}>
-                <ShieldAlertIcon className="h-3.5 w-3.5" />
-                {status === null ? "Loading mode…" : status.paper_mode ? "PAPER — no real orders fire" : "LIVE — real orders to NSE/NFO"}
-              </div>
+              {status === null ? (
+                <div className="flex items-center gap-2 text-zinc-500">
+                  <ShieldAlertIcon className="h-3.5 w-3.5" /> Loading mode…
+                </div>
+              ) : status.trading_mode === "paper" ? (
+                <div className="flex items-center gap-2 text-amber-400">
+                  <ShieldAlertIcon className="h-3.5 w-3.5" /> PAPER — no Angel connection, simulated everything
+                </div>
+              ) : status.trading_mode === "sim" ? (
+                <div className="flex items-center gap-2 text-blue-400">
+                  <ShieldAlertIcon className="h-3.5 w-3.5" /> SIM — real Angel data, simulated order fills (safe)
+                </div>
+              ) : (
+                <div className="flex items-center gap-2 text-red-400">
+                  <ShieldAlertIcon className="h-3.5 w-3.5" /> LIVE — real orders to NSE/NFO
+                </div>
+              )}
               <div className="flex items-center gap-2 text-zinc-500">
                 <DatabaseIcon className="h-3.5 w-3.5" /> {status?.db_path}
               </div>
+              <button
+                data-testid="btn-reset-history"
+                onClick={() => setConfirmReset(true)}
+                className="flex items-center gap-2 text-zinc-500 hover:text-red-400 transition-colors text-[11px] mt-1"
+              >
+                <Trash2Icon className="h-3.5 w-3.5" /> Reset history (current mode)
+              </button>
             </div>
           </Card>
         </section>
@@ -575,7 +641,7 @@ function App() {
         </footer>
       </main>
 
-      {/* PAPER → LIVE confirmation dialog */}
+      {/* SIM/PAPER → LIVE confirmation dialog */}
       <AlertDialog open={confirmLive} onOpenChange={setConfirmLive}>
         <AlertDialogContent className="bg-zinc-950 border-red-800 rounded-none font-mono">
           <AlertDialogHeader>
@@ -590,7 +656,8 @@ function App() {
                 <li>size lots based on that real capital</li>
                 <li>place real BUY / SELL / STOPLOSS_LIMIT orders</li>
               </ul>
-              <span className="block mt-3 text-amber-300">Only proceed during market hours with a verified Angel One session.</span>
+              <span className="block mt-3 text-amber-300">Only proceed during market hours (09:15–15:30 IST) with a verified Angel One session.</span>
+              <span className="block mt-2 text-zinc-500">If unsure, choose <span className="text-blue-300 font-semibold">SIM</span> first — it uses live Angel data but simulates orders.</span>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -602,10 +669,40 @@ function App() {
             </AlertDialogCancel>
             <AlertDialogAction
               data-testid="confirm-live"
-              onClick={() => setMode(false)}
+              onClick={() => applyTradingMode("live")}
               className="rounded-none bg-red-600 hover:bg-red-500 text-zinc-950 font-mono font-semibold"
             >
               Yes, go LIVE
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* Reset history confirmation dialog */}
+      <AlertDialog open={confirmReset} onOpenChange={setConfirmReset}>
+        <AlertDialogContent className="bg-zinc-950 border-zinc-800 rounded-none font-mono">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-zinc-100 flex items-center gap-2">
+              <Trash2Icon className="h-5 w-5 text-amber-400" /> Reset history?
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-zinc-400 text-sm leading-relaxed">
+              This wipes the <span className="text-amber-300">equity curve</span> for the
+              current <span className="text-amber-300">{status?.trading_mode?.toUpperCase()}</span> mode
+              and clears <span className="text-amber-300">all closed trades</span>.
+              State transitions and indicators are kept.
+              <span className="block mt-2 text-zinc-500">Use this after switching modes so drawdown sizing starts fresh.</span>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="rounded-none border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-200 font-mono">
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              data-testid="confirm-reset"
+              onClick={resetHistory}
+              className="rounded-none bg-amber-600 hover:bg-amber-500 text-zinc-950 font-mono font-semibold"
+            >
+              Yes, wipe
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

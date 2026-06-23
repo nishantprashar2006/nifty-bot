@@ -112,6 +112,8 @@ class _LiveSmartApiClient:
     def ltp(self, exchange: str, tradingsymbol: str, symboltoken: str) -> float:
         with self._lock:
             resp = self._api.ltpData(exchange, tradingsymbol, symboltoken)
+            if not resp or not resp.get("status"):
+                raise SmartApiError(f"ltpData failed: {resp}")
             return float(resp["data"]["ltp"])
 
     def logout(self) -> None:
@@ -183,12 +185,49 @@ class _PaperSmartApiClient:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# HYBRID client — real Angel data + cash, simulated order fills (SIM mode)
+# ──────────────────────────────────────────────────────────────────────
+class _HybridSmartApiClient(_LiveSmartApiClient):
+    """Live REST/WS for market data + RMS cash; orders are paper-simulated."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._sim_orders: dict[str, Any] = {}
+        logger.warning("SIM mode active — real ticks, but orders are simulated.")
+
+    def place_order(self, payload: dict[str, Any]) -> str:  # type: ignore[override]
+        oid = f"SIM-{uuid.uuid4().hex[:10]}"
+        self._sim_orders[oid] = {
+            **payload,
+            "status": "complete",
+            "fill_price": float(payload.get("price") or 0.0),
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        return oid
+
+    def cancel_order(self, order_id: str, variety: str = "NORMAL") -> None:  # type: ignore[override]
+        if order_id in self._sim_orders:
+            self._sim_orders[order_id]["status"] = "cancelled"
+
+    def order_book(self) -> list[dict[str, Any]]:  # type: ignore[override]
+        return [{"orderid": k, **v} for k, v in self._sim_orders.items()]
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Factory
 # ──────────────────────────────────────────────────────────────────────
-SmartApiClient = _PaperSmartApiClient if config.PAPER_MODE else _LiveSmartApiClient
+def _select_client_cls():
+    if config.TRADING_MODE == "live":
+        return _LiveSmartApiClient
+    if config.TRADING_MODE == "sim":
+        return _HybridSmartApiClient
+    return _PaperSmartApiClient
+
+
+SmartApiClient = _select_client_cls()
 
 
 def build_client() -> Any:
-    client = SmartApiClient()
+    client = _select_client_cls()()
     client.login()
     return client

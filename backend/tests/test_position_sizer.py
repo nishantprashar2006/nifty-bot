@@ -51,7 +51,7 @@ def test_full_sizing_no_drawdown(sizer):
 
 def test_drawdown_forces_floor(sizer):
     s, db = sizer
-    db.log_equity_point(300_000, 300_000, 0.0, 5)
+    db.log_equity_point(300_000, 300_000, 0.0, 5, trading_mode=config.TRADING_MODE)
     res = s.update_equity_and_size(current_equity=200_000)  # 33% drawdown
     assert res.effective_lots == 1
     assert res.drawdown_pct >= 0.30

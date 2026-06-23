@@ -70,10 +70,12 @@ class SqliteLogger:
             current_equity  REAL NOT NULL,
             peak_equity     REAL NOT NULL,
             drawdown_pct    REAL NOT NULL,
-            effective_lots  INTEGER NOT NULL
+            effective_lots  INTEGER NOT NULL,
+            trading_mode    TEXT NOT NULL DEFAULT 'paper'
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_curve(timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_equity_mode ON equity_curve(trading_mode)",
     ]
 
     def __init__(self, db_path: str) -> None:
@@ -93,6 +95,11 @@ class SqliteLogger:
             cur = self._conn.cursor()
             for stmt in self._SCHEMA:
                 cur.execute(stmt)
+            # Idempotent column add for legacy DBs
+            try:
+                cur.execute("ALTER TABLE equity_curve ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'paper'")
+            except sqlite3.OperationalError:
+                pass  # column already exists
             cur.close()
 
     @contextmanager
@@ -166,22 +173,37 @@ class SqliteLogger:
         peak_equity: float,
         drawdown_pct: float,
         effective_lots: int,
+        trading_mode: str = "paper",
     ) -> None:
         with self._cursor() as cur:
             cur.execute(
                 "INSERT OR REPLACE INTO equity_curve(timestamp, current_equity, "
-                "peak_equity, drawdown_pct, effective_lots) VALUES (?, ?, ?, ?, ?)",
-                (_utc_iso(), current_equity, peak_equity, drawdown_pct, effective_lots),
+                "peak_equity, drawdown_pct, effective_lots, trading_mode) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (_utc_iso(), current_equity, peak_equity, drawdown_pct,
+                 effective_lots, trading_mode),
             )
 
     # ------------------------------------------------------------------ reads
-    def latest_equity(self) -> Optional[tuple[float, float]]:
-        """Return (peak_equity, current_equity) most recent row, or None."""
+    def latest_equity(self, trading_mode: Optional[str] = None) -> Optional[tuple[float, float]]:
+        """Return (peak_equity, current_equity) most recent row.
+
+        If `trading_mode` is supplied, only consider rows logged under that mode.
+        Drawdown sizing across PAPER ↔ SIM ↔ LIVE mode flips must NOT see each
+        other's equity, so callers pass the active mode.
+        """
         with self._cursor() as cur:
-            cur.execute(
-                "SELECT peak_equity, current_equity FROM equity_curve "
-                "ORDER BY timestamp DESC LIMIT 1"
-            )
+            if trading_mode:
+                cur.execute(
+                    "SELECT peak_equity, current_equity FROM equity_curve "
+                    "WHERE trading_mode = ? ORDER BY timestamp DESC LIMIT 1",
+                    (trading_mode,),
+                )
+            else:
+                cur.execute(
+                    "SELECT peak_equity, current_equity FROM equity_curve "
+                    "ORDER BY timestamp DESC LIMIT 1"
+                )
             row = cur.fetchone()
         return row if row else None
 

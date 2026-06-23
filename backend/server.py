@@ -56,11 +56,16 @@ def _ensure_tables() -> None:
         """CREATE TABLE IF NOT EXISTS equity_curve (
             timestamp TEXT PRIMARY KEY, current_equity REAL NOT NULL,
             peak_equity REAL NOT NULL, drawdown_pct REAL NOT NULL,
-            effective_lots INTEGER NOT NULL)""",
+            effective_lots INTEGER NOT NULL,
+            trading_mode TEXT NOT NULL DEFAULT 'paper')""",
     ]
     with _conn() as c:
         for s in schema:
             c.execute(s)
+        try:
+            c.execute("ALTER TABLE equity_curve ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'paper'")
+        except sqlite3.OperationalError:
+            pass
 
 
 _ensure_tables()
@@ -73,6 +78,10 @@ class ControlRequest(BaseModel):
 
 class ModeRequest(BaseModel):
     paper_mode: bool
+
+
+class TradingModeRequest(BaseModel):
+    mode: str   # "paper" | "sim" | "live"
 
 
 class PaperCapitalRequest(BaseModel):
@@ -113,12 +122,25 @@ def _update_env_value(key: str, value: str) -> None:
 @api.get("/")
 def root() -> dict[str, Any]:
     # Re-read env each call so the toggle reflects without backend restart
+    mode = _current_trading_mode()
+    return {
+        "name": "Nifty Options Bot Dashboard",
+        "trading_mode": mode,
+        "paper_mode": mode == "paper",
+    }
+
+
+def _current_trading_mode() -> str:
+    raw = (_read_env_value("TRADING_MODE") or "").strip().lower()
+    if raw in {"paper", "sim", "live"}:
+        return raw
+    # Backward-compat fallback
     paper = (_read_env_value("PAPER_MODE") or "true").lower() == "true"
-    return {"name": "Nifty Options Bot Dashboard", "paper_mode": paper}
+    return "paper" if paper else "live"
 
 
 def _current_paper_mode() -> bool:
-    return (_read_env_value("PAPER_MODE") or "true").lower() == "true"
+    return _current_trading_mode() == "paper"
 
 
 def _current_paper_capital() -> float:
@@ -174,6 +196,7 @@ def bot_status() -> dict[str, Any]:
 
     return {
         "supervisor_state": sup_state,
+        "trading_mode": _current_trading_mode(),
         "paper_mode": _current_paper_mode(),
         "paper_starting_capital": _current_paper_capital(),
         "fsm_state": fsm["new_state"] if fsm else "IDLE",
@@ -225,10 +248,28 @@ def bot_stats() -> dict[str, Any]:
 
 @api.post("/bot/mode")
 def set_mode(req: ModeRequest) -> dict[str, Any]:
-    """Flip PAPER_MODE in .env. Caller must restart bot for it to take effect."""
+    """Legacy 2-mode toggle. Use /bot/trading_mode for the 3-mode endpoint."""
+    new_mode = "paper" if req.paper_mode else "live"
+    _update_env_value("TRADING_MODE", new_mode)
     _update_env_value("PAPER_MODE", "true" if req.paper_mode else "false")
     return {
         "paper_mode": req.paper_mode,
+        "trading_mode": new_mode,
+        "note": "Restart the bot for the change to take effect.",
+    }
+
+
+@api.post("/bot/trading_mode")
+def set_trading_mode(req: TradingModeRequest) -> dict[str, Any]:
+    """Set one of: paper | sim | live. Caller should restart the bot."""
+    mode = req.mode.lower().strip()
+    if mode not in {"paper", "sim", "live"}:
+        raise HTTPException(status_code=400, detail=f"unsupported mode: {mode}")
+    _update_env_value("TRADING_MODE", mode)
+    # Keep legacy flag aligned for any downstream callers
+    _update_env_value("PAPER_MODE", "true" if mode == "paper" else "false")
+    return {
+        "trading_mode": mode,
         "note": "Restart the bot for the change to take effect.",
     }
 
@@ -299,6 +340,27 @@ def bot_control(req: ControlRequest) -> dict[str, Any]:
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@api.post("/bot/reset_history")
+def reset_history(scope: str = "current_mode") -> dict[str, Any]:
+    """Wipe equity_curve + trades. Defaults to current mode only.
+
+    scope = 'current_mode' → only rows tagged with the active TRADING_MODE
+    scope = 'all'          → nuke all rows (use sparingly)
+    """
+    mode = _current_trading_mode()
+    with _conn() as c:
+        if scope == "all":
+            c.execute("DELETE FROM equity_curve")
+            c.execute("DELETE FROM trades")
+            c.execute("DELETE FROM state_transitions")
+            c.execute("DELETE FROM indicators")
+        else:
+            c.execute("DELETE FROM equity_curve WHERE trading_mode = ?", (mode,))
+            # Trades aren't mode-tagged; clear all trades for a clean equity reset
+            c.execute("DELETE FROM trades")
+    return {"reset_scope": scope, "trading_mode": mode}
 
 
 app.include_router(api)
