@@ -55,6 +55,8 @@ class PendingEntry:
     qty: int
     target_price: float
     stop_price: float
+    sl_points: float = 0.0     # ATR-derived; used to re-anchor on actual fill
+    tp_points: float = 0.0
     placed_ts: float = field(default_factory=time.time)
 
     def age_seconds(self) -> float:
@@ -105,6 +107,15 @@ class PositionManager:
             if self._pending is None:
                 raise RuntimeError("No pending entry to promote.")
             p = self._pending
+            # Re-anchor target/stop to ACTUAL fill price using the stored ATR
+            # points; in MARKET mode this corrects for slippage so the 1×/2×
+            # ATR risk profile is preserved.
+            if p.sl_points > 0 and p.tp_points > 0:
+                target_price = fill_price + p.tp_points
+                stop_price = max(0.05, fill_price - p.sl_points)
+            else:
+                target_price = p.target_price
+                stop_price = p.stop_price
             pos = OpenPosition(
                 trade_id=f"T-{uuid.uuid4().hex[:10]}",
                 direction=p.direction,
@@ -114,8 +125,8 @@ class PositionManager:
                 lots=p.lots,
                 entry_price=fill_price,
                 entry_ts=datetime.now(timezone.utc),
-                target_price=p.target_price,
-                stop_price=p.stop_price,
+                target_price=target_price,
+                stop_price=stop_price,
                 trail_anchor=fill_price,
             )
             self._open = pos

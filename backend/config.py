@@ -68,8 +68,9 @@ MAX_HOLD_TIME_MIN = 30
 REENTRY_BLOCK_MIN = 15           # directional cooldown on stop-out side
 COOLDOWN_AFTER_EXIT_MIN = 10     # post-exit system rest
 TRAILING_TRIGGER_STEP = 5.0      # premium points
-LIMIT_SLIP_BUFFER_PCT = 0.005    # 0.5% protective slip on entry
-FILL_TOLERANCE_PCT = 0.01        # reject fills > 1% above expected
+LIMIT_SLIP_BUFFER_PCT = 0.005    # 0.5% protective slip (only used in LIMIT mode)
+FILL_TOLERANCE_PCT = 0.01        # reject LIMIT fills > 1% above expected
+MARKET_FILL_TOLERANCE_PCT = 0.03 # MARKET orders tolerate up to 3% slippage
 
 # ────────────────────────────────────────────────────────────────────
 # 6. Liquidity
@@ -151,6 +152,17 @@ PAPER_MODE: bool = TRADING_MODE == "sim"                  # legacy alias
 
 LOG_LEVEL: str = os.getenv("BOT_LOG_LEVEL", "INFO").upper()
 DB_PATH: str = os.getenv("BOT_DB_PATH", "/app/backend/data_store/nifty_bot.db")
+
+# Entry order type — MARKET (default, guaranteed fill on breakouts) or LIMIT
+ENTRY_ORDER_TYPE: str = os.getenv("ENTRY_ORDER_TYPE", "MARKET").upper()
+if ENTRY_ORDER_TYPE not in {"MARKET", "LIMIT"}:
+    ENTRY_ORDER_TYPE = "MARKET"
+
+# SL leg type — STOPLOSS_MARKET (SL-M, default, protects against gap-throughs)
+# or STOPLOSS_LIMIT (cheaper in calm markets, but can miss fills on gaps)
+SL_ORDER_TYPE: str = os.getenv("SL_ORDER_TYPE", "STOPLOSS_MARKET").upper()
+if SL_ORDER_TYPE not in {"STOPLOSS_MARKET", "STOPLOSS_LIMIT"}:
+    SL_ORDER_TYPE = "STOPLOSS_MARKET"
 
 ANGEL_API_KEY = os.getenv("ANGEL_API_KEY", "")
 ANGEL_CLIENT_ID = os.getenv("ANGEL_CLIENT_ID", "")

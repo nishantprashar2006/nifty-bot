@@ -100,6 +100,11 @@ class ManualEntryRequest(BaseModel):
     direction: str   # "CALL" | "PUT"
 
 
+class OrderTypeRequest(BaseModel):
+    entry_order_type: Optional[str] = None   # "MARKET" | "LIMIT"
+    sl_order_type: Optional[str] = None      # "STOPLOSS_MARKET" | "STOPLOSS_LIMIT"
+
+
 # ──────────────────────────────────────────────────── .env helpers
 ENV_FILE = ROOT_DIR / ".env"
 
@@ -162,6 +167,16 @@ def _current_paper_capital() -> float:
         return 200_000.0
 
 
+def _current_entry_order_type() -> str:
+    v = (_read_env_value("ENTRY_ORDER_TYPE") or "MARKET").upper()
+    return v if v in {"MARKET", "LIMIT"} else "MARKET"
+
+
+def _current_sl_order_type() -> str:
+    v = (_read_env_value("SL_ORDER_TYPE") or "STOPLOSS_MARKET").upper()
+    return v if v in {"STOPLOSS_MARKET", "STOPLOSS_LIMIT"} else "STOPLOSS_MARKET"
+
+
 @api.get("/bot/status")
 def bot_status() -> dict[str, Any]:
     # supervisor status
@@ -211,6 +226,8 @@ def bot_status() -> dict[str, Any]:
         "trading_mode": _current_trading_mode(),
         "paper_mode": _current_paper_mode(),
         "paper_starting_capital": _current_paper_capital(),
+        "entry_order_type": _current_entry_order_type(),
+        "sl_order_type": _current_sl_order_type(),
         "fsm_state": fsm["new_state"] if fsm else "IDLE",
         "fsm_last_transition": fsm,
         "equity_snapshot": equity,
@@ -256,6 +273,27 @@ def bot_stats() -> dict[str, Any]:
         "worst_trade": float(row["worst_trade"] or 0.0),
         "open_position": dict(open_row) if open_row else None,
     }
+
+
+@api.post("/bot/order_types")
+def set_order_types(req: OrderTypeRequest) -> dict[str, Any]:
+    """Update entry / SL order type in .env. Caller restarts bot to apply."""
+    changed = {}
+    if req.entry_order_type is not None:
+        v = req.entry_order_type.upper().strip()
+        if v not in {"MARKET", "LIMIT"}:
+            raise HTTPException(status_code=400, detail=f"bad entry_order_type: {v}")
+        _update_env_value("ENTRY_ORDER_TYPE", v)
+        changed["entry_order_type"] = v
+    if req.sl_order_type is not None:
+        v = req.sl_order_type.upper().strip()
+        if v not in {"STOPLOSS_MARKET", "STOPLOSS_LIMIT"}:
+            raise HTTPException(status_code=400, detail=f"bad sl_order_type: {v}")
+        _update_env_value("SL_ORDER_TYPE", v)
+        changed["sl_order_type"] = v
+    if not changed:
+        raise HTTPException(status_code=400, detail="no fields provided")
+    return {"updated": changed, "note": "Restart the bot for the change to take effect."}
 
 
 @api.post("/bot/manual_entry")

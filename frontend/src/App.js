@@ -263,6 +263,23 @@ function App() {
     }
   };
 
+  const setOrderType = async (field, value) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await axios.post(`${API}/bot/order_types`, { [field]: value });
+      toast.success(`${field === "entry_order_type" ? "Entry" : "SL"} set to ${value.replace("STOPLOSS_", "SL-")}`, {
+        description: "Restarting bot to apply…",
+      });
+      try { await axios.post(`${API}/bot/control`, { action: "restart" }); } catch (_) { /* ignore */ }
+      await fetchAll();
+    } catch (err) {
+      toast.error(`Order-type change failed: ${err?.response?.data?.detail || err.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const fsm = status?.fsm_state || "IDLE";
   const sup = status?.supervisor_state || "UNKNOWN";
   const realized = status?.realized_pnl_today ?? 0;
@@ -414,6 +431,56 @@ function App() {
               </Button>
             </div>
             <div className="mt-5 text-[11px] font-mono text-zinc-500 leading-relaxed border-t border-zinc-800 pt-4 space-y-2">
+              {/* Order type toggles — compact 2-row matrix */}
+              <div className="space-y-1.5 pb-2 border-b border-zinc-800">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] uppercase tracking-wider text-zinc-500">Entry</span>
+                  <div className="flex border border-zinc-800 divide-x divide-zinc-800">
+                    {["MARKET", "LIMIT"].map((v) => {
+                      const active = status?.entry_order_type === v;
+                      return (
+                        <button
+                          key={v}
+                          data-testid={`entry-${v.toLowerCase()}`}
+                          disabled={busy || active}
+                          onClick={() => setOrderType("entry_order_type", v)}
+                          className={`px-2.5 py-0.5 text-[10px] font-mono font-semibold transition-colors disabled:cursor-default ${
+                            active ? "bg-blue-600/80 text-zinc-950" : "text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60"
+                          }`}
+                        >
+                          {v}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] uppercase tracking-wider text-zinc-500">Stop loss</span>
+                  <div className="flex border border-zinc-800 divide-x divide-zinc-800">
+                    {[
+                      { id: "STOPLOSS_MARKET", label: "SL-M" },
+                      { id: "STOPLOSS_LIMIT", label: "SL-L" },
+                    ].map((v) => {
+                      const active = status?.sl_order_type === v.id;
+                      return (
+                        <button
+                          key={v.id}
+                          data-testid={`sl-${v.label.toLowerCase()}`}
+                          disabled={busy || active}
+                          onClick={() => setOrderType("sl_order_type", v.id)}
+                          className={`px-2.5 py-0.5 text-[10px] font-mono font-semibold transition-colors disabled:cursor-default ${
+                            active ? "bg-blue-600/80 text-zinc-950" : "text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60"
+                          }`}
+                        >
+                          {v.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                <div className="text-[10px] text-zinc-600 pt-0.5">Target always LIMIT (locks reward, zero slippage)</div>
+              </div>
+
               {status === null ? (
                 <div className="flex items-center gap-2 text-zinc-500">
                   <ShieldAlertIcon className="h-3.5 w-3.5" /> Loading mode…

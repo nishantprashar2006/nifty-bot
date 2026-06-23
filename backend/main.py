@@ -347,11 +347,17 @@ class NiftyOptionsBot:
     def _handle_fill(self, ev: OrderEvent) -> None:
         pending = self.positions.pending_entry
         if pending and ev.order_id == pending.order_id:
-            # Boundary check: fill_price > expected_price * 1.01 ⇒ reject flow
-            if ev.fill_price > pending.expected_price * (1 + config.FILL_TOLERANCE_PCT):
+            # Slippage check — wider tolerance for MARKET orders since some
+            # slippage is the explicit trade-off for guaranteed fills.
+            tol = (
+                config.MARKET_FILL_TOLERANCE_PCT
+                if config.ENTRY_ORDER_TYPE == "MARKET"
+                else config.FILL_TOLERANCE_PCT
+            )
+            if ev.fill_price > pending.expected_price * (1 + tol):
                 logger.warning(
-                    "Fill %.2f exceeds tolerance vs expected %.2f — emergency exit.",
-                    ev.fill_price, pending.expected_price,
+                    "Fill %.2f exceeds %.0f%% tolerance vs ref %.2f — emergency exit.",
+                    ev.fill_price, tol * 100, pending.expected_price,
                 )
                 self.positions.clear_pending()
                 self._transition(config.State.FORCED_EXIT)
@@ -390,22 +396,42 @@ class NiftyOptionsBot:
             current_equity=self.broker.get_net_available_cash(),
         )
         qty = lots * config.LOT_SIZE_NIFTY
-        limit_px = premium * (1 + config.LIMIT_SLIP_BUFFER_PCT)
+
+        # Build the entry payload — MARKET or LIMIT per config toggle
+        is_market = config.ENTRY_ORDER_TYPE == "MARKET"
+        if is_market:
+            limit_px = premium  # reference for SL/TP draft + slippage check
+            payload = {
+                "variety": "NORMAL",
+                "tradingsymbol": contract.symbol,
+                "symboltoken": contract.token,
+                "transactiontype": "BUY",
+                "exchange": contract.exchange,
+                "ordertype": "MARKET",
+                "producttype": "INTRADAY",
+                "duration": "DAY",
+                "price": "0",
+                "quantity": qty,
+            }
+        else:
+            limit_px = premium * (1 + config.LIMIT_SLIP_BUFFER_PCT)
+            payload = {
+                "variety": "NORMAL",
+                "tradingsymbol": contract.symbol,
+                "symboltoken": contract.token,
+                "transactiontype": "BUY",
+                "exchange": contract.exchange,
+                "ordertype": "LIMIT",
+                "producttype": "INTRADAY",
+                "duration": "DAY",
+                "price": round(limit_px, 2),
+                "quantity": qty,
+            }
+
+        # Provisional SL/TP — will be re-anchored to actual fill in
+        # PositionManager.promote_to_open()
         target_px = premium + tp_pts
         stop_px = max(0.05, premium - sl_pts)
-
-        payload = {
-            "variety": "NORMAL",
-            "tradingsymbol": contract.symbol,
-            "symboltoken": contract.token,
-            "transactiontype": "BUY",
-            "exchange": contract.exchange,
-            "ordertype": "LIMIT",
-            "producttype": "INTRADAY",
-            "duration": "DAY",
-            "price": round(limit_px, 2),
-            "quantity": qty,
-        }
         try:
             order_id = self.broker.place_order(payload)
         except SmartApiError as exc:
@@ -424,13 +450,16 @@ class NiftyOptionsBot:
                 qty=qty,
                 target_price=target_px,
                 stop_price=stop_px,
+                sl_points=sl_pts,
+                tp_points=tp_pts,
             )
         )
         self._pending_source = source
         self._transition(config.State.ORDER_PENDING)
         logger.info(
-            "Entry sent [%s]  %s  qty=%d  lim=₹%.2f  tgt=₹%.2f  sl=₹%.2f  order=%s",
-            source.upper(), contract.symbol, qty, limit_px, target_px, stop_px, order_id,
+            "Entry sent [%s · %s]  %s  qty=%d  ref=₹%.2f  tgt=+%.1fpts  sl=-%.1fpts  order=%s",
+            source.upper(), config.ENTRY_ORDER_TYPE, contract.symbol, qty,
+            limit_px, tp_pts, sl_pts, order_id,
         )
 
         # PAPER / SIM mode: synthesise an immediate fill so the FSM advances
@@ -446,7 +475,8 @@ class NiftyOptionsBot:
         pos = self.positions.open_position
         if pos is None:
             return
-        # Target = LIMIT SELL
+        # Target = LIMIT SELL  (user wants target ALWAYS as limit — locks in
+        # the planned reward, no slippage on the upside).
         tgt = {
             "variety": "NORMAL",
             "tradingsymbol": pos.contract_symbol,
@@ -459,18 +489,38 @@ class NiftyOptionsBot:
             "price": round(target_price, 2),
             "quantity": pos.qty,
         }
-        # Stop = STOPLOSS_LIMIT
-        sl = {
-            **tgt,
-            "ordertype": "STOPLOSS_LIMIT",
-            "price": round(stop_price, 2),
-            "triggerprice": round(stop_price * 1.001, 2),
-        }
+        # SL leg — STOPLOSS_MARKET (default) protects against gap-throughs.
+        # When SL_ORDER_TYPE is STOPLOSS_LIMIT we fall back to a stop-limit
+        # with a tight buffer.
+        if config.SL_ORDER_TYPE == "STOPLOSS_MARKET":
+            sl = {
+                "variety": "NORMAL",
+                "tradingsymbol": pos.contract_symbol,
+                "symboltoken": pos.contract_token,
+                "transactiontype": "SELL",
+                "exchange": "NFO",
+                "ordertype": "STOPLOSS_MARKET",
+                "producttype": "INTRADAY",
+                "duration": "DAY",
+                "price": "0",
+                "triggerprice": round(stop_price, 2),
+                "quantity": pos.qty,
+            }
+        else:
+            sl = {
+                **tgt,
+                "ordertype": "STOPLOSS_LIMIT",
+                "price": round(stop_price, 2),
+                "triggerprice": round(stop_price * 1.001, 2),
+            }
         try:
             tgt_id = self.broker.place_order(tgt)
             sl_id = self.broker.place_order(sl)
             self.positions.set_protective_orders(tgt_id, sl_id)
-            logger.info("Protective OCO armed: tgt=%s sl=%s", tgt_id, sl_id)
+            logger.info(
+                "Protective OCO armed [SL=%s]: tgt=%s sl=%s  (target ₹%.2f, stop ₹%.2f)",
+                config.SL_ORDER_TYPE, tgt_id, sl_id, target_price, stop_price,
+            )
         except SmartApiError as exc:
             logger.exception("Failed to arm OCO: %s", exc)
             self._transition(config.State.FORCED_EXIT)
@@ -623,21 +673,37 @@ class NiftyOptionsBot:
                 # cancel-replace stop leg
                 try:
                     self.broker.cancel_order(pos.stop_order_id)
-                    new_id = self.broker.place_order({
-                        "variety": "NORMAL",
-                        "tradingsymbol": pos.contract_symbol,
-                        "symboltoken": pos.contract_token,
-                        "transactiontype": "SELL",
-                        "exchange": "NFO",
-                        "ordertype": "STOPLOSS_LIMIT",
-                        "producttype": "INTRADAY",
-                        "duration": "DAY",
-                        "price": round(new_stop, 2),
-                        "triggerprice": round(new_stop * 1.001, 2),
-                        "quantity": pos.qty,
-                    })
+                    if config.SL_ORDER_TYPE == "STOPLOSS_MARKET":
+                        new_sl_payload = {
+                            "variety": "NORMAL",
+                            "tradingsymbol": pos.contract_symbol,
+                            "symboltoken": pos.contract_token,
+                            "transactiontype": "SELL",
+                            "exchange": "NFO",
+                            "ordertype": "STOPLOSS_MARKET",
+                            "producttype": "INTRADAY",
+                            "duration": "DAY",
+                            "price": "0",
+                            "triggerprice": round(new_stop, 2),
+                            "quantity": pos.qty,
+                        }
+                    else:
+                        new_sl_payload = {
+                            "variety": "NORMAL",
+                            "tradingsymbol": pos.contract_symbol,
+                            "symboltoken": pos.contract_token,
+                            "transactiontype": "SELL",
+                            "exchange": "NFO",
+                            "ordertype": "STOPLOSS_LIMIT",
+                            "producttype": "INTRADAY",
+                            "duration": "DAY",
+                            "price": round(new_stop, 2),
+                            "triggerprice": round(new_stop * 1.001, 2),
+                            "quantity": pos.qty,
+                        }
+                    new_id = self.broker.place_order(new_sl_payload)
                     self.positions.set_protective_orders(pos.target_order_id, new_id)
-                    logger.info("Stop trailed → %.2f (order=%s)", new_stop, new_id)
+                    logger.info("Stop trailed → %.2f (%s order=%s)", new_stop, config.SL_ORDER_TYPE, new_id)
                 except Exception:
                     logger.exception("Trail stop replace failed.")
 
