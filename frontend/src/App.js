@@ -7,12 +7,20 @@ import {
 import {
   ActivityIcon, PowerIcon, PauseIcon, RotateCwIcon, ShieldAlertIcon,
   TrendingUpIcon, TrendingDownIcon, CircleDotIcon, DatabaseIcon,
+  TargetIcon, WalletIcon, PercentIcon, BriefcaseIcon, PencilIcon,
 } from "lucide-react";
 import { Card } from "./components/ui/card";
 import { Button } from "./components/ui/button";
 import { Badge } from "./components/ui/badge";
+import { Switch } from "./components/ui/switch";
+import { Input } from "./components/ui/input";
+import { Label } from "./components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from "./components/ui/alert-dialog";
 import { Toaster, toast } from "sonner";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
@@ -83,21 +91,31 @@ function StatCard({ label, value, sub, icon: Icon, tone = "default" }) {
 
 function App() {
   const [status, setStatus] = useState(null);
+  const [stats, setStats] = useState(null);
   const [trades, setTrades] = useState([]);
   const [equity, setEquity] = useState([]);
   const [transitions, setTransitions] = useState([]);
   const [busy, setBusy] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
 
+  // Live-toggle confirmation dialog
+  const [confirmLive, setConfirmLive] = useState(false);
+
+  // Editable paper capital
+  const [editingCap, setEditingCap] = useState(false);
+  const [capInput, setCapInput] = useState("");
+
   const fetchAll = useCallback(async () => {
     try {
-      const [s, t, e, tr] = await Promise.all([
+      const [s, st, t, e, tr] = await Promise.all([
         axios.get(`${API}/bot/status`),
+        axios.get(`${API}/bot/stats`),
         axios.get(`${API}/bot/trades?limit=50`),
         axios.get(`${API}/bot/equity?limit=200`),
         axios.get(`${API}/bot/transitions?limit=30`),
       ]);
       setStatus(s.data);
+      setStats(st.data);
       setTrades(t.data);
       setEquity(e.data);
       setTransitions(tr.data);
@@ -127,10 +145,51 @@ function App() {
     }
   };
 
+  const setMode = async (paperMode) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await axios.post(`${API}/bot/mode`, { paper_mode: paperMode });
+      toast.success(paperMode ? "Switched to PAPER mode" : "Switched to LIVE mode", {
+        description: "Restarting bot to apply change…",
+      });
+      // Apply by restarting the bot (autostart=false so safe even if it wasn't running)
+      try { await axios.post(`${API}/bot/control`, { action: "restart" }); } catch (_) { /* ignore */ }
+      await fetchAll();
+    } catch (err) {
+      toast.error(`Mode change failed: ${err?.response?.data?.detail || err.message}`);
+    } finally {
+      setBusy(false);
+      setConfirmLive(false);
+    }
+  };
+
+  const saveCapital = async () => {
+    const v = Number(capInput);
+    if (!v || v <= 0) {
+      toast.error("Capital must be a positive number");
+      return;
+    }
+    try {
+      await axios.post(`${API}/bot/paper_capital`, { capital: v });
+      toast.success(`Paper capital set to ${fmtINR(v)}`, {
+        description: "Restart the bot to apply.",
+      });
+      setEditingCap(false);
+      await fetchAll();
+    } catch (err) {
+      toast.error(`Failed: ${err?.response?.data?.detail || err.message}`);
+    }
+  };
+
   const fsm = status?.fsm_state || "IDLE";
   const sup = status?.supervisor_state || "UNKNOWN";
   const realized = status?.realized_pnl_today ?? 0;
   const eqSnap = status?.equity_snapshot;
+  const openPos = stats?.open_position;
+  const totalPnl = stats?.total_pnl ?? 0;
+  const winRate = stats?.win_rate ?? 0;
+  const closedTrades = stats?.closed_trades ?? 0;
 
   const equityChartData = equity.map((p) => ({
     t: new Date(p.timestamp).getTime(),
@@ -141,9 +200,10 @@ function App() {
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100" data-testid="dashboard-root">
       <Toaster theme="dark" position="top-right" />
+
       {/* Header */}
       <header className="border-b border-zinc-800 bg-zinc-950/90 backdrop-blur sticky top-0 z-10">
-        <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
+        <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between flex-wrap gap-3">
           <div className="flex items-center gap-4">
             <div className="h-9 w-9 grid place-items-center bg-amber-500/10 border border-amber-500/30 rounded-none">
               <ActivityIcon className="h-4 w-4 text-amber-400" />
@@ -154,14 +214,27 @@ function App() {
             </div>
           </div>
 
-          <div className="flex items-center gap-3">
-            <Badge
-              data-testid="badge-mode"
-              variant="outline"
-              className={`font-mono rounded-none border ${status === null ? "border-zinc-700 text-zinc-500 bg-zinc-900" : status.paper_mode ? "border-amber-600/60 text-amber-300 bg-amber-950/40" : "border-red-600/60 text-red-300 bg-red-950/40"}`}
-            >
-              {status === null ? "—" : status.paper_mode ? "PAPER" : "LIVE"}
-            </Badge>
+          <div className="flex items-center gap-4">
+            {/* Mode toggle */}
+            <div className="flex items-center gap-2 px-3 py-1.5 border border-zinc-800 bg-zinc-900/60 rounded-none">
+              <span className={`text-xs font-mono ${status?.paper_mode ? "text-amber-300" : "text-zinc-500"}`}>
+                PAPER
+              </span>
+              <Switch
+                data-testid="switch-mode"
+                checked={status ? !status.paper_mode : false}
+                disabled={busy || status === null}
+                onCheckedChange={(checked) => {
+                  if (checked) setConfirmLive(true);   // PAPER → LIVE needs confirm
+                  else setMode(true);                  // LIVE → PAPER no confirm
+                }}
+                className="data-[state=checked]:bg-red-600 data-[state=unchecked]:bg-amber-600"
+              />
+              <span className={`text-xs font-mono ${status && !status.paper_mode ? "text-red-300" : "text-zinc-500"}`}>
+                LIVE
+              </span>
+            </div>
+
             <Badge
               data-testid="badge-supervisor"
               variant="outline"
@@ -206,7 +279,9 @@ function App() {
                   <div className="text-zinc-100">{eqSnap?.effective_lots ?? "—"}</div>
                 </div>
                 <div>
-                  <div className="text-[10px] uppercase tracking-wider text-zinc-500">Equity</div>
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500">
+                    {status?.paper_mode ? "Paper Equity" : "Live Cash (RMS)"}
+                  </div>
                   <div className="text-zinc-100">{eqSnap ? fmtINR(eqSnap.current_equity) : "—"}</div>
                 </div>
                 <div>
@@ -220,6 +295,62 @@ function App() {
                   </div>
                 </div>
               </div>
+
+              {/* Paper-mode editable capital */}
+              {status?.paper_mode && (
+                <div className="mt-6 pt-5 border-t border-zinc-800 flex items-center gap-3 flex-wrap">
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-mono">Paper starting capital</div>
+                  {!editingCap ? (
+                    <>
+                      <span data-testid="paper-capital-value" className="font-mono text-amber-300 text-sm">
+                        {fmtINR(status?.paper_starting_capital)}
+                      </span>
+                      <Button
+                        data-testid="btn-edit-capital"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => {
+                          setCapInput(String(status?.paper_starting_capital ?? 200000));
+                          setEditingCap(true);
+                        }}
+                        className="h-7 rounded-none border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-200 font-mono"
+                      >
+                        <PencilIcon className="h-3 w-3 mr-1.5" /> Edit
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <Input
+                        data-testid="input-capital"
+                        type="number"
+                        value={capInput}
+                        onChange={(e) => setCapInput(e.target.value)}
+                        className="h-7 w-36 rounded-none border-zinc-700 bg-zinc-900 text-amber-200 font-mono focus-visible:ring-amber-600"
+                        placeholder="200000"
+                      />
+                      <Button
+                        data-testid="btn-save-capital"
+                        size="sm"
+                        onClick={saveCapital}
+                        className="h-7 rounded-none bg-amber-600 hover:bg-amber-500 text-zinc-950 font-mono"
+                      >
+                        Save
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => setEditingCap(false)}
+                        className="h-7 rounded-none border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-300 font-mono"
+                      >
+                        Cancel
+                      </Button>
+                    </>
+                  )}
+                  <span className="text-[10px] font-mono text-zinc-600">
+                    (restart the bot to apply)
+                  </span>
+                </div>
+              )}
             </Card>
           </motion.div>
 
@@ -252,9 +383,10 @@ function App() {
                 <RotateCwIcon className="h-4 w-4 mr-2" /> Restart
               </Button>
             </div>
-            <div className="mt-5 text-[11px] font-mono text-zinc-500 leading-relaxed border-t border-zinc-800 pt-4">
-              <div className="flex items-center gap-2 text-amber-400 mb-2">
-                <ShieldAlertIcon className="h-3.5 w-3.5" /> Mode: {status?.paper_mode ? "Paper (safe)" : "LIVE — real orders"}
+            <div className="mt-5 text-[11px] font-mono text-zinc-500 leading-relaxed border-t border-zinc-800 pt-4 space-y-2">
+              <div className={`flex items-center gap-2 ${status === null ? "text-zinc-500" : status.paper_mode ? "text-amber-400" : "text-red-400"}`}>
+                <ShieldAlertIcon className="h-3.5 w-3.5" />
+                {status === null ? "Loading mode…" : status.paper_mode ? "PAPER — no real orders fire" : "LIVE — real orders to NSE/NFO"}
               </div>
               <div className="flex items-center gap-2 text-zinc-500">
                 <DatabaseIcon className="h-3.5 w-3.5" /> {status?.db_path}
@@ -263,32 +395,61 @@ function App() {
           </Card>
         </section>
 
+        {/* Current position banner (if any) */}
+        {openPos && (
+          <Card
+            data-testid="open-position-card"
+            className="border-emerald-700/50 bg-emerald-950/20 p-5 rounded-none flex items-center justify-between flex-wrap gap-4"
+          >
+            <div className="flex items-center gap-4">
+              <BriefcaseIcon className="h-5 w-5 text-emerald-400" />
+              <div>
+                <div className="text-[10px] uppercase tracking-[0.2em] text-emerald-400 font-mono">Open position</div>
+                <div className="font-mono text-zinc-100">
+                  {openPos.direction} · qty {openPos.qty} · entry {fmtINR(openPos.entry_price)}
+                </div>
+              </div>
+            </div>
+            <div className="text-xs font-mono text-zinc-500">
+              opened {fmtDateTime(openPos.entry_time)}
+            </div>
+          </Card>
+        )}
+
         {/* Stats row */}
         <section className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           <StatCard
-            label="Realized PnL (today)"
+            label="Total P&L (all-time)"
+            value={fmtINR(totalPnl)}
+            sub={`${closedTrades} closed trades`}
+            icon={WalletIcon}
+            tone={totalPnl > 0 ? "pos" : totalPnl < 0 ? "neg" : "default"}
+          />
+          <StatCard
+            label="Realized P&L (today)"
             value={fmtINR(realized)}
+            sub={`trades today: ${status?.trades_today ?? 0} / 4`}
             icon={realized >= 0 ? TrendingUpIcon : TrendingDownIcon}
             tone={realized > 0 ? "pos" : realized < 0 ? "neg" : "default"}
           />
           <StatCard
-            label="Trades today"
-            value={status?.trades_today ?? "—"}
-            sub="cap: 4 / day"
-            icon={ActivityIcon}
-            tone={status?.trades_today >= 4 ? "warn" : "default"}
+            label="Win rate"
+            value={closedTrades ? `${(winRate * 100).toFixed(1)}%` : "—"}
+            sub={closedTrades ? `${stats?.wins}W · ${stats?.losses}L` : "no closed trades yet"}
+            icon={PercentIcon}
+            tone={winRate >= 0.5 ? "pos" : winRate > 0 ? "warn" : "default"}
           />
           <StatCard
-            label="Effective lots"
-            value={eqSnap?.effective_lots ?? "—"}
-            sub="lot size: 65"
-            tone="default"
-          />
-          <StatCard
-            label="Drawdown"
-            value={eqSnap ? `${(eqSnap.drawdown_pct * 100).toFixed(2)}%` : "—"}
-            sub={eqSnap?.drawdown_pct >= 0.1 ? "sizing scaled down" : "no scaling"}
-            tone={(eqSnap?.drawdown_pct ?? 0) >= 0.1 ? "warn" : "default"}
+            label="Best / Worst"
+            value={
+              <span className="text-base font-mono">
+                <span className="text-emerald-300">{stats?.best_trade ? fmtINR(stats.best_trade) : "—"}</span>
+                <span className="text-zinc-600"> / </span>
+                <span className="text-red-300">{stats?.worst_trade ? fmtINR(stats.worst_trade) : "—"}</span>
+              </span>
+            }
+            sub={`avg ${stats?.avg_pnl ? fmtINR(stats.avg_pnl) : "—"}/trade`}
+            icon={TargetIcon}
           />
         </section>
 
@@ -413,6 +574,42 @@ function App() {
           Single-position FSM · 4-table SQLite ledger · ATR stops · drawdown-aware sizing
         </footer>
       </main>
+
+      {/* PAPER → LIVE confirmation dialog */}
+      <AlertDialog open={confirmLive} onOpenChange={setConfirmLive}>
+        <AlertDialogContent className="bg-zinc-950 border-red-800 rounded-none font-mono">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-red-300 flex items-center gap-2">
+              <ShieldAlertIcon className="h-5 w-5" /> Switch to LIVE mode?
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-zinc-400 text-sm leading-relaxed">
+              The bot will start placing <span className="text-red-300 font-semibold">real orders</span> on
+              NSE/NFO against your Angel One account. It will:
+              <ul className="list-disc list-inside mt-3 space-y-1 text-zinc-300">
+                <li>read your <span className="text-amber-300">actual net available cash</span> via <code className="text-amber-300">rmsLimit()</code></li>
+                <li>size lots based on that real capital</li>
+                <li>place real BUY / SELL / STOPLOSS_LIMIT orders</li>
+              </ul>
+              <span className="block mt-3 text-amber-300">Only proceed during market hours with a verified Angel One session.</span>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel
+              data-testid="cancel-live"
+              className="rounded-none border-zinc-700 bg-zinc-900 hover:bg-zinc-800 text-zinc-200 font-mono"
+            >
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              data-testid="confirm-live"
+              onClick={() => setMode(false)}
+              className="rounded-none bg-red-600 hover:bg-red-500 text-zinc-950 font-mono font-semibold"
+            >
+              Yes, go LIVE
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

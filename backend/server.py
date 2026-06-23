@@ -71,10 +71,61 @@ class ControlRequest(BaseModel):
     action: str   # "start" | "stop" | "restart" | "panic"
 
 
+class ModeRequest(BaseModel):
+    paper_mode: bool
+
+
+class PaperCapitalRequest(BaseModel):
+    capital: float
+
+
+# ──────────────────────────────────────────────────── .env helpers
+ENV_FILE = ROOT_DIR / ".env"
+
+
+def _read_env_value(key: str) -> Optional[str]:
+    if not ENV_FILE.exists():
+        return None
+    for line in ENV_FILE.read_text().splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
+def _update_env_value(key: str, value: str) -> None:
+    """In-place key=value rewrite; appends if missing. Preserves other keys."""
+    if not ENV_FILE.exists():
+        ENV_FILE.write_text(f"{key}={value}\n")
+        return
+    lines = ENV_FILE.read_text().splitlines()
+    found = False
+    for i, ln in enumerate(lines):
+        if ln.startswith(f"{key}="):
+            lines[i] = f"{key}={value}"
+            found = True
+            break
+    if not found:
+        lines.append(f"{key}={value}")
+    ENV_FILE.write_text("\n".join(lines) + "\n")
+
+
 # ──────────────────────────────────────────────────── Routes
 @api.get("/")
 def root() -> dict[str, Any]:
-    return {"name": "Nifty Options Bot Dashboard", "paper_mode": PAPER_MODE}
+    # Re-read env each call so the toggle reflects without backend restart
+    paper = (_read_env_value("PAPER_MODE") or "true").lower() == "true"
+    return {"name": "Nifty Options Bot Dashboard", "paper_mode": paper}
+
+
+def _current_paper_mode() -> bool:
+    return (_read_env_value("PAPER_MODE") or "true").lower() == "true"
+
+
+def _current_paper_capital() -> float:
+    try:
+        return float(_read_env_value("PAPER_STARTING_CAPITAL") or 200_000)
+    except ValueError:
+        return 200_000.0
 
 
 @api.get("/bot/status")
@@ -123,7 +174,8 @@ def bot_status() -> dict[str, Any]:
 
     return {
         "supervisor_state": sup_state,
-        "paper_mode": PAPER_MODE,
+        "paper_mode": _current_paper_mode(),
+        "paper_starting_capital": _current_paper_capital(),
         "fsm_state": fsm["new_state"] if fsm else "IDLE",
         "fsm_last_transition": fsm,
         "equity_snapshot": equity,
@@ -131,6 +183,64 @@ def bot_status() -> dict[str, Any]:
         "realized_pnl_today": float(realized or 0.0),
         "db_path": DB_PATH,
         "server_time_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@api.get("/bot/stats")
+def bot_stats() -> dict[str, Any]:
+    """All-time aggregate stats from the trades table."""
+    with _conn() as c:
+        row = c.execute(
+            """
+            SELECT
+              COUNT(*) AS total_trades,
+              COALESCE(SUM(pnl), 0) AS total_pnl,
+              COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+              COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) AS losses,
+              COALESCE(AVG(pnl), 0) AS avg_pnl,
+              COALESCE(MAX(pnl), 0) AS best_trade,
+              COALESCE(MIN(pnl), 0) AS worst_trade
+            FROM trades
+            WHERE pnl IS NOT NULL
+            """
+        ).fetchone()
+        open_row = c.execute(
+            "SELECT * FROM trades WHERE exit_time IS NULL ORDER BY entry_time DESC LIMIT 1"
+        ).fetchone()
+    closed = int(row["total_trades"] or 0)
+    wins = int(row["wins"] or 0)
+    win_rate = (wins / closed) if closed else 0.0
+    return {
+        "closed_trades": closed,
+        "total_pnl": float(row["total_pnl"] or 0.0),
+        "wins": wins,
+        "losses": int(row["losses"] or 0),
+        "win_rate": round(win_rate, 4),
+        "avg_pnl": float(row["avg_pnl"] or 0.0),
+        "best_trade": float(row["best_trade"] or 0.0),
+        "worst_trade": float(row["worst_trade"] or 0.0),
+        "open_position": dict(open_row) if open_row else None,
+    }
+
+
+@api.post("/bot/mode")
+def set_mode(req: ModeRequest) -> dict[str, Any]:
+    """Flip PAPER_MODE in .env. Caller must restart bot for it to take effect."""
+    _update_env_value("PAPER_MODE", "true" if req.paper_mode else "false")
+    return {
+        "paper_mode": req.paper_mode,
+        "note": "Restart the bot for the change to take effect.",
+    }
+
+
+@api.post("/bot/paper_capital")
+def set_paper_capital(req: PaperCapitalRequest) -> dict[str, Any]:
+    if req.capital <= 0:
+        raise HTTPException(status_code=400, detail="capital must be > 0")
+    _update_env_value("PAPER_STARTING_CAPITAL", str(int(req.capital)))
+    return {
+        "paper_starting_capital": float(req.capital),
+        "note": "Restart the bot to apply the new starting capital.",
     }
 
 

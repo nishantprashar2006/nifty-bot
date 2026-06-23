@@ -128,7 +128,13 @@ class _LiveSmartApiClient:
 class _PaperSmartApiClient:
     """Deterministic in-memory broker for dry-run testing of the FSM."""
 
-    def __init__(self, starting_cash: float = 200_000.0) -> None:
+    def __init__(self, starting_cash: float | None = None) -> None:
+        import os as _os
+        if starting_cash is None:
+            try:
+                starting_cash = float(_os.environ.get("PAPER_STARTING_CAPITAL", "200000"))
+            except ValueError:
+                starting_cash = 200_000.0
         self._cash = starting_cash
         self._orders: dict[str, dict[str, Any]] = {}
         self._lock = threading.RLock()
