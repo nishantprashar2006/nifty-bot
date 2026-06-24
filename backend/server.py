@@ -319,6 +319,27 @@ def set_order_types(req: OrderTypeRequest) -> dict[str, Any]:
     return {"updated": changed, "note": "Restart the bot for the change to take effect."}
 
 
+@api.get("/bot/signal_diagnostic")
+def signal_diagnostic() -> dict[str, Any]:
+    """Snapshot of why no signal fired. Updated every bot tick while in IDLE."""
+    import json
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT value, updated FROM bot_state WHERE key='signal_diag'"
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    if not row:
+        return {}
+    try:
+        d = json.loads(row["value"])
+        d["updated"] = row["updated"]
+        return d
+    except Exception:
+        return {}
+
+
 @api.post("/bot/manual_entry")
 def manual_entry(req: ManualEntryRequest) -> dict[str, Any]:
     """Queue a discretionary CALL or PUT entry. The bot picks this up on its

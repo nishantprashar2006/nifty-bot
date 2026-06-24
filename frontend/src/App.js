@@ -113,6 +113,7 @@ function App() {
   const [trades, setTrades] = useState([]);
   const [equity, setEquity] = useState([]);
   const [transitions, setTransitions] = useState([]);
+  const [diag, setDiag] = useState(null);
   const [busy, setBusy] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
 
@@ -132,18 +133,20 @@ function App() {
 
   const fetchAll = useCallback(async () => {
     try {
-      const [s, st, t, e, tr] = await Promise.all([
+      const [s, st, t, e, tr, dg] = await Promise.all([
         axios.get(`${API}/bot/status`),
         axios.get(`${API}/bot/stats`),
         axios.get(`${API}/bot/trades?limit=50`),
         axios.get(`${API}/bot/equity?limit=200`),
         axios.get(`${API}/bot/transitions?limit=30`),
+        axios.get(`${API}/bot/signal_diagnostic`),
       ]);
       setStatus(s.data);
       setStats(st.data);
       setTrades(t.data);
       setEquity(e.data);
       setTransitions(tr.data);
+      setDiag(dg.data);
       setLastUpdate(new Date());
     } catch (err) {
       console.error("dashboard fetch failed", err);
@@ -645,6 +648,42 @@ function App() {
             </div>
           </div>
         </Card>
+
+        {/* Signal diagnostic */}
+        {diag && diag.note && (
+          <Card data-testid="signal-diagnostic" className="border-zinc-800 bg-zinc-950/70 p-5 rounded-none">
+            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+              <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono">Signal diagnostic</div>
+              <div className="text-[10px] text-zinc-600 font-mono">{diag.note}</div>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-x-6 gap-y-2 text-xs font-mono">
+              {[
+                ["Bars 3m", diag.bars_3m, diag.bars_3m >= 22],
+                ["Bars 15m", diag.bars_15m, diag.bars_15m >= 51],
+                ["RSI", diag.rsi != null ? diag.rsi.toFixed(1) : "—", true],
+                ["ADX", diag.adx != null ? diag.adx.toFixed(1) : "—", diag.adx != null ? diag.adx > diag.adx_min_req : false],
+                ["ADX delta", diag.adx != null && diag.adx_prev != null ? (diag.adx - diag.adx_prev).toFixed(2) : "—",
+                  diag.adx != null && diag.adx_prev != null ? (diag.adx - diag.adx_prev) > diag.adx_delta_req : false],
+                ["VIX", diag.vix != null ? diag.vix.toFixed(2) : "—",
+                  diag.vix != null && diag.vix >= diag.vix_band[0] && diag.vix <= diag.vix_band[1]],
+                ["Macro trend", diag.ema_macro_fast > diag.ema_macro_slow ? "LONG bias" : diag.ema_macro_fast < diag.ema_macro_slow ? "SHORT bias" : "neutral", true],
+                ["3m EMA9/21", diag.ema_fast_3m && diag.ema_slow_3m ? (diag.ema_fast_3m > diag.ema_slow_3m ? "F>S" : "F<S") : "—", true],
+              ].map(([label, val, ok]) => (
+                <div key={label}>
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500">{label}</div>
+                  <div className={`mt-0.5 ${ok === false ? "text-amber-300" : ok === true ? "text-emerald-300" : "text-zinc-200"}`}>
+                    {String(val)}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="mt-3 pt-3 border-t border-zinc-800 text-[10px] font-mono text-zinc-500">
+              Need: ADX &gt; {diag.adx_min_req} · ADX delta &gt; {diag.adx_delta_req} ·
+              RSI &gt; {diag.rsi_long_req} (long) or &lt; {diag.rsi_short_req} (short) ·
+              VIX {diag.vix_band[0]}–{diag.vix_band[1]} · entry window 09:45–14:45 IST
+            </div>
+          </Card>
+        )}
 
         {/* Stats row */}
         <section className="grid grid-cols-2 lg:grid-cols-4 gap-4">

@@ -581,6 +581,7 @@ class NiftyOptionsBot:
     # ────────────────────────────────────────────────────────── FSM steps
     def _step_idle(self) -> None:
         if not self._in_entry_window() or not self._vix_ok():
+            self._update_signal_diag("blocked: outside entry window or VIX")
             return
         if self.positions.has_open_position or self.positions.has_pending_entry:
             return
@@ -589,10 +590,15 @@ class NiftyOptionsBot:
         bars_15m = self.candles.series(config.NIFTY_SPOT_TOKEN, 15).closed_bars()
         snap = self.indicators.build_snapshot(bars_3m, bars_15m)
         if snap.ema9 is None or snap.ema20_15m is None:
+            self._update_signal_diag(f"warming up · bars3m={len(bars_3m)} bars15m={len(bars_15m)}")
             return
 
         regime = self.regime.evaluate(snap)
         cross = self.signal_gen.latest_cross(bars_3m, snap)
+        self._update_signal_diag(
+            f"regime_long={regime.authorize_long} regime_short={regime.authorize_short} "
+            f"cross={cross.direction.name if cross else 'none'}"
+        )
         if cross is None:
             return
 
@@ -615,6 +621,36 @@ class NiftyOptionsBot:
             }
         )
         self._transition(config.State.WAIT_CONFIRMATION)
+
+    def _update_signal_diag(self, note: str) -> None:
+        """Snapshot of why no signal is firing — surfaces in /api/bot/status."""
+        try:
+            import json
+            bars_3m = self.candles.series(config.NIFTY_SPOT_TOKEN, 3).closed_bars()
+            bars_15m = self.candles.series(config.NIFTY_SPOT_TOKEN, 15).closed_bars()
+            snap = self.indicators.build_snapshot(bars_3m, bars_15m)
+            self.db.set_state("signal_diag", json.dumps({
+                "note": note,
+                "bars_3m": len(bars_3m),
+                "bars_15m": len(bars_15m),
+                "rsi": snap.rsi,
+                "adx": snap.adx,
+                "adx_prev": snap.adx_prev,
+                "adx_delta_req": config.ADX_DELTA_MIN,
+                "adx_min_req": config.ADX_MIN,
+                "rsi_long_req": config.RSI_LONG,
+                "rsi_short_req": config.RSI_SHORT,
+                "vix": self.vix.value,
+                "vix_band": [config.VIX_MIN, config.VIX_MAX],
+                "ema_macro_fast": snap.ema20_15m,
+                "ema_macro_slow": snap.ema50_15m,
+                "ema_fast_3m": snap.ema9,
+                "ema_slow_3m": snap.ema21,
+                "last_close": snap.last_close,
+                "vwap": snap.vwap,
+            }))
+        except Exception:
+            pass
 
     def _step_wait_confirmation(self) -> None:
         sig = self._pending_signal
