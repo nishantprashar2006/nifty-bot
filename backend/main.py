@@ -146,6 +146,11 @@ class NiftyOptionsBot:
         )
         self.ws.start()
 
+        # Boot-time orphan recovery: if a trade row exists with no exit_time,
+        # mark it closed (bot lost in-memory state on restart). User can
+        # re-open via Buy Call/Put manually.
+        self._recover_orphan_trade()
+
         # main loop
         try:
             self._main_loop()
@@ -155,6 +160,33 @@ class NiftyOptionsBot:
     def _on_signal(self, *_args) -> None:
         logger.warning("Signal received — initiating graceful shutdown.")
         self._stop.set()
+
+    def _recover_orphan_trade(self) -> None:
+        """Mark any DB-open trade as closed on boot — the in-memory
+        PositionManager just lost it. User can re-open manually if needed."""
+        try:
+            import sqlite3
+            con = sqlite3.connect(config.DB_PATH)
+            con.row_factory = sqlite3.Row
+            row = con.execute(
+                "SELECT trade_id, entry_price FROM trades "
+                "WHERE exit_time IS NULL ORDER BY entry_time DESC LIMIT 1"
+            ).fetchone()
+            if row:
+                from datetime import datetime as _dt, timezone as _tz
+                con.execute(
+                    "UPDATE trades SET exit_time=?, exit_price=?, pnl=?, "
+                    "exit_reason=? WHERE trade_id=?",
+                    (_dt.now(_tz.utc).isoformat(), row["entry_price"], 0.0,
+                     "RESTART_ORPHAN_RECOVERY", row["trade_id"]),
+                )
+                con.commit()
+                logger.warning("Recovered orphan trade %s on boot", row["trade_id"])
+            con.close()
+            # Log a fresh transition so the dashboard doesn't show stale state
+            self.db.log_state_transition("BOOT", "IDLE")
+        except Exception:
+            logger.exception("orphan recovery failed (continuing)")
 
     def _build_token_subscriptions(self) -> list[dict[str, Any]]:
         """Compose the NSE_CM tokens (spot + VIX) the bot needs. ATM CE/PE on
@@ -649,6 +681,81 @@ class NiftyOptionsBot:
                 "last_close": snap.last_close,
                 "vwap": snap.vwap,
             }))
+            # Also update the weighted setup score (Task 1)
+            self._update_setup_score(snap)
+        except Exception:
+            pass
+
+    def _update_setup_score(self, snap) -> None:
+        """Weighted Setup Score (Task 1). Writes to bot_state['setup_score']
+        atomically via SQLite — surfaces in /api/bot/status for the UI."""
+        try:
+            import json
+            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+            base_call = 0
+            base_put = 0
+            if snap.last_close is not None and snap.ema20_15m is not None:
+                if snap.last_close > snap.ema20_15m: base_call += 20
+                if snap.last_close < snap.ema20_15m: base_put += 20
+            if snap.ema9 is not None and snap.ema21 is not None:
+                if snap.ema9 > snap.ema21: base_call += 20
+                if snap.ema9 < snap.ema21: base_put += 20
+            if snap.adx is not None and snap.adx > config.ADX_MIN:
+                base_call += 10
+                base_put += 10
+            if snap.adx is not None and snap.adx_prev is not None:
+                if (snap.adx - snap.adx_prev) > config.ADX_DELTA_MIN:
+                    base_call += 15
+                    base_put += 15
+            if snap.last_close is not None and snap.vwap is not None:
+                if snap.last_close > snap.vwap: base_call += 15
+                if snap.last_close < snap.vwap: base_put += 15
+            vix = self.vix.value
+            if vix is not None and config.VIX_MIN <= vix <= config.VIX_MAX:
+                base_call += 10
+                base_put += 10
+
+            # Liquidity penalty — average spread across CE/PE quotes if present
+            penalties = []
+            for c in (self._ce, self._pe):
+                if c is None: continue
+                q = self._last_option_quote.get(c.token)
+                if not q: continue
+                bid, ask = q.get("bid", 0), q.get("ask", 0)
+                if bid > 0 and ask > 0:
+                    spread_pct = (ask - bid) / ((ask + bid) / 2)
+                    penalties.append(min(spread_pct * 2000, 50))
+            penalty = sum(penalties) / len(penalties) if penalties else 0
+
+            call_score = max(0, round(base_call - penalty))
+            put_score = max(0, round(base_put - penalty))
+
+            def classify(s):
+                if s >= 80: return "STRONG"
+                if s >= 60: return "GOOD"
+                if s >= 40: return "NEUTRAL"
+                if s >= 20: return "WEAK"
+                return "AVOID"
+
+            if call_score > put_score:
+                bias, strength = "CALL", classify(call_score)
+            elif put_score > call_score:
+                bias, strength = "PUT", classify(put_score)
+            else:
+                bias, strength = "NEUTRAL", classify(max(call_score, put_score))
+
+            ist_now = (_dt.now(_tz.utc) + _td(hours=5, minutes=30)).strftime("%H:%M:%S")
+            self.db.set_state("setup_score", json.dumps({
+                "call_score": call_score,
+                "put_score": put_score,
+                "base_call": base_call,
+                "base_put": base_put,
+                "penalty": round(penalty, 1),
+                "bias": bias,
+                "strength": strength,
+                "timestamp": ist_now,
+            }))
         except Exception:
             pass
 
@@ -817,6 +924,10 @@ class NiftyOptionsBot:
                 # Pull at most one pending command per tick (manual entries,
                 # panic exits, etc.) before stepping the FSM.
                 self._drain_command_queue()
+
+                # Continuously refresh the setup-score advisory (Task 1)
+                # so the UI shows live scoring across all FSM states.
+                self._update_signal_diag("tick")
 
                 breach = self._trip_circuit_breakers()
                 if breach and self.state is not config.State.SHUTDOWN:

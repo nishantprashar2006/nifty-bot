@@ -236,6 +236,7 @@ def bot_status() -> dict[str, Any]:
         "trades_today": int(trade_count),
         "realized_pnl_today": float(realized or 0.0),
         "live_quotes": _live_quotes(),
+        "setup_score": _setup_score(),
         "db_path": DB_PATH,
         "server_time_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -259,6 +260,26 @@ def _live_quotes() -> dict[str, Any]:
         return {}
     data["updated"] = row["updated"]
     return data
+
+
+def _setup_score() -> dict[str, Any]:
+    """Weighted Setup Score (Task 1) — Call/Put bias + strength + timestamp."""
+    import json
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT value, updated FROM bot_state WHERE key='setup_score'"
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    if not row:
+        return {}
+    try:
+        d = json.loads(row["value"])
+        d["updated"] = row["updated"]
+        return d
+    except Exception:
+        return {}
 
 
 @api.get("/bot/stats")
@@ -338,6 +359,27 @@ def signal_diagnostic() -> dict[str, Any]:
         return d
     except Exception:
         return {}
+
+
+@api.post("/bot/force_close_orphan")
+def force_close_orphan() -> dict[str, Any]:
+    """Mark any DB-orphaned open trade as exited. Use when the bot was
+    restarted while holding a position — the DB row stays `exit_time IS NULL`
+    but the in-memory PositionManager forgot the position on boot."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT trade_id, entry_price, qty FROM trades "
+            "WHERE exit_time IS NULL ORDER BY entry_time DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return {"closed": False, "note": "no open trade in DB"}
+        c.execute(
+            "UPDATE trades SET exit_time=?, exit_price=?, pnl=?, exit_reason=? "
+            "WHERE trade_id=?",
+            (datetime.now(timezone.utc).isoformat(), row["entry_price"], 0.0,
+             "MANUAL_FORCE_CLOSE", row["trade_id"]),
+        )
+    return {"closed": True, "trade_id": row["trade_id"]}
 
 
 @api.post("/bot/manual_entry")

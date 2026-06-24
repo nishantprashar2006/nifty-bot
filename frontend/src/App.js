@@ -301,6 +301,21 @@ function App() {
     ? (optionLtp - openPos.entry_price) * openPos.qty
     : null;
 
+  // Setup advisory (Task 1)
+  const score = status?.setup_score || {};
+  const scoreStale = score.updated
+    ? (Date.now() - new Date(score.updated).getTime()) / 1000 > 10
+    : false;
+  const callGlow = score.bias === "CALL" ? score.strength : null;
+  const putGlow = score.bias === "PUT" ? score.strength : null;
+
+  function glowClass(strength) {
+    if (strength === "STRONG") return "animate-pulse shadow-[0_0_24px_currentColor] ring-2 ring-current";
+    if (strength === "GOOD")   return "shadow-[0_0_12px_currentColor] ring-1 ring-current";
+    if (strength === "NEUTRAL") return "ring-1 ring-amber-500/70";
+    return "";
+  }
+
   const equityChartData = equity.map((p) => ({
     t: new Date(p.timestamp).getTime(),
     equity: p.current_equity,
@@ -618,7 +633,7 @@ function App() {
                   data-testid="btn-buy-call"
                   onClick={() => setConfirmManual("CALL")}
                   disabled={busy || sup !== "RUNNING"}
-                  className="rounded-none bg-emerald-600 hover:bg-emerald-500 text-zinc-950 font-mono font-semibold disabled:opacity-40"
+                  className={`rounded-none bg-emerald-600 hover:bg-emerald-500 text-zinc-950 font-mono font-semibold disabled:opacity-40 text-emerald-300 ${glowClass(callGlow)}`}
                 >
                   <ArrowUpRightIcon className="h-4 w-4 mr-2" /> Buy Call
                 </Button>
@@ -626,7 +641,7 @@ function App() {
                   data-testid="btn-buy-put"
                   onClick={() => setConfirmManual("PUT")}
                   disabled={busy || sup !== "RUNNING"}
-                  className="rounded-none bg-red-600 hover:bg-red-500 text-zinc-50 font-mono font-semibold disabled:opacity-40"
+                  className={`rounded-none bg-red-600 hover:bg-red-500 text-zinc-50 font-mono font-semibold disabled:opacity-40 text-red-300 ${glowClass(putGlow)}`}
                 >
                   <ArrowDownRightIcon className="h-4 w-4 mr-2" /> Buy Put
                 </Button>
@@ -648,6 +663,65 @@ function App() {
             </div>
           </div>
         </Card>
+
+        {/* Setup advisory — weighted Call/Put scores (Task 1) */}
+        {score.timestamp && (
+          <Card data-testid="setup-advisory" className="border-zinc-800 bg-zinc-950/70 p-5 rounded-none">
+            <div className="flex items-center justify-between flex-wrap gap-2 mb-4">
+              <div>
+                <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono">Setup Advisory</div>
+                <div className="font-mono text-sm text-zinc-200 mt-1">
+                  Bias:{" "}
+                  <span className={
+                    score.bias === "CALL" ? "text-emerald-300" :
+                    score.bias === "PUT" ? "text-red-300" : "text-zinc-400"
+                  }>{score.bias}</span>
+                  <span className="text-zinc-600"> · </span>
+                  <span className={
+                    score.strength === "STRONG" ? "text-emerald-300" :
+                    score.strength === "GOOD" ? "text-blue-300" :
+                    score.strength === "NEUTRAL" ? "text-amber-300" :
+                    "text-zinc-500"
+                  }>{score.strength}</span>
+                </div>
+              </div>
+              <div className="text-[10px] font-mono">
+                {scoreStale ? (
+                  <span className="text-red-400" data-testid="score-stale">⚠ stale ({score.timestamp})</span>
+                ) : (
+                  <span className="text-zinc-500">last updated {score.timestamp} IST</span>
+                )}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              {[
+                { label: "Call score", val: score.call_score, color: "emerald" },
+                { label: "Put score",  val: score.put_score,  color: "red" },
+              ].map((s) => (
+                <div key={s.label} className="space-y-1.5">
+                  <div className="flex items-baseline justify-between font-mono">
+                    <span className="text-[10px] uppercase tracking-wider text-zinc-500">{s.label}</span>
+                    <span className={`text-2xl text-${s.color}-300`}>{s.val ?? 0}</span>
+                  </div>
+                  <div className="h-1.5 bg-zinc-900 border border-zinc-800">
+                    <div
+                      className={`h-full bg-${s.color}-500 transition-all`}
+                      style={{ width: `${Math.min(100, s.val ?? 0)}%` }}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-3 pt-3 border-t border-zinc-800 text-[10px] font-mono text-zinc-500">
+              base call <span className="text-zinc-300">{score.base_call}</span> · base put <span className="text-zinc-300">{score.base_put}</span> · liquidity penalty <span className="text-amber-300">−{score.penalty}</span>
+              <span className="block mt-1">
+                ≥80 STRONG · ≥60 GOOD · ≥40 NEUTRAL · ≥20 WEAK · &lt;20 AVOID. Score = EMA15m (20) + EMA9/21 3m (20) + ADX (10) + ADX-Δ (15) + VWAP (15) + VIX-band (10) − bid-ask spread penalty.
+              </span>
+            </div>
+          </Card>
+        )}
 
         {/* Signal diagnostic */}
         {diag && diag.note && (
