@@ -62,6 +62,8 @@ def _ensure_tables() -> None:
             id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
             action TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}',
             status TEXT NOT NULL DEFAULT 'pending', result TEXT)""",
+        """CREATE TABLE IF NOT EXISTS bot_state (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL, updated TEXT NOT NULL)""",
     ]
     with _conn() as c:
         for s in schema:
@@ -233,9 +235,30 @@ def bot_status() -> dict[str, Any]:
         "equity_snapshot": equity,
         "trades_today": int(trade_count),
         "realized_pnl_today": float(realized or 0.0),
+        "live_quotes": _live_quotes(),
         "db_path": DB_PATH,
         "server_time_utc": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _live_quotes() -> dict[str, Any]:
+    """Latest broker ticks the bot has cached (spot / VIX / option LTP / ts)."""
+    import json
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT value, updated FROM bot_state WHERE key='live_quotes'"
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    if not row:
+        return {}
+    try:
+        data = json.loads(row["value"])
+    except Exception:
+        return {}
+    data["updated"] = row["updated"]
+    return data
 
 
 @api.get("/bot/stats")

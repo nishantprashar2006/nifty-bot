@@ -320,12 +320,35 @@ class NiftyOptionsBot:
         if t.token == config.NIFTY_SPOT_TOKEN:
             self.candles.series(t.token, 3).ingest_tick(t.ltp, t.volume)
             self.candles.series(t.token, 15).ingest_tick(t.ltp, t.volume)
+            self._update_live_state(spot=t.ltp)
             return
         # Option tick
         self._last_option_quote[t.token] = {
             "ltp": t.ltp, "bid": t.bid, "ask": t.ask, "volume": t.volume, "oi": t.oi,
         }
         self.candles.series(t.token, 3).ingest_tick(t.ltp, t.volume)
+        # If this is the open position's contract, push live LTP into bot_state
+        pos = self.positions.open_position
+        if pos and pos.contract_token == t.token:
+            self._update_live_state(option_ltp=t.ltp)
+
+    def _update_live_state(self, spot: Optional[float] = None,
+                            option_ltp: Optional[float] = None) -> None:
+        try:
+            import json
+            current = self.db.get_state("live_quotes")
+            payload = json.loads(current[0]) if current else {}
+            if spot is not None:
+                payload["spot"] = spot
+            if option_ltp is not None:
+                payload["option_ltp"] = option_ltp
+            vix_val = self.vix.value
+            if vix_val is not None:
+                payload["vix"] = vix_val
+            payload["ts"] = time.time()
+            self.db.set_state("live_quotes", json.dumps(payload))
+        except Exception:
+            pass
 
     def _on_order(self, ev: OrderEvent) -> None:
         # Once terminal, ignore everything (prevents SHUTDOWN ↔ FORCED_EXIT loop)
@@ -646,10 +669,11 @@ class NiftyOptionsBot:
         if p.age_seconds() >= config.ORDER_TIMEOUT_SEC:
             logger.warning("Entry order %s unfilled in %ds — cancelling.",
                            p.order_id, config.ORDER_TIMEOUT_SEC)
-            try:
-                self.broker.cancel_order(p.order_id)
-            except Exception:
-                pass
+            if p.order_id and p.order_id not in (None, "None", ""):
+                try:
+                    self.broker.cancel_order(p.order_id)
+                except Exception:
+                    logger.exception("cancel_order failed (continuing)")
             self.positions.clear_pending()
             self._transition(config.State.IDLE)
 

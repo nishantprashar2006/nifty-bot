@@ -289,6 +289,15 @@ function App() {
   const winRate = stats?.win_rate ?? 0;
   const closedTrades = stats?.closed_trades ?? 0;
 
+  // Live broker ticks
+  const lq = status?.live_quotes || {};
+  const lastTickTs = lq.ts ? new Date(lq.ts * 1000) : null;
+  const tickAgeSec = lastTickTs ? Math.max(0, Math.round((Date.now() - lastTickTs.getTime()) / 1000)) : null;
+  const optionLtp = lq.option_ltp ?? null;
+  const livePnl = openPos && optionLtp != null
+    ? (optionLtp - openPos.entry_price) * openPos.qty
+    : null;
+
   const equityChartData = equity.map((p) => ({
     t: new Date(p.timestamp).getTime(),
     equity: p.current_equity,
@@ -344,6 +353,34 @@ function App() {
               <CircleDotIcon className="h-3 w-3 mr-1.5" />
               {sup}
             </Badge>
+            <div
+              data-testid="last-tick"
+              className="hidden md:flex items-center gap-1.5 text-[10px] font-mono px-2 py-1 border border-zinc-800 bg-zinc-900/60"
+              title="Tick = a price update from Angel One. Green pulse = ticks flowing within the last 3 s."
+            >
+              <span className={`h-1.5 w-1.5 rounded-full ${
+                tickAgeSec == null ? "bg-zinc-600"
+                : tickAgeSec < 3 ? "bg-emerald-400 animate-pulse"
+                : tickAgeSec < 10 ? "bg-amber-400"
+                : "bg-red-400"
+              }`} />
+              <span className="text-zinc-500">tick</span>
+              <span className="text-zinc-300">
+                {tickAgeSec == null ? "—" : tickAgeSec < 60 ? `${tickAgeSec}s` : `${Math.round(tickAgeSec/60)}m`}
+              </span>
+              {lq.spot != null && (
+                <>
+                  <span className="text-zinc-600 mx-1">·</span>
+                  <span className="text-amber-300">N {Math.round(lq.spot).toLocaleString("en-IN")}</span>
+                </>
+              )}
+              {lq.vix != null && (
+                <>
+                  <span className="text-zinc-600 mx-1">·</span>
+                  <span className="text-blue-300">VIX {lq.vix.toFixed(2)}</span>
+                </>
+              )}
+            </div>
             <span className="text-[10px] font-mono text-zinc-500 hidden md:inline">
               {lastUpdate ? `synced ${fmtTime(lastUpdate.toISOString())}` : "syncing…"}
             </span>
@@ -532,10 +569,25 @@ function App() {
                   qty <span className="text-zinc-200">{openPos.qty}</span>
                   <span className="text-zinc-500"> · </span>
                   entry <span className="text-zinc-200">{fmtINR(openPos.entry_price)}</span>
+                  {optionLtp != null && (
+                    <>
+                      <span className="text-zinc-500"> · </span>
+                      LTP <span className="text-zinc-200">{fmtINR(optionLtp)}</span>
+                    </>
+                  )}
                   {openPos.source === "manual" && (
                     <span className="ml-2 px-1.5 py-0.5 text-[10px] border border-amber-700 text-amber-300 font-mono">
                       MANUAL
                     </span>
+                  )}
+                  {livePnl != null && (
+                    <div
+                      data-testid="live-pnl"
+                      className={`mt-2 text-base ${livePnl >= 0 ? "text-emerald-300" : "text-red-300"}`}
+                    >
+                      <span className="text-[10px] uppercase tracking-wider text-zinc-500 mr-2">Live P&L</span>
+                      {livePnl >= 0 ? "+" : ""}{fmtINR(livePnl)}
+                    </div>
                   )}
                 </div>
               ) : (

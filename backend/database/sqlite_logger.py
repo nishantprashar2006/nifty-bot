@@ -87,6 +87,13 @@ class SqliteLogger:
         )
         """,
         "CREATE INDEX IF NOT EXISTS idx_commands_status ON commands(status)",
+        """
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key      TEXT PRIMARY KEY,
+            value    TEXT NOT NULL,
+            updated  TEXT NOT NULL
+        )
+        """,
     ]
 
     def __init__(self, db_path: str) -> None:
@@ -291,6 +298,21 @@ class SqliteLogger:
                 "UPDATE commands SET status=?, result=? WHERE id=?",
                 ("done" if ok else "failed", result, cmd_id),
             )
+
+    # ───────────────────────────────────────────────────── bot live state
+    def set_state(self, key: str, value: str) -> None:
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO bot_state(key, value, updated) VALUES (?, ?, ?)",
+                (key, value, _utc_iso()),
+            )
+
+    def get_state(self, key: str) -> Optional[tuple[str, str]]:
+        with self._cursor() as cur:
+            row = cur.execute(
+                "SELECT value, updated FROM bot_state WHERE key = ?", (key,)
+            ).fetchone()
+        return row if row else None
 
 
 _singleton: Optional[SqliteLogger] = None

@@ -95,14 +95,29 @@ class _LiveSmartApiClient:
     def place_order(self, payload: dict[str, Any]) -> str:
         with self._lock:
             resp = self._api.placeOrder(payload)
-            if isinstance(resp, dict) and not resp.get("status", True):
-                raise SmartApiError(f"placeOrder rejected: {resp}")
-            # smartapi returns the order id string directly on success
-            return str(resp.get("data", {}).get("orderid", resp) if isinstance(resp, dict) else resp)
+            # Angel returns dict {success: False, message, errorCode} on errors;
+            # the smartapi-python SDK ALSO logs and returns it instead of raising.
+            if isinstance(resp, dict):
+                if not resp.get("status", True) or resp.get("success") is False:
+                    msg = resp.get("message") or resp.get("errorMessage") or str(resp)
+                    raise SmartApiError(f"placeOrder rejected: {msg}")
+                data = resp.get("data") or {}
+                oid = data.get("orderid") if isinstance(data, dict) else None
+                if not oid:
+                    raise SmartApiError(f"placeOrder returned no orderid: {resp}")
+                return str(oid)
+            if not resp or resp == "None":
+                raise SmartApiError("placeOrder returned empty response")
+            return str(resp)
 
     def cancel_order(self, order_id: str, variety: str = "NORMAL") -> None:
         with self._lock:
-            self._api.cancelOrder(order_id, variety)
+            resp = self._api.cancelOrder(order_id, variety)
+            if isinstance(resp, dict) and (
+                not resp.get("status", True) or resp.get("success") is False
+            ):
+                msg = resp.get("message") or str(resp)
+                raise SmartApiError(f"cancelOrder rejected: {msg}")
 
     def order_book(self) -> list[dict[str, Any]]:
         with self._lock:
