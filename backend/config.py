@@ -168,3 +168,15 @@ ANGEL_API_KEY = os.getenv("ANGEL_API_KEY", "")
 ANGEL_CLIENT_ID = os.getenv("ANGEL_CLIENT_ID", "")
 ANGEL_PIN = os.getenv("ANGEL_PIN", "")
 ANGEL_TOTP_KEY = os.getenv("ANGEL_TOTP_KEY", "")
+
+# ────────────────────────────────────────────────────────────────────
+# 12. SMC Engine (independent — does NOT influence indicator engine)
+# ────────────────────────────────────────────────────────────────────
+SMC_WINDOW_START = time(9, 20)
+SMC_WINDOW_END = time(15, 0)
+# Auto-expire a generated SMC signal after this many minutes if it hasn't
+# been executed. Configurable via env so users can tune without code changes.
+try:
+    MAX_SIGNAL_AGE_MINUTES: int = int(os.getenv("SMC_MAX_SIGNAL_AGE_MIN", "5"))
+except ValueError:
+    MAX_SIGNAL_AGE_MINUTES = 5

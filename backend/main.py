@@ -111,6 +111,11 @@ class NiftyOptionsBot:
         # record can be tagged on fill.
         self._pending_source: Optional[str] = None
 
+        # SMC signal freshness tracker — independent of indicator FSM.
+        # Holds {'direction', 'confidence', 'grade', 'generated_at'} for the
+        # current live SMC signal. Auto-expires after MAX_SIGNAL_AGE_MINUTES.
+        self._smc_signal: Optional[dict] = None
+
     # ────────────────────────────────────────────────────────── lifecycle
     def start(self) -> None:
         _configure_logging()
@@ -778,22 +783,24 @@ class NiftyOptionsBot:
     # Smart Money Concepts engine — completely decoupled from the indicator
     # engine above. Own 5m/15m timeframes, own 09:20–15:00 IST window, own
     # state row in bot_state. Indicator-engine logic is NOT touched.
-    SMC_WINDOW_START = dtime(9, 20)
-    SMC_WINDOW_END = dtime(15, 0)
-
     def _update_smc_score(self) -> None:
         try:
             import json
             from datetime import datetime as _dt, timezone as _tz, timedelta as _td
 
             t_ist = _ist_time()
-            in_window = self.SMC_WINDOW_START <= t_ist <= self.SMC_WINDOW_END
+            in_window = config.SMC_WINDOW_START <= t_ist <= config.SMC_WINDOW_END
             bars_5m = self.candles.series(config.NIFTY_SPOT_TOKEN, 5).closed_bars()
             bars_15m = self.candles.series(config.NIFTY_SPOT_TOKEN, 15).closed_bars()
 
-            ist_now = (_dt.now(_tz.utc) + _td(hours=5, minutes=30)).strftime("%H:%M:%S")
+            now_utc = _dt.now(_tz.utc)
+            ist_now = (now_utc + _td(hours=5, minutes=30)).strftime("%H:%M:%S")
 
             if not in_window:
+                # outside SMC window — flush any pending signal so a stale one
+                # doesn't survive the lunch break.
+                if self._smc_signal is not None:
+                    self._smc_signal = None
                 self.db.set_state("smc_score", json.dumps({
                     "direction": "NEUTRAL",
                     "confidence": 0,
@@ -801,22 +808,75 @@ class NiftyOptionsBot:
                     "strength": "OFF",
                     "reasons": ["outside SMC window 09:20–15:00 IST"],
                     "entry": None, "stop_loss": None, "target": None,
+                    "market_structure": "—",
+                    "htf_trend": "—",
+                    "regime": "—",
+                    "signal_age_sec": None,
+                    "signal_max_age_sec": config.MAX_SIGNAL_AGE_MINUTES * 60,
                     "bars_5m": len(bars_5m), "bars_15m": len(bars_15m),
                     "timestamp": ist_now,
                 }))
                 return
 
             result = smc_evaluate(bars_5m, bars_15m)
-            grade = _smc_grade(result.confidence)
+
+            # ── Signal freshness: emit, age, expire (with logging)
+            signal_age_sec: Optional[int] = None
+            expired = False
+            if result.direction in ("CALL", "PUT") and result.confidence > 0:
+                if (
+                    self._smc_signal is None
+                    or self._smc_signal["direction"] != result.direction
+                ):
+                    # New signal — start the freshness clock and log it
+                    self._smc_signal = {
+                        "direction": result.direction,
+                        "confidence": result.confidence,
+                        "grade": _smc_grade(result.confidence),
+                        "generated_at": now_utc.isoformat(),
+                    }
+                    logger.info(
+                        "SMC BUY %s (%d%%) generated  grade=%s  HTF=%s  structure=%s",
+                        result.direction, result.confidence,
+                        _smc_grade(result.confidence),
+                        (result.ctx.htf_trend if result.ctx else "—"),
+                        (result.ctx.structure if result.ctx else "—"),
+                    )
+                # Age check
+                gen = _dt.fromisoformat(self._smc_signal["generated_at"])
+                age = (now_utc - gen).total_seconds()
+                if age >= config.MAX_SIGNAL_AGE_MINUTES * 60:
+                    logger.info(
+                        "SMC signal expired (age %.0fs ≥ %dm) — re-scanning",
+                        age, config.MAX_SIGNAL_AGE_MINUTES,
+                    )
+                    self._smc_signal = None
+                    expired = True
+                    signal_age_sec = int(age)
+                else:
+                    signal_age_sec = int(age)
+            else:
+                # NEUTRAL or zero confidence — drop any active signal
+                if self._smc_signal is not None:
+                    self._smc_signal = None
+
+            ctx = result.ctx
+            grade = _smc_grade(result.confidence) if not expired else "EXPIRED"
             payload = {
-                "direction": result.direction,
-                "confidence": result.confidence,
+                "direction": "NEUTRAL" if expired else result.direction,
+                "confidence": 0 if expired else result.confidence,
                 "grade": grade,
-                "strength": smc_classify(result.confidence),
-                "reasons": list(result.reasons or []),
-                "entry": result.entry,
-                "stop_loss": result.stop_loss,
-                "target": result.target,
+                "strength": "EXPIRED" if expired else smc_classify(result.confidence),
+                "reasons": (["signal expired — re-scanning"] if expired
+                            else list(result.reasons or [])),
+                "entry": None if expired else result.entry,
+                "stop_loss": None if expired else result.stop_loss,
+                "target": None if expired else result.target,
+                "market_structure": (ctx.structure if ctx else "NEUTRAL"),
+                "htf_trend": (ctx.htf_trend if ctx else "NEUTRAL"),
+                "regime": (ctx.regime if ctx else "UNCLEAR"),
+                "signal_age_sec": signal_age_sec,
+                "signal_max_age_sec": config.MAX_SIGNAL_AGE_MINUTES * 60,
                 "bars_5m": len(bars_5m),
                 "bars_15m": len(bars_15m),
                 "timestamp": ist_now,

@@ -874,6 +874,69 @@ function App() {
             </div>
           </div>
 
+          {/* Structural context — Market Structure · HTF Trend · Regime */}
+          <div className="grid grid-cols-3 gap-3 font-mono text-xs mb-3 border-t border-zinc-800 pt-3">
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500">HTF Trend (15m)</div>
+              <div
+                data-testid="smc-htf-trend"
+                className={`mt-0.5 ${
+                  smc.htf_trend === "CALL" ? "text-emerald-300"
+                  : smc.htf_trend === "PUT" ? "text-red-300"
+                  : "text-zinc-400"
+                }`}
+              >
+                {smc.htf_trend === "CALL" ? "Bullish (HH+HL)"
+                  : smc.htf_trend === "PUT" ? "Bearish (LH+LL)"
+                  : (smc.htf_trend || "—")}
+              </div>
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500">Market Structure (5m)</div>
+              <div
+                data-testid="smc-structure"
+                className={`mt-0.5 ${
+                  smc.market_structure === "CALL" ? "text-emerald-300"
+                  : smc.market_structure === "PUT" ? "text-red-300"
+                  : "text-zinc-400"
+                }`}
+              >
+                {smc.market_structure === "CALL" ? "Bullish (HH+HL)"
+                  : smc.market_structure === "PUT" ? "Bearish (LH+LL)"
+                  : (smc.market_structure || "—")}
+              </div>
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500">Regime</div>
+              <div
+                data-testid="smc-regime"
+                className={`mt-0.5 ${
+                  smc.regime === "TRENDING" ? "text-emerald-300"
+                  : smc.regime === "SIDEWAYS" ? "text-amber-300"
+                  : smc.regime === "HIGH_VOL" ? "text-red-300"
+                  : smc.regime === "LOW_VOL" ? "text-blue-300"
+                  : "text-zinc-400"
+                }`}
+              >
+                {smc.regime || "—"}
+              </div>
+            </div>
+          </div>
+
+          {/* Signal freshness — auto-expires after SMC_MAX_SIGNAL_AGE_MIN */}
+          {smc.signal_age_sec != null && smc.signal_max_age_sec != null && (
+            <div className="font-mono text-[10px] text-zinc-500 mb-3" data-testid="smc-signal-age">
+              <span className="uppercase tracking-wider">Signal age </span>
+              <span className={
+                smc.signal_age_sec >= smc.signal_max_age_sec * 0.8
+                  ? "text-amber-300" : "text-zinc-300"
+              }>
+                {smc.signal_age_sec}s
+              </span>
+              <span className="text-zinc-600"> / {smc.signal_max_age_sec}s · auto-expires</span>
+            </div>
+          )}
+
           {smc.reasons && smc.reasons.length > 0 && (
             <div className="border-t border-zinc-800 pt-3">
               <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-mono mb-1.5">Reasons</div>
@@ -888,7 +951,8 @@ function App() {
           <div className="mt-3 pt-3 border-t border-zinc-800 text-[10px] font-mono text-zinc-500">
             Grade: 95+ A+ · 90+ A · 85+ B+ · 80+ B · 75+ C · &lt;75 D.
             <span className="block mt-1">
-              Weights: HTF Trend 20 · Structure 15 · BOS/CHoCH 20 · Sweep 15 · OB Retest 15 · FVG 10 · Premium/Discount 5. 5m execution · 15m HTF · 09:20–15:00 IST.
+              Weights: HTF Trend 20 · Structure 15 · BOS/CHoCH 20 · Sweep 15 · OB Retest 15 · FVG 10 · Premium/Discount 5.
+              5m execution · 15m HTF (structure-based) · 09:20–15:00 IST · auto-expire after SMC_MAX_SIGNAL_AGE_MIN.
             </span>
           </div>
         </Card>

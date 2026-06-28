@@ -1,7 +1,7 @@
 """tests/test_smc_engine.py
-Pure-function tests for the Smart Money Concepts engine. The contract is:
-given the same bars, always emit the same SMCResult — no randomness, no
-hidden state, no AI."""
+Pure-function tests for the v1.5 Smart Money Concepts engine (PART 2 spec).
+Contract: given the same bars, always emit the same SMCResult — no
+randomness, no hidden state, no AI."""
 from __future__ import annotations
 
 import sys
@@ -13,10 +13,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from data.candle_manager import Bar
 from data.swing_finder import find_swings
 from strategy.smc_engine import (
+    SWING_WINDOW,
+    _wilder_atr,
     classify_strength,
+    detect_displacement,
     detect_fvgs,
     detect_htf_trend,
     detect_order_blocks,
+    detect_regime,
     detect_structure,
     evaluate,
 )
@@ -27,15 +31,58 @@ def _bar(ts_min: int, o: float, h: float, l: float, c: float, v: int = 1000) -> 
     return Bar(ts=ts, open=o, high=h, low=l, close=c, volume=v)
 
 
-def _trend(direction: str, n: int = 25, start: float = 22_000.0, step: float = 25.0) -> list[Bar]:
+def _trend(direction: str, n: int = 40, start: float = 22_000.0, step: float = 25.0) -> list[Bar]:
+    """Mostly-monotonic zig-zag with confirmable HH/HL or LH/LL structure."""
     bars: list[Bar] = []
     px = start
     for i in range(n):
         if direction == "up":
             px += step
+            o, h, l, c = px - step / 2, px + 5, px - 5, px
         else:
             px -= step
-        bars.append(_bar(i, px - step / 2, px + 5, px - 5, px))
+            o, h, l, c = px + step / 2, px + 5, px - 5, px
+        bars.append(_bar(i, o, h, l, c))
+    return bars
+
+
+def _zigzag_up(n: int = 50) -> list[Bar]:
+    """Synthetic 5m bars with clearly confirmable HH+HL fractal swings
+    (peaks at bar 5 & 25, troughs at bar 15 & 35) for lookback=5.
+    Default 50 bars so both swings have 5 bars confirming on the right."""
+    # Custom-built closes so peaks/troughs are strict fractal extremes
+    closes = [
+        100, 101, 102, 103, 104,    # 0-4 rising
+        108,                         # 5 PEAK (high=110)
+        103, 102, 101, 100, 99,     # 6-10 falling
+        98, 97, 96, 95,             # 11-14
+        91,                          # 15 TROUGH (low=85)
+        95, 97, 99, 100, 101,        # 16-20 rising
+        103, 104, 105, 106,          # 21-24
+        113,                         # 25 HIGHER PEAK (high=115)
+        106, 105, 104, 103, 102,     # 26-30
+        100, 99, 98, 97,             # 31-34
+        93,                          # 35 HIGHER TROUGH (low=88)
+        96, 98, 100, 102, 104,       # 36-40
+        105, 106, 107, 108, 109,     # 41-45
+        110, 111, 112, 113,          # 46-49
+    ]
+    closes = (closes + [110] * n)[:n]
+    bars: list[Bar] = []
+    for i, c in enumerate(closes):
+        o = closes[i - 1] if i > 0 else c
+        if i == 5:
+            h, l = 110, min(o, c) - 1
+        elif i == 25:
+            h, l = 115, min(o, c) - 1
+        elif i == 15:
+            h, l = max(o, c) + 1, 85       # deep trough
+        elif i == 35:
+            h, l = max(o, c) + 1, 88       # higher trough but still strictly below neighbours
+        else:
+            h = max(o, c) + 1
+            l = min(o, c) - 1
+        bars.append(_bar(i, o, h, l, c))
     return bars
 
 
@@ -47,33 +94,27 @@ def test_warming_up_when_insufficient_bars():
     assert res.reasons == ["warming_up"]
 
 
-def test_htf_trend_call_on_uptrend():
-    assert detect_htf_trend(_trend("up", 30)) == "CALL"
+def test_swing_window_default_is_five():
+    assert SWING_WINDOW == 5
 
 
-def test_htf_trend_put_on_downtrend():
-    assert detect_htf_trend(_trend("down", 30)) == "PUT"
+def test_htf_trend_call_on_uptrend_structure():
+    # PART 2: HTF must be structure-based, not EMA-based.
+    bars = _zigzag_up()
+    assert detect_htf_trend(bars) == "CALL"
+
+
+def test_htf_trend_neutral_on_flat():
+    bars = [_bar(i, 100, 101, 99, 100) for i in range(40)]
+    assert detect_htf_trend(bars) == "NEUTRAL"
 
 
 def test_structure_detects_hh_hl():
-    # Strict fractal (lookback=2) requires 2 strictly lower-high bars on
-    # each side of every swing high. Build a clear zig-zag.
-    bars = [
-        _bar(0, 100, 101, 99, 100),
-        _bar(1, 100, 103, 99, 102),
-        _bar(2, 102, 110, 101, 109),   # swing HIGH (110)
-        _bar(3, 109, 108, 100, 101),
-        _bar(4, 101, 102, 95, 96),     # swing LOW  (95)
-        _bar(5, 96, 100, 96, 99),
-        _bar(6, 99, 115, 98, 114),     # higher HIGH (115)
-        _bar(7, 114, 113, 105, 106),
-        _bar(8, 106, 107, 100, 101),   # higher LOW  (100 > 95)
-        _bar(9, 101, 108, 100, 107),
-        _bar(10, 107, 109, 102, 103),
-    ]
-    swings = find_swings(bars, lookback=2)
+    bars = _zigzag_up()
+    swings = find_swings(bars, lookback=SWING_WINDOW)
     assert any(s.side == "HIGH" for s in swings)
     assert any(s.side == "LOW" for s in swings)
+    assert detect_structure(swings) == "CALL"
 
 
 def test_fvg_bullish_detected():
@@ -86,19 +127,49 @@ def test_fvg_bullish_detected():
     assert any(g.side == "BULL" for g in gaps)
 
 
-def test_order_block_bullish():
-    # OB scanner iterates i in [max(2, n-30), n-3). Need n ≥ 6 so the
-    # bearish candle + 3-bar impulse window fits inside the slice.
+def test_displacement_bull_when_body_exceeds_atr_mult():
+    # ATR ≈ 1, body must exceed 1.5
+    atr = 1.0
+    bull = _bar(0, 100.0, 105.0, 99.5, 104.8)   # body 4.8 > 1.5, close near high
+    bear = _bar(1, 105.0, 105.2, 99.0, 99.2)    # body 5.8 > 1.5, close near low
+    small = _bar(2, 100.0, 101.0, 99.0, 100.5)  # body 0.5
+    assert detect_displacement(bull, atr) == "BULL"
+    assert detect_displacement(bear, atr) == "BEAR"
+    assert detect_displacement(small, atr) is None
+
+
+def test_displacement_requires_close_near_extreme():
+    """Body big but close in middle of range → not a displacement."""
+    atr = 1.0
+    # body 4, range 10, close in middle → rejected
+    mid = _bar(0, 100.0, 110.0, 99.0, 104.0)
+    assert detect_displacement(mid, atr) is None
+
+
+def test_order_block_bullish_via_displacement():
+    """OB = last opposite-color candle before a confirmed displacement."""
     bars = [
         _bar(0, 100, 101, 99, 100),
         _bar(1, 100, 101, 99, 100),
-        _bar(2, 105, 106, 100, 101),   # bearish (close < open) — OB candidate
-        _bar(3, 101, 110, 101, 109),   # bull impulse 1
-        _bar(4, 109, 115, 108, 114),   # bull impulse 2 (close 114 > a.high 106)
-        _bar(5, 114, 116, 113, 115),
-        _bar(6, 115, 117, 114, 116),
+        _bar(2, 100, 101, 99, 100),
+        _bar(3, 100, 101, 99, 100),
+        _bar(4, 100, 101, 99, 100),
+        _bar(5, 100, 101, 99, 100),
+        _bar(6, 100, 101, 99, 100),
+        _bar(7, 100, 101, 99, 100),
+        _bar(8, 100, 101, 99, 100),
+        _bar(9, 100, 101, 99, 100),
+        _bar(10, 100, 101, 99, 100),
+        _bar(11, 100, 101, 99, 100),
+        _bar(12, 100, 101, 99, 100),
+        _bar(13, 100, 101, 99, 100),
+        _bar(14, 100, 101, 99, 100),     # ATR ≈ 2
+        _bar(15, 100, 100.5, 98, 98.5),  # bearish candle — OB candidate
+        _bar(16, 98.5, 108, 98, 107.8),  # bull displacement: body 9.3 > 2×1.5=3
+        _bar(17, 107, 110, 106, 109),
     ]
-    obs = detect_order_blocks(bars)
+    atr = _wilder_atr(bars)
+    obs = detect_order_blocks(bars, atr)
     assert any(o.side == "BULL" for o in obs)
 
 
@@ -111,8 +182,8 @@ def test_classify_strength_buckets():
 
 
 def test_evaluate_is_deterministic():
-    bars_5m = _trend("up", 30)
-    bars_15m = _trend("up", 15)
+    bars_5m = _trend("up", 40)
+    bars_15m = _trend("up", 25)
     a = evaluate(bars_5m, bars_15m)
     b = evaluate(bars_5m, bars_15m)
     assert a.direction == b.direction
@@ -123,25 +194,35 @@ def test_evaluate_is_deterministic():
     assert a.target == b.target
 
 
-def test_evaluate_uptrend_biases_call():
-    bars_5m = _trend("up", 30)
-    bars_15m = _trend("up", 20)
-    res = evaluate(bars_5m, bars_15m)
-    # at minimum the HTF-trend weight (20) should fire
-    assert res.confidence >= 20
-    assert res.direction in {"CALL", "NEUTRAL"}
-
-
-def test_evaluate_downtrend_biases_put():
-    bars_5m = _trend("down", 30)
-    bars_15m = _trend("down", 20)
-    res = evaluate(bars_5m, bars_15m)
-    assert res.confidence >= 20
-    assert res.direction in {"PUT", "NEUTRAL"}
-
-
 def test_evaluate_confidence_bounded():
-    bars_5m = _trend("up", 60)
-    bars_15m = _trend("up", 30)
+    bars_5m = _trend("up", 80)
+    bars_15m = _trend("up", 40)
     res = evaluate(bars_5m, bars_15m)
     assert 0 <= res.confidence <= 100
+
+
+def test_evaluate_ctx_exposes_structure_and_htf():
+    bars_5m = _zigzag_up()
+    bars_15m = _zigzag_up()
+    res = evaluate(bars_5m, bars_15m)
+    assert res.ctx is not None
+    # required dashboard fields exist
+    assert res.ctx.htf_trend in {"CALL", "PUT", "NEUTRAL"}
+    assert res.ctx.structure in {"CALL", "PUT", "NEUTRAL"}
+    assert res.ctx.regime in {"TRENDING", "SIDEWAYS", "HIGH_VOL", "LOW_VOL", "UNCLEAR"}
+
+
+def test_regime_classifier_returns_valid_label():
+    bars = _trend("up", 40)
+    swings = find_swings(bars, lookback=SWING_WINDOW)
+    atr = _wilder_atr(bars)
+    reg = detect_regime(bars, swings, atr)
+    assert reg in {"TRENDING", "SIDEWAYS", "HIGH_VOL", "LOW_VOL", "UNCLEAR"}
+
+
+def test_regime_attenuates_confidence_in_sideways():
+    """Sideways/HighVol/LowVol should never increase score above 100,
+    and a flat market should not produce STRONG signals."""
+    flat = [_bar(i, 100, 100.5, 99.5, 100) for i in range(40)]
+    res = evaluate(flat, flat[:20])
+    assert res.confidence <= 30

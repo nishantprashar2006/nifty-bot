@@ -50,30 +50,43 @@ modular layout (config, broker, data, strategy, risk, database, main).
 - Unit-tested risk + FSM building blocks
 - Supervisor-managed daemon entry point
 
-## Additions — 2026-02-17 (SMC Engine + Twin Card)
-- New `data/swing_finder.py` (Bill Williams fractal swing detector, lookback=2)
-- New `strategy/smc_engine.py` — fully deterministic SMC scorer with the user's
-  exact weights (Trend 20 / Structure 15 / BOS-CHoCH 20 / Sweep 15 / OB 15 /
-  FVG 10 / Premium-Discount 5). Detects OB, FVG, BOS, CHoCH, Liquidity Sweeps,
-  Premium/Discount, EQH/EQL. Pure function — same input → same SMCResult.
-- `main.py` registers a dedicated **5m spot series** for SMC (3m/15m are NOT
-  touched — the indicator engine stays exactly as before). `_update_smc_score`
-  runs every loop tick during the 09:20–15:00 IST SMC window and persists a
-  JSON payload into `bot_state['smc_score']`. Indicator engine and its window
-  (09:45–14:45 IST, 3m EMA) remain entirely unmodified.
+## Additions — 2026-02-17 (SMC Engine v1.5 · PART 2 spec)
+- New `data/swing_finder.py` (Bill Williams fractal swing detector, configurable lookback — default `SWING_WINDOW=5`)
+- New `strategy/smc_engine.py` (v1.5) — fully deterministic SMC scorer with
+  the user's exact weights (Trend 20 / Structure 15 / BOS-CHoCH 20 / Sweep 15
+  / OB 15 / FVG 10 / Premium-Discount 5). PART 2 compliant:
+    • HTF Trend derived from 15m **structure** (HH/HL vs LH/LL) — NOT EMA
+    • Displacement detector: body > ATR × 1.5 AND close near candle extreme
+    • Order Blocks based on confirmed displacement; tracks `mitigated` + `broken`
+    • CHoCH = **first** structural reversal only; subsequent breaks become BOS
+    • Market Regime classifier (Trending / Sideways / High-Vol / Low-Vol /
+      Unclear). Regime only **attenuates** confidence — never suppresses
+    • Wilder ATR (period 14)
+- New configurable constant `SMC_MAX_SIGNAL_AGE_MIN` (env-driven, default 5).
+  Signals auto-expire if not executed within the window; expiry logged with
+  age for easy review.
+- `main.py` registers a **dedicated 5m spot series** for SMC (3m/15m left
+  untouched). `_update_smc_score` runs every loop tick during 09:20–15:00
+  IST and persists JSON to `bot_state['smc_score']` including:
+  `direction, confidence, grade, reasons, entry, stop_loss, target,
+  market_structure, htf_trend, regime, signal_age_sec, signal_max_age_sec,
+  bars_5m, bars_15m, timestamp`.
 - `server.py` exposes `smc_score` as an **additive** field on
   `GET /api/bot/status` — no breaking changes to existing keys.
 - `frontend/src/App.js`:
     • **Engine Selector** (radio: Indicator / SMC, persisted in localStorage)
-    • **Twin Advisory cards** side-by-side: Indicator Setup Advisory (left)
-      and new SMC Setup Advisory (right) showing direction (BUY CALL / BUY PUT),
-      confidence %, Trade Grade (A+/A/B+/B/C/D), reasons, entry, stop loss,
-      target, and IST timestamp.
+    • **Twin Advisory cards** side-by-side: Indicator (left) + SMC (right)
+    • SMC card shows Direction, Confidence %, Trade Grade (A+/A/B+/B/C/D),
+      Entry, Stop Loss, Target, **HTF Trend (15m)**, **Market Structure (5m)**,
+      **Regime**, **Signal Age**, Reasons, IST timestamp
     • Buy Call / Buy Put button glow follows the currently selected engine's
-      bias only — buttons themselves unchanged.
-- `tests/test_smc_engine.py` — 11 new passing tests covering determinism,
-  primitives (OB, FVG, structure), HTF trend, and confidence bounds. Suite
-  total: 36 passing.
+      bias only — buttons themselves unchanged
+- `tests/test_smc_engine.py` — 17 new passing tests covering determinism,
+  primitives (OB via displacement, FVG, structure, regime), HTF trend (now
+  structure-based), confidence bounds. Suite total: **40 passing**.
+- **Stability**: Indicator Engine (3m/15m, 09:45–14:45 IST, EMA9/21 + macro
+  EMA20/50 + RSI/ADX/VWAP/VIX) is entirely untouched. SIM/LIVE modes,
+  broker integration, FSM, sizing, and OCO are all preserved.
 
 ## Prioritized backlog
 - **P1**: Wire actual Angel SmartAPI websocket message format end-to-end against a real session (paper-tested today; live message shape may need micro-adjustments at first run)
