@@ -124,6 +124,19 @@ class _LiveSmartApiClient:
             resp = self._api.orderBook()
             return resp.get("data", []) if isinstance(resp, dict) else []
 
+    def positions(self) -> list[dict[str, Any]]:
+        """Current open positions (net). Used for crash-recovery — if the
+        bot restarts while a position is open, we adopt it back into the
+        FSM instead of orphaning it on the broker."""
+        with self._lock:
+            try:
+                resp = self._api.position()
+            except Exception as exc:
+                raise SmartApiError(f"position() failed: {exc}") from exc
+            if not isinstance(resp, dict):
+                return []
+            return resp.get("data") or []
+
     def ltp(self, exchange: str, tradingsymbol: str, symboltoken: str) -> float:
         with self._lock:
             resp = self._api.ltpData(exchange, tradingsymbol, symboltoken)
@@ -192,6 +205,10 @@ class _PaperSmartApiClient:
         with self._lock:
             return [{"orderid": k, **v} for k, v in self._orders.items()]
 
+    def positions(self) -> list[dict[str, Any]]:
+        """Paper broker has no carry — always flat at boot."""
+        return []
+
     def ltp(self, exchange: str, tradingsymbol: str, symboltoken: str) -> float:
         return 0.0
 
@@ -226,6 +243,10 @@ class _HybridSmartApiClient(_LiveSmartApiClient):
 
     def order_book(self) -> list[dict[str, Any]]:  # type: ignore[override]
         return [{"orderid": k, **v} for k, v in self._sim_orders.items()]
+
+    def positions(self) -> list[dict[str, Any]]:  # type: ignore[override]
+        """SIM mode is always flat at boot — no real positions to adopt."""
+        return []
 
 
 # ──────────────────────────────────────────────────────────────────────

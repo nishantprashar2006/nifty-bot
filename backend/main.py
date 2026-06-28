@@ -184,31 +184,126 @@ class NiftyOptionsBot:
         self._stop.set()
 
     def _recover_orphan_trade(self) -> None:
-        """Mark any DB-open trade as closed on boot — the in-memory
-        PositionManager just lost it. User can re-open manually if needed."""
+        """PART 3 §15 — Crash-recovery.
+
+        On boot, check the DB for any trade row with no exit_time. If the
+        broker still reports a matching open position, ADOPT it back into
+        the FSM (re-attach to its SL/TP orders, resume trailing). Only
+        when the broker is genuinely flat do we mark the DB row closed —
+        this avoids the previous bug where a DB-close masked a live
+        broker position.
+        """
         try:
             import sqlite3
+            from datetime import datetime as _dt, timezone as _tz
             con = sqlite3.connect(config.DB_PATH)
             con.row_factory = sqlite3.Row
             row = con.execute(
-                "SELECT trade_id, entry_price FROM trades "
+                "SELECT trade_id, direction, entry_price, qty, entry_time, "
+                "sl_price, tp_price FROM trades "
                 "WHERE exit_time IS NULL ORDER BY entry_time DESC LIMIT 1"
             ).fetchone()
-            if row:
-                from datetime import datetime as _dt, timezone as _tz
+            self.db.log_state_transition("BOOT", "IDLE")
+            if not row:
+                con.close()
+                return
+
+            trade_id = row["trade_id"]
+            # Query the broker for open positions
+            try:
+                broker_positions = self.broker.positions() if self.broker else []
+            except Exception as exc:
+                logger.critical(
+                    "Boot recovery: broker.positions() failed (%s). "
+                    "DB orphan %s left open — manual review required.",
+                    exc, trade_id,
+                )
+                con.close()
+                return
+
+            # Filter to non-zero option positions
+            open_opt = [
+                p for p in broker_positions
+                if str(p.get("exchange", "")).upper() == "NFO"
+                and int(float(p.get("netqty") or 0)) != 0
+            ]
+
+            if not open_opt:
+                # Broker is flat — safe to mark DB orphan closed
                 con.execute(
                     "UPDATE trades SET exit_time=?, exit_price=?, pnl=?, "
                     "exit_reason=? WHERE trade_id=?",
                     (_dt.now(_tz.utc).isoformat(), row["entry_price"], 0.0,
-                     "RESTART_ORPHAN_RECOVERY", row["trade_id"]),
+                     "RESTART_ORPHAN_RECOVERY", trade_id),
                 )
                 con.commit()
-                logger.warning("Recovered orphan trade %s on boot", row["trade_id"])
+                con.close()
+                logger.warning(
+                    "Boot recovery: DB orphan %s closed; broker is flat.",
+                    trade_id,
+                )
+                return
+
+            # Broker has an open option position → ADOPT it
+            bp = open_opt[0]
+            net = int(float(bp.get("netqty") or 0))
+            entry_px = float(bp.get("avgnetprice") or bp.get("buyavgprice") or row["entry_price"])
+            symbol = bp.get("tradingsymbol", "")
+            token = str(bp.get("symboltoken", ""))
+            direction = (
+                config.Direction.LONG
+                if "CE" in symbol.upper() else config.Direction.SHORT
+            )
+
+            # Look for resting SL/TP legs in the order book
+            sl_id: Optional[str] = None
+            tp_id: Optional[str] = None
+            try:
+                ob = self.broker.order_book()
+            except Exception:
+                ob = []
+            for o in ob:
+                if str(o.get("symboltoken")) != token:
+                    continue
+                status = str(o.get("status") or o.get("orderstatus") or "").lower()
+                if status not in {"open", "trigger pending", "trigger_pending", "pending"}:
+                    continue
+                ot = str(o.get("ordertype") or "").upper()
+                if "STOPLOSS" in ot or "SL" in ot:
+                    sl_id = str(o.get("orderid"))
+                elif ot == "LIMIT" and str(o.get("transactiontype", "")).upper() == "SELL":
+                    tp_id = str(o.get("orderid"))
+
+            stop_px = float(row["sl_price"] or entry_px * (1 - config.MANUAL_SL_PCT))
+            target_px = float(row["tp_price"] or entry_px * (1 + config.MANUAL_TP_PCT))
+
+            from strategy.position_manager import OpenPosition
+            pos = OpenPosition(
+                trade_id=trade_id,
+                direction=direction,
+                contract_symbol=symbol,
+                contract_token=token,
+                qty=abs(net),
+                lots=max(1, abs(net) // config.LOT_SIZE_NIFTY),
+                entry_price=entry_px,
+                entry_ts=_dt.now(_tz.utc),
+                target_price=target_px,
+                stop_price=stop_px,
+                target_order_id=tp_id,
+                stop_order_id=sl_id,
+                trail_anchor=entry_px,
+                trail_step_pct=config.TRAIL_STEP_PCT,
+            )
+            self.positions.adopt_open_position(pos)
+            self._transition(config.State.POSITION_OPEN)
+            logger.critical(
+                "Boot recovery: ADOPTED broker position %s qty=%d entry=₹%.2f "
+                "(SL order=%s · TP order=%s) — resuming trailing.",
+                symbol, abs(net), entry_px, sl_id, tp_id,
+            )
             con.close()
-            # Log a fresh transition so the dashboard doesn't show stale state
-            self.db.log_state_transition("BOOT", "IDLE")
         except Exception:
-            logger.exception("orphan recovery failed (continuing)")
+            logger.exception("orphan recovery failed (continuing in IDLE)")
 
     def _build_token_subscriptions(self) -> list[dict[str, Any]]:
         """Compose the NSE_CM tokens (spot + VIX) the bot needs. ATM CE/PE on
@@ -1046,42 +1141,59 @@ class NiftyOptionsBot:
         if ltp:
             new_stop = self.positions.maybe_trail_stop(ltp)
             if new_stop is not None and pos.stop_order_id:
-                # cancel-replace stop leg
+                # PART 3 §15 — cancel-replace SL atomically. If the cancel
+                # succeeds but the replace fails, the position has NO active
+                # stop on the broker → force-exit immediately rather than
+                # leaving it unprotected.
                 try:
                     self.broker.cancel_order(pos.stop_order_id)
-                    if config.SL_ORDER_TYPE == "STOPLOSS_MARKET":
-                        new_sl_payload = {
-                            "variety": "NORMAL",
-                            "tradingsymbol": pos.contract_symbol,
-                            "symboltoken": pos.contract_token,
-                            "transactiontype": "SELL",
-                            "exchange": "NFO",
-                            "ordertype": "STOPLOSS_MARKET",
-                            "producttype": "INTRADAY",
-                            "duration": "DAY",
-                            "price": "0",
-                            "triggerprice": round(new_stop, 2),
-                            "quantity": pos.qty,
-                        }
-                    else:
-                        new_sl_payload = {
-                            "variety": "NORMAL",
-                            "tradingsymbol": pos.contract_symbol,
-                            "symboltoken": pos.contract_token,
-                            "transactiontype": "SELL",
-                            "exchange": "NFO",
-                            "ordertype": "STOPLOSS_LIMIT",
-                            "producttype": "INTRADAY",
-                            "duration": "DAY",
-                            "price": round(new_stop, 2),
-                            "triggerprice": round(new_stop * 1.001, 2),
-                            "quantity": pos.qty,
-                        }
+                except Exception:
+                    logger.exception(
+                        "Trail-cancel failed — old SL still active at ₹%.2f, skipping bump",
+                        pos.stop_price,
+                    )
+                    return
+                if config.SL_ORDER_TYPE == "STOPLOSS_MARKET":
+                    new_sl_payload = {
+                        "variety": "NORMAL",
+                        "tradingsymbol": pos.contract_symbol,
+                        "symboltoken": pos.contract_token,
+                        "transactiontype": "SELL",
+                        "exchange": "NFO",
+                        "ordertype": "STOPLOSS_MARKET",
+                        "producttype": "INTRADAY",
+                        "duration": "DAY",
+                        "price": "0",
+                        "triggerprice": round(new_stop, 2),
+                        "quantity": pos.qty,
+                    }
+                else:
+                    new_sl_payload = {
+                        "variety": "NORMAL",
+                        "tradingsymbol": pos.contract_symbol,
+                        "symboltoken": pos.contract_token,
+                        "transactiontype": "SELL",
+                        "exchange": "NFO",
+                        "ordertype": "STOPLOSS_LIMIT",
+                        "producttype": "INTRADAY",
+                        "duration": "DAY",
+                        "price": round(new_stop, 2),
+                        "triggerprice": round(new_stop * 1.001, 2),
+                        "quantity": pos.qty,
+                    }
+                try:
                     new_id = self.broker.place_order(new_sl_payload)
                     self.positions.set_protective_orders(pos.target_order_id, new_id)
-                    logger.info("Stop trailed → %.2f (%s order=%s)", new_stop, config.SL_ORDER_TYPE, new_id)
+                    logger.info(
+                        "Stop trailed → ₹%.2f (%s order=%s)",
+                        new_stop, config.SL_ORDER_TYPE, new_id,
+                    )
                 except Exception:
-                    logger.exception("Trail stop replace failed.")
+                    logger.critical(
+                        "Trail SL re-place FAILED at ₹%.2f — position unprotected, "
+                        "routing to FORCED_EXIT to flatten.", new_stop,
+                    )
+                    self._transition(config.State.FORCED_EXIT)
 
     def _step_forced_exit(self) -> None:
         pos = self.positions.open_position

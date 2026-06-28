@@ -106,6 +106,14 @@ class PositionManager:
                 raise RuntimeError("Single-position lock violated.")
             self._pending = p
 
+    def adopt_open_position(self, pos: OpenPosition) -> None:
+        """Crash-recovery: re-attach to a broker-side position that survived
+        a bot restart. Bypasses the single-position lock since the lock is
+        what we're restoring."""
+        with self._lock:
+            self._open = pos
+            self._pending = None
+
     def clear_pending(self) -> None:
         with self._lock:
             self._pending = None
