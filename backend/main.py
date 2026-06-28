@@ -36,6 +36,7 @@ from strategy.confirmation_engine import ConfirmationEngine
 from strategy.position_manager import PendingEntry, PositionManager
 from strategy.regime_filter import RegimeFilter
 from strategy.signal_generator import SignalGenerator
+from strategy.smc_engine import classify_strength as smc_classify, evaluate as smc_evaluate
 
 logger = logging.getLogger("nifty_bot")
 
@@ -49,6 +50,17 @@ def _now_ist() -> datetime:
 
 def _ist_time() -> dtime:
     return _now_ist().time()
+
+
+# SMC trade-grade mapping (user-specified): 95+ A+, 90+ A, 85+ B+, 80+ B,
+# 75+ C, otherwise D. Independent of the indicator engine's strength bands.
+def _smc_grade(confidence: int) -> str:
+    if confidence >= 95: return "A+"
+    if confidence >= 90: return "A"
+    if confidence >= 85: return "B+"
+    if confidence >= 80: return "B"
+    if confidence >= 75: return "C"
+    return "D"
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -352,6 +364,9 @@ class NiftyOptionsBot:
         if t.token == config.NIFTY_SPOT_TOKEN:
             self.candles.series(t.token, 3).ingest_tick(t.ltp, t.volume)
             self.candles.series(t.token, 15).ingest_tick(t.ltp, t.volume)
+            # SMC engine consumes a dedicated 5m series for the spot — fully
+            # parallel to the indicator engine, which never reads it.
+            self.candles.series(t.token, 5).ingest_tick(t.ltp, t.volume)
             self._update_live_state(spot=t.ltp)
             return
         # Option tick
@@ -759,6 +774,57 @@ class NiftyOptionsBot:
         except Exception:
             pass
 
+    # ─────────────────────────────────────────────── SMC advisory (independent)
+    # Smart Money Concepts engine — completely decoupled from the indicator
+    # engine above. Own 5m/15m timeframes, own 09:20–15:00 IST window, own
+    # state row in bot_state. Indicator-engine logic is NOT touched.
+    SMC_WINDOW_START = dtime(9, 20)
+    SMC_WINDOW_END = dtime(15, 0)
+
+    def _update_smc_score(self) -> None:
+        try:
+            import json
+            from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+            t_ist = _ist_time()
+            in_window = self.SMC_WINDOW_START <= t_ist <= self.SMC_WINDOW_END
+            bars_5m = self.candles.series(config.NIFTY_SPOT_TOKEN, 5).closed_bars()
+            bars_15m = self.candles.series(config.NIFTY_SPOT_TOKEN, 15).closed_bars()
+
+            ist_now = (_dt.now(_tz.utc) + _td(hours=5, minutes=30)).strftime("%H:%M:%S")
+
+            if not in_window:
+                self.db.set_state("smc_score", json.dumps({
+                    "direction": "NEUTRAL",
+                    "confidence": 0,
+                    "grade": "OFF",
+                    "strength": "OFF",
+                    "reasons": ["outside SMC window 09:20–15:00 IST"],
+                    "entry": None, "stop_loss": None, "target": None,
+                    "bars_5m": len(bars_5m), "bars_15m": len(bars_15m),
+                    "timestamp": ist_now,
+                }))
+                return
+
+            result = smc_evaluate(bars_5m, bars_15m)
+            grade = _smc_grade(result.confidence)
+            payload = {
+                "direction": result.direction,
+                "confidence": result.confidence,
+                "grade": grade,
+                "strength": smc_classify(result.confidence),
+                "reasons": list(result.reasons or []),
+                "entry": result.entry,
+                "stop_loss": result.stop_loss,
+                "target": result.target,
+                "bars_5m": len(bars_5m),
+                "bars_15m": len(bars_15m),
+                "timestamp": ist_now,
+            }
+            self.db.set_state("smc_score", json.dumps(payload))
+        except Exception:
+            logger.debug("SMC scoring tick failed (continuing)", exc_info=True)
+
     def _step_wait_confirmation(self) -> None:
         sig = self._pending_signal
         if not sig:
@@ -928,6 +994,10 @@ class NiftyOptionsBot:
                 # Continuously refresh the setup-score advisory (Task 1)
                 # so the UI shows live scoring across all FSM states.
                 self._update_signal_diag("tick")
+
+                # SMC Engine — completely independent of the indicator engine.
+                # Own 5m/15m series, own 09:20–15:00 IST window, own state key.
+                self._update_smc_score()
 
                 breach = self._trip_circuit_breakers()
                 if breach and self.state is not config.State.SHUTDOWN:

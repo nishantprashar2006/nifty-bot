@@ -237,6 +237,7 @@ def bot_status() -> dict[str, Any]:
         "realized_pnl_today": float(realized or 0.0),
         "live_quotes": _live_quotes(),
         "setup_score": _setup_score(),
+        "smc_score": _smc_score(),
         "db_path": DB_PATH,
         "server_time_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -269,6 +270,27 @@ def _setup_score() -> dict[str, Any]:
         with _conn() as c:
             row = c.execute(
                 "SELECT value, updated FROM bot_state WHERE key='setup_score'"
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    if not row:
+        return {}
+    try:
+        d = json.loads(row["value"])
+        d["updated"] = row["updated"]
+        return d
+    except Exception:
+        return {}
+
+
+def _smc_score() -> dict[str, Any]:
+    """Independent SMC engine result — direction, confidence, grade, reasons,
+    entry/SL/TP. Updated every bot loop tick during 09:20–15:00 IST."""
+    import json
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT value, updated FROM bot_state WHERE key='smc_score'"
             ).fetchone()
     except sqlite3.OperationalError:
         return {}

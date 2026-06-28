@@ -131,6 +131,15 @@ function App() {
   // Manual entry confirmation
   const [confirmManual, setConfirmManual] = useState(null);  // null | "CALL" | "PUT"
 
+  // Engine selector: 'indicator' | 'smc' — drives which advisory's bias
+  // lights up the Buy Call / Buy Put buttons. Persists across reloads.
+  const [engine, setEngine] = useState(() =>
+    (typeof window !== "undefined" && window.localStorage?.getItem("selectedEngine")) || "indicator"
+  );
+  useEffect(() => {
+    try { window.localStorage?.setItem("selectedEngine", engine); } catch (_) { /* ignore */ }
+  }, [engine]);
+
   const fetchAll = useCallback(async () => {
     try {
       const [s, st, t, e, tr, dg] = await Promise.all([
@@ -306,8 +315,21 @@ function App() {
   const scoreStale = score.updated
     ? (Date.now() - new Date(score.updated).getTime()) / 1000 > 10
     : false;
-  const callGlow = score.bias === "CALL" ? score.strength : null;
-  const putGlow = score.bias === "PUT" ? score.strength : null;
+
+  // SMC advisory (independent engine)
+  const smc = status?.smc_score || {};
+  const smcStale = smc.updated
+    ? (Date.now() - new Date(smc.updated).getTime()) / 1000 > 10
+    : false;
+
+  // Buy-button glow = bias from the currently selected engine only
+  const selectedBias =
+    engine === "smc" ? (smc.direction === "CALL" || smc.direction === "PUT" ? smc.direction : null)
+                      : (score.bias === "CALL" || score.bias === "PUT" ? score.bias : null);
+  const selectedStrength =
+    engine === "smc" ? smc.strength : score.strength;
+  const callGlow = selectedBias === "CALL" ? selectedStrength : null;
+  const putGlow = selectedBias === "PUT" ? selectedStrength : null;
 
   function glowClass(strength) {
     if (strength === "STRONG") return "animate-pulse shadow-[0_0_24px_currentColor] ring-2 ring-current";
@@ -664,12 +686,51 @@ function App() {
           </div>
         </Card>
 
+        {/* Engine selector — chooses which advisory drives the Buy buttons */}
+        <Card data-testid="engine-selector" className="border-zinc-800 bg-zinc-950/70 p-4 rounded-none">
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono">Selected Engine</div>
+              <div className="text-[10px] font-mono text-zinc-600 mt-1">
+                Buy Call / Buy Put buttons execute the selected engine&apos;s signal. Engines remain fully independent.
+              </div>
+            </div>
+            <div className="flex border border-zinc-800 divide-x divide-zinc-800">
+              {[
+                { id: "indicator", label: "INDICATOR" },
+                { id: "smc",       label: "SMC" },
+              ].map((opt) => {
+                const active = engine === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    data-testid={`engine-${opt.id}`}
+                    onClick={() => setEngine(opt.id)}
+                    className={`px-3 py-1.5 text-xs font-mono font-semibold tracking-wider transition-colors ${
+                      active ? "bg-amber-500/80 text-zinc-950" : "text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60"
+                    }`}
+                  >
+                    {active && <span className="mr-1.5">●</span>}{opt.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </Card>
+
+        {/* Twin advisory cards — Indicator (left) and SMC (right), side by side */}
+        <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Setup advisory — weighted Call/Put scores (Task 1) */}
-        {score.timestamp && (
-          <Card data-testid="setup-advisory" className="border-zinc-800 bg-zinc-950/70 p-5 rounded-none">
+        {score.timestamp ? (
+          <Card
+            data-testid="setup-advisory"
+            className={`border-zinc-800 bg-zinc-950/70 p-5 rounded-none transition-shadow ${
+              engine === "indicator" ? "ring-1 ring-amber-500/40" : ""
+            }`}
+          >
             <div className="flex items-center justify-between flex-wrap gap-2 mb-4">
               <div>
-                <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono">Setup Advisory</div>
+                <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono">Indicator Setup Advisory</div>
                 <div className="font-mono text-sm text-zinc-200 mt-1">
                   Bias:{" "}
                   <span className={
@@ -721,7 +782,117 @@ function App() {
               </span>
             </div>
           </Card>
+        ) : (
+          <Card className="border-zinc-800 bg-zinc-950/70 p-5 rounded-none">
+            <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono">Indicator Setup Advisory</div>
+            <div className="mt-4 text-xs font-mono text-zinc-500">warming up — waiting for first 3m bars…</div>
+          </Card>
         )}
+
+        {/* SMC Advisory — independent engine */}
+        <Card
+          data-testid="smc-advisory"
+          className={`border-zinc-800 bg-zinc-950/70 p-5 rounded-none transition-shadow ${
+            engine === "smc" ? "ring-1 ring-amber-500/40" : ""
+          }`}
+        >
+          <div className="flex items-center justify-between flex-wrap gap-2 mb-4">
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono">SMC Setup Advisory</div>
+              <div className="font-mono text-sm text-zinc-200 mt-1">
+                Direction:{" "}
+                <span className={
+                  smc.direction === "CALL" ? "text-emerald-300" :
+                  smc.direction === "PUT" ? "text-red-300" : "text-zinc-400"
+                }>
+                  {smc.direction === "CALL" ? "BUY CALL"
+                    : smc.direction === "PUT" ? "BUY PUT"
+                    : (smc.direction || "—")}
+                </span>
+                <span className="text-zinc-600"> · </span>
+                <span className="text-amber-300" data-testid="smc-grade">
+                  Grade {smc.grade ?? "—"}
+                </span>
+              </div>
+            </div>
+            <div className="text-[10px] font-mono">
+              {smc.timestamp ? (
+                smcStale ? (
+                  <span className="text-red-400" data-testid="smc-stale">⚠ stale ({smc.timestamp})</span>
+                ) : (
+                  <span className="text-zinc-500">last updated {smc.timestamp} IST</span>
+                )
+              ) : (
+                <span className="text-zinc-500">awaiting first tick…</span>
+              )}
+            </div>
+          </div>
+
+          <div className="space-y-1.5 mb-3">
+            <div className="flex items-baseline justify-between font-mono">
+              <span className="text-[10px] uppercase tracking-wider text-zinc-500">Confidence</span>
+              <span
+                data-testid="smc-confidence"
+                className={
+                  (smc.confidence ?? 0) >= 80 ? "text-2xl text-emerald-300"
+                  : (smc.confidence ?? 0) >= 60 ? "text-2xl text-blue-300"
+                  : (smc.confidence ?? 0) >= 40 ? "text-2xl text-amber-300"
+                  : "text-2xl text-zinc-400"
+                }
+              >
+                {smc.confidence ?? 0}%
+              </span>
+            </div>
+            <div className="h-1.5 bg-zinc-900 border border-zinc-800">
+              <div
+                className={`h-full transition-all ${
+                  smc.direction === "PUT" ? "bg-red-500" : "bg-emerald-500"
+                }`}
+                style={{ width: `${Math.min(100, smc.confidence ?? 0)}%` }}
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-3 font-mono text-xs mb-3">
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500">Entry</div>
+              <div className="text-zinc-200 mt-0.5">
+                {smc.entry != null ? smc.entry.toLocaleString("en-IN") : "—"}
+              </div>
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500">Stop Loss</div>
+              <div className="text-red-300 mt-0.5">
+                {smc.stop_loss != null ? smc.stop_loss.toLocaleString("en-IN") : "—"}
+              </div>
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500">Target</div>
+              <div className="text-emerald-300 mt-0.5">
+                {smc.target != null ? smc.target.toLocaleString("en-IN") : "—"}
+              </div>
+            </div>
+          </div>
+
+          {smc.reasons && smc.reasons.length > 0 && (
+            <div className="border-t border-zinc-800 pt-3">
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-mono mb-1.5">Reasons</div>
+              <ul className="space-y-0.5 font-mono text-[11px] text-zinc-300" data-testid="smc-reasons">
+                {smc.reasons.map((r, i) => (
+                  <li key={i} className="leading-snug">· {r}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="mt-3 pt-3 border-t border-zinc-800 text-[10px] font-mono text-zinc-500">
+            Grade: 95+ A+ · 90+ A · 85+ B+ · 80+ B · 75+ C · &lt;75 D.
+            <span className="block mt-1">
+              Weights: HTF Trend 20 · Structure 15 · BOS/CHoCH 20 · Sweep 15 · OB Retest 15 · FVG 10 · Premium/Discount 5. 5m execution · 15m HTF · 09:20–15:00 IST.
+            </span>
+          </div>
+        </Card>
+        </section>
 
         {/* Signal diagnostic */}
         {diag && diag.note && (

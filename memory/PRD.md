@@ -50,6 +50,31 @@ modular layout (config, broker, data, strategy, risk, database, main).
 - Unit-tested risk + FSM building blocks
 - Supervisor-managed daemon entry point
 
+## Additions — 2026-02-17 (SMC Engine + Twin Card)
+- New `data/swing_finder.py` (Bill Williams fractal swing detector, lookback=2)
+- New `strategy/smc_engine.py` — fully deterministic SMC scorer with the user's
+  exact weights (Trend 20 / Structure 15 / BOS-CHoCH 20 / Sweep 15 / OB 15 /
+  FVG 10 / Premium-Discount 5). Detects OB, FVG, BOS, CHoCH, Liquidity Sweeps,
+  Premium/Discount, EQH/EQL. Pure function — same input → same SMCResult.
+- `main.py` registers a dedicated **5m spot series** for SMC (3m/15m are NOT
+  touched — the indicator engine stays exactly as before). `_update_smc_score`
+  runs every loop tick during the 09:20–15:00 IST SMC window and persists a
+  JSON payload into `bot_state['smc_score']`. Indicator engine and its window
+  (09:45–14:45 IST, 3m EMA) remain entirely unmodified.
+- `server.py` exposes `smc_score` as an **additive** field on
+  `GET /api/bot/status` — no breaking changes to existing keys.
+- `frontend/src/App.js`:
+    • **Engine Selector** (radio: Indicator / SMC, persisted in localStorage)
+    • **Twin Advisory cards** side-by-side: Indicator Setup Advisory (left)
+      and new SMC Setup Advisory (right) showing direction (BUY CALL / BUY PUT),
+      confidence %, Trade Grade (A+/A/B+/B/C/D), reasons, entry, stop loss,
+      target, and IST timestamp.
+    • Buy Call / Buy Put button glow follows the currently selected engine's
+      bias only — buttons themselves unchanged.
+- `tests/test_smc_engine.py` — 11 new passing tests covering determinism,
+  primitives (OB, FVG, structure), HTF trend, and confidence bounds. Suite
+  total: 36 passing.
+
 ## Prioritized backlog
 - **P1**: Wire actual Angel SmartAPI websocket message format end-to-end against a real session (paper-tested today; live message shape may need micro-adjustments at first run)
 - **P1**: Replace order-update WS fallback poller with a real subscription once SDK class name is confirmed in the current `smartapi-python` build
