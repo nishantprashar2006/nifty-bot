@@ -50,6 +50,40 @@ modular layout (config, broker, data, strategy, risk, database, main).
 - Unit-tested risk + FSM building blocks
 - Supervisor-managed daemon entry point
 
+## Additions — 2026-02-17 (PART 3 · Execution & Dashboard Integration)
+- **Auto-entry disabled by default** via `AUTO_ENTRY_ENABLED=false`. The
+  legacy EMA-cross → WAIT_CONFIRMATION → ENTRY pipeline is fully preserved
+  for backward compatibility but bypassed; `_step_idle` exits early with a
+  diagnostic note. Re-enable with `AUTO_ENTRY_ENABLED=true` in `.env`.
+- **Manual-mode SL/TP/Trail percent defaults** (env-configurable):
+  `MANUAL_SL_PCT=15`, `MANUAL_TP_PCT=30`, `TRAIL_STEP_PCT=10`. All three
+  are re-anchored to the **ACTUAL fill price** in
+  `PositionManager.promote_to_open()` and `maybe_trail_stop()`. Auto-mode
+  positions keep their ATR-based stops unchanged.
+- **Editable, sticky Lot Size** in the UI:
+    • `GET /api/bot/manual_lots` returns the drawdown-aware default
+    • The lots input pre-fills from the auto value and refreshes every 5 s
+    • As soon as the user edits, their value becomes authoritative until
+      the trade is submitted (then resets) — premium ticks never overwrite
+      a user-typed value
+    • Locked once the position is open
+- **Engine-tagged trade log** — new `trades` columns: `engine`,
+  `confidence`, `reasons` (JSON), `sl_price`, `tp_price`. Idempotent
+  schema migration for legacy DBs.
+- **Broker connectivity badge** (🟢 Connected / 🔴 Disconnected) backed
+  by `bot_state['broker_status']` (heartbeat-updated by the bot on every
+  tick; flipped to disconnected on WS lapse).
+- **Feed staleness gate** — `/api/bot/status` exposes `feed_stale` +
+  `feed_stale_threshold_sec` (default 10s); Buy Call / Buy Put buttons
+  are disabled when supervisor != RUNNING OR feed stale OR broker
+  disconnected.
+- **UI renamed** "Panic Exit" → "Exit Position" (same endpoint).
+- **Manual entry confirmation dialog** now shows the selected engine,
+  exact lots, and the configured SL/TP/Trail percentages.
+- Manual_entry POST accepts `{direction, engine, lots, confidence,
+  reasons}`. Engine + advisory snapshot are persisted on the resulting
+  trade row.
+
 ## Additions — 2026-02-17 (SMC Engine v1.5 · PART 2 spec)
 - New `data/swing_finder.py` (Bill Williams fractal swing detector, configurable lookback — default `SWING_WINDOW=5`)
 - New `strategy/smc_engine.py` (v1.5) — fully deterministic SMC scorer with

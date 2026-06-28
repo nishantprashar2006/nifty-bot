@@ -100,6 +100,12 @@ class PaperCapitalRequest(BaseModel):
 
 class ManualEntryRequest(BaseModel):
     direction: str   # "CALL" | "PUT"
+    # PART 3 — optional engine selector + user-edited lot size + advisory
+    # snapshot. The bot records these on the resulting trade row.
+    engine: Optional[str] = None        # "indicator" | "smc"
+    lots: Optional[int] = None
+    confidence: Optional[int] = None
+    reasons: Optional[list[str]] = None
 
 
 class OrderTypeRequest(BaseModel):
@@ -223,6 +229,26 @@ def bot_status() -> dict[str, Any]:
             (f"{today}%",),
         ).fetchone()[0]
 
+    # Broker connectivity — independent of supervisor status. The bot writes
+    # 'broker_status' (connected | disconnected | error) to bot_state on every
+    # WS heartbeat / REST refresh. If missing, infer from the live-tick age.
+    quotes = _live_quotes()
+    broker_status = _broker_status() or (
+        "connected" if quotes.get("updated") else "unknown"
+    )
+
+    # Feed staleness — last tick older than FEED_STALE_SECONDS disables Buy
+    feed_stale = False
+    if quotes.get("updated"):
+        try:
+            ts = datetime.fromisoformat(quotes["updated"].replace("Z", "+00:00"))
+            age = (datetime.now(timezone.utc) - ts).total_seconds()
+            feed_stale = age > _feed_stale_threshold()
+        except Exception:
+            feed_stale = True
+    else:
+        feed_stale = True
+
     return {
         "supervisor_state": sup_state,
         "trading_mode": _current_trading_mode(),
@@ -235,12 +261,48 @@ def bot_status() -> dict[str, Any]:
         "equity_snapshot": equity,
         "trades_today": int(trade_count),
         "realized_pnl_today": float(realized or 0.0),
-        "live_quotes": _live_quotes(),
+        "live_quotes": quotes,
         "setup_score": _setup_score(),
         "smc_score": _smc_score(),
         "db_path": DB_PATH,
         "server_time_utc": datetime.now(timezone.utc).isoformat(),
+        # PART 3 — execution gating + manual-mode policy
+        "broker_status": broker_status,
+        "feed_stale": feed_stale,
+        "feed_stale_threshold_sec": _feed_stale_threshold(),
+        "auto_entry_enabled": (
+            _read_env_value("AUTO_ENTRY_ENABLED") or "false"
+        ).lower() == "true",
+        "manual_sl_pct": float(_read_env_value("MANUAL_SL_PCT") or 15.0),
+        "manual_tp_pct": float(_read_env_value("MANUAL_TP_PCT") or 30.0),
+        "trail_step_pct": float(_read_env_value("TRAIL_STEP_PCT") or 10.0),
+        "smc_max_signal_age_min": int(_read_env_value("SMC_MAX_SIGNAL_AGE_MIN") or 5),
     }
+
+
+def _feed_stale_threshold() -> int:
+    try:
+        return int(_read_env_value("FEED_STALE_SECONDS") or 10)
+    except ValueError:
+        return 10
+
+
+def _broker_status() -> Optional[str]:
+    """Latest broker connectivity status posted by the bot, or None."""
+    import json
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT value FROM bot_state WHERE key='broker_status'"
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    try:
+        return json.loads(row["value"]).get("state")
+    except Exception:
+        return None
 
 
 def _live_quotes() -> dict[str, Any]:
@@ -404,6 +466,42 @@ def force_close_orphan() -> dict[str, Any]:
     return {"closed": True, "trade_id": row["trade_id"]}
 
 
+@api.get("/bot/manual_lots")
+def manual_lots_default() -> dict[str, Any]:
+    """Auto-calculated lot count using the existing drawdown-aware sizer
+    (PART 3 §5). Mirrors what the bot would size internally on an entry —
+    the UI uses this as the default value in the editable lot-size box,
+    then locks in whatever the user submits."""
+    import math
+    capital = _current_paper_capital()
+    # Pull latest equity row so the drawdown scale is honoured
+    with _conn() as c:
+        eq = c.execute(
+            "SELECT current_equity, peak_equity, drawdown_pct, effective_lots "
+            "FROM equity_curve WHERE trading_mode=? "
+            "ORDER BY timestamp DESC LIMIT 1",
+            (_current_trading_mode(),),
+        ).fetchone()
+    if eq and eq["effective_lots"]:
+        lots = int(eq["effective_lots"])
+        eff_eq = float(eq["current_equity"])
+        dd = float(eq["drawdown_pct"])
+    else:
+        # cold start — base lots from capital alone
+        try:
+            from config import CAPITAL_PER_LOT, MIN_LOTS, MAX_LOTS_DYNAMIC
+        except Exception:
+            CAPITAL_PER_LOT, MIN_LOTS, MAX_LOTS_DYNAMIC = 50_000, 1, 50
+        lots = max(MIN_LOTS, min(MAX_LOTS_DYNAMIC, math.floor(capital / CAPITAL_PER_LOT)))
+        eff_eq, dd = capital, 0.0
+    return {
+        "default_lots": lots,
+        "current_equity": eff_eq,
+        "drawdown_pct": dd,
+        "trading_mode": _current_trading_mode(),
+    }
+
+
 @api.post("/bot/manual_entry")
 def manual_entry(req: ManualEntryRequest) -> dict[str, Any]:
     """Queue a discretionary CALL or PUT entry. The bot picks this up on its
@@ -432,13 +530,23 @@ def manual_entry(req: ManualEntryRequest) -> dict[str, Any]:
 
     import json
     with _conn() as c:
+        payload = {
+            "direction": direction,
+            "engine": (req.engine or "indicator").lower(),
+            "lots": req.lots,
+            "confidence": req.confidence,
+            "reasons": req.reasons or [],
+        }
         cur = c.execute(
             "INSERT INTO commands(timestamp, action, payload, status) "
             "VALUES (?, 'manual_entry', ?, 'pending')",
-            (datetime.now(timezone.utc).isoformat(), json.dumps({"direction": direction})),
+            (datetime.now(timezone.utc).isoformat(), json.dumps(payload)),
         )
         cmd_id = cur.lastrowid
-    return {"queued": True, "cmd_id": cmd_id, "direction": direction}
+    return {
+        "queued": True, "cmd_id": cmd_id,
+        "direction": direction, "engine": payload["engine"], "lots": payload["lots"],
+    }
 
 
 @api.get("/bot/commands")

@@ -110,6 +110,11 @@ class NiftyOptionsBot:
         # Source ('auto' | 'manual') of the currently pending entry so the trade
         # record can be tagged on fill.
         self._pending_source: Optional[str] = None
+        # PART 3 — engine ('indicator'|'smc'), confidence, and reasons that
+        # triggered the manual entry. Persisted to the trades row on fill.
+        self._pending_engine: Optional[str] = None
+        self._pending_confidence: Optional[int] = None
+        self._pending_reasons: list[str] = []
 
         # SMC signal freshness tracker — independent of indicator FSM.
         # Holds {'direction', 'confidence', 'grade', 'generated_at'} for the
@@ -245,9 +250,17 @@ class NiftyOptionsBot:
             logger.exception("ATM contract resolution failed.")
 
     # ────────────────────────────────────────────────────── manual entries
-    def _handle_manual_entry(self, direction: config.Direction) -> tuple[bool, str]:
-        """Fire a discretionary entry. Enforces the same single-position lock,
-        sizing, ATR-based SL/TP, OCO, trailing, and cooldown as auto entries."""
+    def _handle_manual_entry(
+        self,
+        direction: config.Direction,
+        lots_override: Optional[int] = None,
+        engine: str = "indicator",
+        confidence: Optional[int] = None,
+        reasons: Optional[list[str]] = None,
+    ) -> tuple[bool, str]:
+        """Fire a discretionary entry. PART 3 §6-8: manual SL = 15 % of fill,
+        TP = 30 %, trailing step = 10 %. Same single-position lock, sizing
+        guards, OCO, and cooldown as the auto path."""
         # Hard guards — same single-position lock used by auto entries
         if self.state is config.State.SHUTDOWN:
             return False, "bot is in SHUTDOWN"
@@ -265,19 +278,27 @@ class NiftyOptionsBot:
             contract = self._ce if direction is config.Direction.LONG else self._pe
         if contract is None:
             return False, "ATM contract not yet resolved"
-        # ATR for SL/TP — fall back to 10 premium points if the option series
-        # is too fresh to compute a real ATR(14).
-        option_bars = self.candles.series(contract.token, 3).closed_bars()
-        snap = self.indicators.build_snapshot(
-            self.candles.series(config.NIFTY_SPOT_TOKEN, 3).closed_bars(),
-            self.candles.series(config.NIFTY_SPOT_TOKEN, 15).closed_bars(),
-            option_bars,
+        # Remember the engine + advisory snapshot so the post-fill row in the
+        # trades table can record which engine triggered the entry.
+        self._pending_engine = engine
+        self._pending_confidence = confidence
+        self._pending_reasons = reasons or []
+        ok = self._place_entry(
+            direction, contract,
+            sl_pts=0.0, tp_pts=0.0,                     # unused for manual
+            sl_pct=config.MANUAL_SL_PCT,
+            tp_pct=config.MANUAL_TP_PCT,
+            trail_step_pct=config.TRAIL_STEP_PCT,
+            source="manual",
+            lot_override=lots_override,
         )
-        atr_pts = snap.atr_3m or 10.0
-        sl_pts, tp_pts = self.sizer.stops_from_atr(atr_pts)
-        ok = self._place_entry(direction, contract, sl_pts, tp_pts, source="manual")
         if ok:
-            return True, f"manual {direction.value} placed with ATR={atr_pts:.2f}"
+            return (
+                True,
+                f"manual {direction.value} placed [{engine.upper()}] · "
+                f"SL={config.MANUAL_SL_PCT*100:.0f}%  TP={config.MANUAL_TP_PCT*100:.0f}%  "
+                f"trail={config.TRAIL_STEP_PCT*100:.0f}%",
+            )
         return False, "broker rejected the entry"
 
     def _drain_command_queue(self) -> None:
@@ -298,7 +319,22 @@ class NiftyOptionsBot:
                 if direction is None:
                     self.db.complete_command(cmd_id, False, "unknown direction")
                     return
-                ok, msg = self._handle_manual_entry(direction)
+                lots_override = data.get("lots")
+                if isinstance(lots_override, str):
+                    try:
+                        lots_override = int(lots_override)
+                    except ValueError:
+                        lots_override = None
+                engine = (data.get("engine") or "indicator").lower()
+                confidence = data.get("confidence")
+                reasons = data.get("reasons") or []
+                ok, msg = self._handle_manual_entry(
+                    direction,
+                    lots_override=lots_override,
+                    engine=engine,
+                    confidence=confidence,
+                    reasons=reasons,
+                )
                 self.db.complete_command(cmd_id, ok, msg)
                 logger.info("Manual command #%d → %s (%s)", cmd_id, "OK" if ok else "FAIL", msg)
             elif action == "panic_exit":
@@ -399,6 +435,12 @@ class NiftyOptionsBot:
                 payload["vix"] = vix_val
             payload["ts"] = time.time()
             self.db.set_state("live_quotes", json.dumps(payload))
+            # PART 3 §11 — heartbeat a 'connected' status so the dashboard
+            # can show a 🟢 broker badge independent of supervisor state.
+            self.db.set_state(
+                "broker_status",
+                json.dumps({"state": "connected", "ts": time.time()}),
+            )
         except Exception:
             pass
 
@@ -408,6 +450,14 @@ class NiftyOptionsBot:
             return
         if ev.status == "heartbeat_lapse":
             logger.critical("Heartbeat lapse — routing to FORCED_EXIT")
+            try:
+                import json
+                self.db.set_state(
+                    "broker_status",
+                    json.dumps({"state": "disconnected", "ts": time.time()}),
+                )
+            except Exception:
+                pass
             self._transition(config.State.FORCED_EXIT)
             return
         if ev.status == "rejected":
@@ -439,10 +489,21 @@ class NiftyOptionsBot:
                 return
             pos = self.positions.promote_to_open(ev.fill_price)
             source = self._pending_source if self._pending_source else "auto"
+            engine = self._pending_engine if self._pending_engine else None
+            confidence = self._pending_confidence
+            reasons = self._pending_reasons or []
             self._pending_source = None
+            self._pending_engine = None
+            self._pending_confidence = None
+            self._pending_reasons = []
             self.db.insert_trade_entry(
                 pos.trade_id, pos.direction.value, pos.qty, pos.entry_price,
                 source=source,
+                engine=engine,
+                confidence=confidence,
+                reasons=reasons,
+                sl_price=pos.stop_price,
+                tp_price=pos.target_price,
             )
             self._place_protective_legs(pos.target_price, pos.stop_price)
             self._transition(config.State.POSITION_OPEN)
@@ -457,6 +518,8 @@ class NiftyOptionsBot:
     def _place_entry(
         self, direction: config.Direction, contract: OptionContract, sl_pts: float, tp_pts: float,
         source: str = "auto",
+        sl_pct: float = 0.0, tp_pct: float = 0.0, trail_step_pct: float = 0.0,
+        lot_override: Optional[int] = None,
     ) -> bool:
         quote = self._last_option_quote.get(contract.token)
         if not quote and not config.SIMULATE_ORDERS:
@@ -470,6 +533,12 @@ class NiftyOptionsBot:
             effective_lots=self._effective_lots,
             current_equity=self.broker.get_net_available_cash(),
         )
+        # PART 3 §5 — user may override the auto-calculated lot size
+        # before clicking Buy. Honour their value (still subject to the
+        # spike guard so we never break capital limits).
+        if lot_override is not None and lot_override > 0:
+            lots = min(lots, lot_override) if lots > 0 else lot_override
+            lots = max(1, lots)
         qty = lots * config.LOT_SIZE_NIFTY
 
         # Build the entry payload — MARKET or LIMIT per config toggle
@@ -504,9 +573,14 @@ class NiftyOptionsBot:
             }
 
         # Provisional SL/TP — will be re-anchored to actual fill in
-        # PositionManager.promote_to_open()
-        target_px = premium + tp_pts
-        stop_px = max(0.05, premium - sl_pts)
+        # PositionManager.promote_to_open(). Manual mode uses % of premium;
+        # auto path stays on ATR-derived points.
+        if sl_pct > 0 and tp_pct > 0:
+            target_px = premium * (1 + tp_pct)
+            stop_px = max(0.05, premium * (1 - sl_pct))
+        else:
+            target_px = premium + tp_pts
+            stop_px = max(0.05, premium - sl_pts)
         try:
             order_id = self.broker.place_order(payload)
         except SmartApiError as exc:
@@ -527,6 +601,9 @@ class NiftyOptionsBot:
                 stop_price=stop_px,
                 sl_points=sl_pts,
                 tp_points=tp_pts,
+                sl_pct=sl_pct,
+                tp_pct=tp_pct,
+                trail_step_pct=trail_step_pct,
             )
         )
         self._pending_source = source
@@ -632,6 +709,12 @@ class NiftyOptionsBot:
 
     # ────────────────────────────────────────────────────────── FSM steps
     def _step_idle(self) -> None:
+        # PART 3 §3 — application must NEVER auto-open a trade. The
+        # auto-entry pipeline below is preserved for backward compatibility
+        # but skipped by default. Re-enable via AUTO_ENTRY_ENABLED=true.
+        if not config.AUTO_ENTRY_ENABLED:
+            self._update_signal_diag("auto-entry disabled · manual-only mode")
+            return
         if not self._in_entry_window() or not self._vix_ok():
             self._update_signal_diag("blocked: outside entry window or VIX")
             return

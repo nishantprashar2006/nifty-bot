@@ -140,6 +140,29 @@ function App() {
     try { window.localStorage?.setItem("selectedEngine", engine); } catch (_) { /* ignore */ }
   }, [engine]);
 
+  // PART 3 §5 — editable lot size with STICKY semantics. The bot auto-
+  // calculates a default; once the user edits, their value becomes
+  // authoritative until they execute or dismiss the signal.
+  const [lots, setLots] = useState(null);          // current input value (null = use default)
+  const [lotsEdited, setLotsEdited] = useState(false);
+  const [defaultLots, setDefaultLots] = useState(null);
+
+  useEffect(() => {
+    let stop = false;
+    const tick = async () => {
+      try {
+        const { data } = await axios.get(`${API}/bot/manual_lots`);
+        if (stop) return;
+        setDefaultLots(data.default_lots);
+        // Only refresh the value when the user has NOT manually edited it.
+        if (!lotsEdited) setLots(data.default_lots);
+      } catch (_) { /* ignore */ }
+    };
+    tick();
+    const t = setInterval(tick, 5000);
+    return () => { stop = true; clearInterval(t); };
+  }, [lotsEdited]);
+
   const fetchAll = useCallback(async () => {
     try {
       const [s, st, t, e, tr, dg] = await Promise.all([
@@ -247,10 +270,27 @@ function App() {
     if (busy) return;
     setBusy(true);
     try {
-      const { data } = await axios.post(`${API}/bot/manual_entry`, { direction });
-      toast.success(`${direction} entry queued (#${data.cmd_id})`, {
-        description: "Bot will place it on its next tick — same SL/TP/Trail rails as auto.",
+      // PART 3 — submit selected engine + (sticky) lots + advisory snapshot
+      const selected = engine === "smc" ? smc : score;
+      const confidence = engine === "smc"
+        ? (selected.confidence ?? null)
+        : (direction === "CALL" ? selected.call_score : selected.put_score) ?? null;
+      const reasons = engine === "smc" ? (selected.reasons || []) : [
+        `Indicator bias: ${selected.bias || "—"}`,
+        `Strength: ${selected.strength || "—"}`,
+      ];
+      const { data } = await axios.post(`${API}/bot/manual_entry`, {
+        direction,
+        engine,
+        lots,
+        confidence,
+        reasons,
       });
+      toast.success(`${direction} entry queued (#${data.cmd_id})`, {
+        description: `Engine: ${engine.toUpperCase()} · Lots: ${data.lots ?? lots} · SL ${status?.manual_sl_pct ?? 15}% / TP ${status?.manual_tp_pct ?? 30}% / Trail ${status?.trail_step_pct ?? 10}%`,
+      });
+      // Once submitted, the auto-default resumes for the next signal
+      setLotsEdited(false);
       await fetchAll();
     } catch (err) {
       toast.error(`Manual entry failed`, {
@@ -261,15 +301,15 @@ function App() {
     }
   };
 
-  const panicExit = async () => {
+  const exitPosition = async () => {
     if (busy) return;
     setBusy(true);
     try {
       await axios.post(`${API}/bot/panic_exit`);
-      toast.success("Panic exit queued — flattening to cash");
+      toast.success("Exit Position queued — closing trade now");
       await fetchAll();
     } catch (err) {
-      toast.error(`Panic exit failed: ${err?.response?.data?.detail || err.message}`);
+      toast.error(`Exit failed: ${err?.response?.data?.detail || err.message}`);
     } finally {
       setBusy(false);
     }
@@ -294,6 +334,10 @@ function App() {
 
   const fsm = status?.fsm_state || "IDLE";
   const sup = status?.supervisor_state || "UNKNOWN";
+  // PART 3 §11/§12 — execution gating
+  const brokerOk = status?.broker_status === "connected";
+  const feedOk = status && status.feed_stale === false;
+  const canTrade = sup === "RUNNING" && brokerOk && feedOk;
   const realized = status?.realized_pnl_today ?? 0;
   const eqSnap = status?.equity_snapshot;
   const openPos = stats?.open_position;
@@ -638,23 +682,75 @@ function App() {
             </div>
           </div>
 
-          {/* Right side: manual entry / panic / counters */}
+          {/* Right side: manual entry / exit / counters */}
           <div className="flex items-center gap-3 flex-wrap">
+            {/* PART 3 §11/§12 — Broker + Feed badges */}
+            <div className="flex items-center gap-3 border-r border-zinc-800 pr-3">
+              <div className="text-right">
+                <div className="text-[10px] uppercase tracking-[0.2em] font-mono text-zinc-500">Broker</div>
+                <div
+                  data-testid="broker-status"
+                  className={`font-mono text-xs mt-1 ${
+                    brokerOk ? "text-emerald-300" : "text-red-300"
+                  }`}
+                >
+                  {brokerOk ? "🟢 Connected" : "🔴 Disconnected"}
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-[10px] uppercase tracking-[0.2em] font-mono text-zinc-500">Feed</div>
+                <div
+                  data-testid="feed-status"
+                  className={`font-mono text-xs mt-1 ${
+                    feedOk ? "text-emerald-300" : "text-red-300"
+                  }`}
+                >
+                  {feedOk ? "🟢 Live" : "🔴 Stale"}
+                </div>
+              </div>
+            </div>
+
             {openPos ? (
               <Button
-                data-testid="btn-panic-exit"
-                onClick={panicExit}
+                data-testid="btn-exit-position"
+                onClick={exitPosition}
                 disabled={busy}
                 className="rounded-none bg-red-600 hover:bg-red-500 text-zinc-50 font-mono font-semibold disabled:opacity-40"
               >
-                <XOctagonIcon className="h-4 w-4 mr-2" /> Panic Exit
+                <XOctagonIcon className="h-4 w-4 mr-2" /> Exit Position
               </Button>
             ) : (
               <>
+                {/* PART 3 §5 — editable, sticky lot-size */}
+                <div className="flex flex-col items-end">
+                  <label className="text-[10px] uppercase tracking-[0.2em] font-mono text-zinc-500 mb-1" htmlFor="lots-input">
+                    Lots {lotsEdited && <span className="text-amber-300 ml-1">edited</span>}
+                  </label>
+                  <input
+                    id="lots-input"
+                    data-testid="lots-input"
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={lots ?? ""}
+                    onChange={(e) => {
+                      const v = e.target.value === "" ? null : Math.max(1, parseInt(e.target.value, 10) || 1);
+                      setLots(v);
+                      setLotsEdited(true);
+                    }}
+                    disabled={busy || !canTrade}
+                    className="w-20 bg-zinc-900 border border-zinc-800 px-2 py-1 font-mono text-sm text-zinc-100 text-right disabled:opacity-40 focus:outline-none focus:border-amber-500"
+                  />
+                  {defaultLots != null && (
+                    <div className="text-[10px] font-mono text-zinc-600 mt-0.5">
+                      auto {defaultLots}
+                    </div>
+                  )}
+                </div>
                 <Button
                   data-testid="btn-buy-call"
                   onClick={() => setConfirmManual("CALL")}
-                  disabled={busy || sup !== "RUNNING"}
+                  disabled={busy || !canTrade}
                   className={`rounded-none bg-emerald-600 hover:bg-emerald-500 text-zinc-950 font-mono font-semibold disabled:opacity-40 text-emerald-300 ${glowClass(callGlow)}`}
                 >
                   <ArrowUpRightIcon className="h-4 w-4 mr-2" /> Buy Call
@@ -662,7 +758,7 @@ function App() {
                 <Button
                   data-testid="btn-buy-put"
                   onClick={() => setConfirmManual("PUT")}
-                  disabled={busy || sup !== "RUNNING"}
+                  disabled={busy || !canTrade}
                   className={`rounded-none bg-red-600 hover:bg-red-500 text-zinc-50 font-mono font-semibold disabled:opacity-40 text-red-300 ${glowClass(putGlow)}`}
                 >
                   <ArrowDownRightIcon className="h-4 w-4 mr-2" /> Buy Put
@@ -1251,14 +1347,15 @@ function App() {
                 : <span className="block mt-1 text-blue-300">Mode is SIM — order is simulated.</span>
               }
               <ul className="list-disc list-inside mt-3 space-y-1 text-zinc-300">
-                <li>same sizing (drawdown-aware + premium-spike guard)</li>
-                <li>same SL/TP from option ATR (1× / 2×)</li>
-                <li>same ≥5pt trailing stop</li>
-                <li>same 30-min max hold + 15:10 IST square-off</li>
-                <li>auto-cooldown after exit; counts toward the 4-trade daily cap</li>
+                <li>Engine: <span className="text-amber-300 uppercase">{engine}</span> (drives the SL/TP/Trail policy)</li>
+                <li>Lots: <span className="text-amber-300">{lots ?? "auto"}</span> (locks once submitted)</li>
+                <li>Stop Loss: <span className="text-red-300">{status?.manual_sl_pct ?? 15}%</span> of fill price</li>
+                <li>Target: <span className="text-emerald-300">{status?.manual_tp_pct ?? 30}%</span> of fill price</li>
+                <li>Trailing step: <span className="text-amber-300">{status?.trail_step_pct ?? 10}%</span></li>
+                <li>Single-position lock + cooldown after exit</li>
               </ul>
               <span className="block mt-3 text-zinc-500">
-                Single-position lock applies — auto entries are blocked until this one exits.
+                Position size and SL/TP recalc from your ACTUAL fill price — no theoretical math.
               </span>
             </AlertDialogDescription>
           </AlertDialogHeader>

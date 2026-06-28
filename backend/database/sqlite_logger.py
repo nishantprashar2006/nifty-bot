@@ -117,6 +117,12 @@ class SqliteLogger:
             for ddl in (
                 "ALTER TABLE equity_curve ADD COLUMN trading_mode TEXT NOT NULL DEFAULT 'paper'",
                 "ALTER TABLE trades ADD COLUMN source TEXT NOT NULL DEFAULT 'auto'",
+                # PART 3 — manual-entry metadata
+                "ALTER TABLE trades ADD COLUMN engine TEXT",
+                "ALTER TABLE trades ADD COLUMN confidence INTEGER",
+                "ALTER TABLE trades ADD COLUMN reasons TEXT",
+                "ALTER TABLE trades ADD COLUMN sl_price REAL",
+                "ALTER TABLE trades ADD COLUMN tp_price REAL",
             ):
                 try:
                     cur.execute(ddl)
@@ -167,12 +173,24 @@ class SqliteLogger:
         entry_price: float,
         entry_time: Optional[str] = None,
         source: str = "auto",
+        engine: Optional[str] = None,
+        confidence: Optional[int] = None,
+        reasons: Optional[list] = None,
+        sl_price: Optional[float] = None,
+        tp_price: Optional[float] = None,
     ) -> None:
+        import json as _json
         with self._cursor() as cur:
             cur.execute(
                 "INSERT INTO trades(trade_id, entry_time, direction, qty, "
-                "entry_price, source) VALUES (?, ?, ?, ?, ?, ?)",
-                (trade_id, entry_time or _utc_iso(), direction, qty, entry_price, source),
+                "entry_price, source, engine, confidence, reasons, sl_price, tp_price) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    trade_id, entry_time or _utc_iso(), direction, qty, entry_price,
+                    source, engine, confidence,
+                    _json.dumps(reasons) if reasons else None,
+                    sl_price, tp_price,
+                ),
             )
 
     def update_trade_exit(

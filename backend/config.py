@@ -180,3 +180,23 @@ try:
     MAX_SIGNAL_AGE_MINUTES: int = int(os.getenv("SMC_MAX_SIGNAL_AGE_MIN", "5"))
 except ValueError:
     MAX_SIGNAL_AGE_MINUTES = 5
+
+# ────────────────────────────────────────────────────────────────────
+# 13. Manual-entry execution (PART 3 spec)
+# ────────────────────────────────────────────────────────────────────
+# When false, the auto-entry pipeline (EMA-cross signal generator + WAIT
+# CONFIRMATION → ENTRY) is bypassed. The bot only enters when the user
+# clicks Buy Call / Buy Put on the dashboard. Setting this to true revives
+# the original ATR-based auto path (preserved for backward compatibility).
+AUTO_ENTRY_ENABLED: bool = os.getenv("AUTO_ENTRY_ENABLED", "false").lower() == "true"
+
+# Manual SL / TP / trailing — percent of FILLED premium (not theoretical).
+def _pct(env_key: str, default: float) -> float:
+    try:
+        return float(os.getenv(env_key, str(default)))
+    except ValueError:
+        return default
+
+MANUAL_SL_PCT: float = _pct("MANUAL_SL_PCT", 15.0) / 100.0      # 15 % stop
+MANUAL_TP_PCT: float = _pct("MANUAL_TP_PCT", 30.0) / 100.0      # 30 % target
+TRAIL_STEP_PCT: float = _pct("TRAIL_STEP_PCT", 10.0) / 100.0    # 10 % trail step

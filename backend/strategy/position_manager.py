@@ -39,6 +39,9 @@ class OpenPosition:
     target_order_id: Optional[str] = None
     stop_order_id: Optional[str] = None
     trail_anchor: float = 0.0    # last premium high used to trail SL up
+    # PART 3 manual-mode trailing — when > 0, premium percent step replaces
+    # the global TRAILING_TRIGGER_STEP for this specific position.
+    trail_step_pct: float = 0.0
 
     def age_seconds(self) -> float:
         return (datetime.now(timezone.utc) - self.entry_ts).total_seconds()
@@ -57,6 +60,11 @@ class PendingEntry:
     stop_price: float
     sl_points: float = 0.0     # ATR-derived; used to re-anchor on actual fill
     tp_points: float = 0.0
+    # PART 3 — when > 0 these supersede sl/tp_points and recompute the legs
+    # from the ACTUAL fill price as a percentage of premium (manual mode).
+    sl_pct: float = 0.0
+    tp_pct: float = 0.0
+    trail_step_pct: float = 0.0
     placed_ts: float = field(default_factory=time.time)
 
     def age_seconds(self) -> float:
@@ -107,10 +115,12 @@ class PositionManager:
             if self._pending is None:
                 raise RuntimeError("No pending entry to promote.")
             p = self._pending
-            # Re-anchor target/stop to ACTUAL fill price using the stored ATR
-            # points; in MARKET mode this corrects for slippage so the 1×/2×
-            # ATR risk profile is preserved.
-            if p.sl_points > 0 and p.tp_points > 0:
+            # Re-anchor SL/TP to ACTUAL fill price. Manual mode uses % of
+            # premium; auto path uses ATR-based points.
+            if p.sl_pct > 0 and p.tp_pct > 0:
+                target_price = fill_price * (1 + p.tp_pct)
+                stop_price = max(0.05, fill_price * (1 - p.sl_pct))
+            elif p.sl_points > 0 and p.tp_points > 0:
                 target_price = fill_price + p.tp_points
                 stop_price = max(0.05, fill_price - p.sl_points)
             else:
@@ -128,6 +138,7 @@ class PositionManager:
                 target_price=target_price,
                 stop_price=stop_price,
                 trail_anchor=fill_price,
+                trail_step_pct=p.trail_step_pct,
             )
             self._open = pos
             self._pending = None
@@ -155,15 +166,24 @@ class PositionManager:
 
     # ------------------------------------------------------------- trailing
     def maybe_trail_stop(self, current_premium: float) -> Optional[float]:
-        """If premium advanced ≥ TRAILING_TRIGGER_STEP since trail_anchor,
-        bump the stop by that step. Returns new stop or None."""
+        """If premium advanced ≥ trailing step since trail_anchor, bump the
+        stop by that step. Returns new stop or None.
+
+        Manual-mode positions use a PERCENT step (`trail_step_pct` × entry
+        price). Auto-mode positions keep the legacy fixed-points step
+        (config.TRAILING_TRIGGER_STEP) so the original behaviour is preserved.
+        """
         with self._lock:
             pos = self._open
             if pos is None:
                 return None
+            if pos.trail_step_pct > 0:
+                step = max(0.05, pos.entry_price * pos.trail_step_pct)
+            else:
+                step = config.TRAILING_TRIGGER_STEP
             delta = current_premium - pos.trail_anchor
-            if delta >= config.TRAILING_TRIGGER_STEP:
-                bump = config.TRAILING_TRIGGER_STEP * (delta // config.TRAILING_TRIGGER_STEP)
+            if delta >= step:
+                bump = step * (delta // step)
                 pos.stop_price += bump
                 pos.trail_anchor += bump
                 return pos.stop_price
