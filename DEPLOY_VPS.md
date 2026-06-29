@@ -124,3 +124,49 @@ If you expose the FastAPI dashboard publicly:
 - Data feed: free (bundled with SmartAPI)
 
 **Total: well under ₹600/mo for an institutional-grade always-on setup.**
+
+---
+
+## Update workflow (after every `git pull`)
+
+```bash
+cd /opt/nifty-bot && git pull
+
+# Backend deps + restart (only if requirements.txt changed)
+source /opt/nifty-bot/.venv/bin/activate
+pip install -r backend/requirements.txt
+
+# Frontend build (only if anything under frontend/ changed)
+cd /opt/nifty-bot/frontend
+yarn install
+yarn build
+sudo rsync -a --delete build/ /var/www/nifty-bot/   # adjust to your nginx root
+sudo systemctl reload nginx
+
+# Always restart the bot + API after any backend change
+sudo supervisorctl restart all
+```
+
+## Common gotchas (read before you panic)
+
+1. **`http://<vm-ip>:8000/` returns 404** — this is normal. FastAPI has no `/` route by design; only `/api/*` and `/docs`. Open the React UI via `http://<vm-ip>/` (port 80, served by Nginx).
+2. **Preview pod `*.preview.emergentagent.com`** can never reach your VPS backend — that's the Emergent staging environment. Always test against your VM IP/domain.
+3. **Env var name is `REACT_APP_BACKEND_URL`** (Create React App), NOT `VITE_API_BASE_URL`. For an Nginx-proxied setup, leave it **empty** in `frontend/.env.production`:
+   ```
+   REACT_APP_BACKEND_URL=
+   ```
+   This makes axios call `/api/*` relative to the current origin → Nginx proxies it to FastAPI on port 8000.
+4. **Nginx config must include SPA fallback** for React client-side routes:
+   ```nginx
+   location / {
+       try_files $uri /index.html;
+   }
+   location /api/ {
+       proxy_pass http://127.0.0.1:8000;
+       proxy_set_header Host $host;
+       proxy_set_header X-Real-IP $remote_addr;
+   }
+   ```
+5. **`.venv` lives at `/opt/nifty-bot/.venv`**, not inside `backend/`. Activate with `source /opt/nifty-bot/.venv/bin/activate`.
+6. **`supervisor_state: "STOPPED"`** in `/api/bot/status` is the bot daemon's own status flag (the FSM is idle), NOT the Supervisor process itself. The API stays up regardless — that's why curl to `/api/bot/status` works even when the bot is stopped.
+
