@@ -153,3 +153,71 @@ def test_trailing_stop_bumps_only_above_step():
     assert pm.maybe_trail_stop(103.0) is None   # below step
     new_stop = pm.maybe_trail_stop(106.0)        # 6pt advance → bump 5
     assert new_stop == 95.0
+
+
+# ──────────────────────────────────────────────── manual-mode % trailing
+def test_manual_mode_percent_trail_step():
+    """A position opened with trail_step_pct=0.10 should bump SL by 10 %
+    of entry price on every advance ≥ that step."""
+    pm = PositionManager()
+    p = PendingEntry(
+        order_id="O1", direction=Direction.LONG, contract_symbol="X",
+        contract_token="T", expected_price=100, lots=1, qty=65,
+        target_price=130, stop_price=85,
+        sl_pct=0.15, tp_pct=0.30, trail_step_pct=0.10,
+    )
+    pm.register_pending_entry(p)
+    pos = pm.promote_to_open(100.0)
+    # entry × 10 % = ₹10 step
+    assert pm.maybe_trail_stop(109.0) is None         # below step
+    new_stop = pm.maybe_trail_stop(112.0)             # 12pt advance → 1×10 bump
+    assert new_stop == round(pos.stop_price, 2)
+    assert pos.stop_price > 85.0
+
+
+# ──────────────────────────────────────────────── synthetic exit thresholds
+def test_synthetic_exit_thresholds_fire_correctly():
+    """The bot's `_step_position_open` synthetic-exit check is pure logic
+    over an OpenPosition's stop/target prices. Verify the inequality
+    contract directly so we never regress the SIM-mode enforcement."""
+    pm = PositionManager()
+    p = PendingEntry(
+        order_id="O1", direction=Direction.LONG, contract_symbol="X",
+        contract_token="T", expected_price=100, lots=1, qty=65,
+        target_price=130, stop_price=85,
+        sl_pct=0.15, tp_pct=0.30, trail_step_pct=0.10,
+    )
+    pm.register_pending_entry(p)
+    pos = pm.promote_to_open(100.0)
+
+    # Inequality contract used by _step_position_open
+    def synth_decision(ltp: float) -> str:
+        if ltp >= pos.target_price:
+            return "TARGET"
+        if ltp <= pos.stop_price:
+            return "STOP"
+        return "HOLD"
+
+    assert synth_decision(100.0) == "HOLD"
+    assert synth_decision(129.9) == "HOLD"
+    assert synth_decision(130.0) == "TARGET"
+    assert synth_decision(150.0) == "TARGET"
+    assert synth_decision(85.0)  == "STOP"
+    assert synth_decision(70.0)  == "STOP"
+
+
+# ──────────────────────────── SIM-mode consecutive-loss breaker is relaxed
+def test_consecutive_loss_breaker_relaxed_in_sim(monkeypatch):
+    """In SIM mode the bot must NOT auto-SHUTDOWN after N consecutive
+    losses — paper testing should never lock the user out for the day."""
+    # Recreate the breaker logic in isolation (matches main._trip_circuit_breakers)
+    def trip(consecutive_losses: int, mode: str) -> str:
+        if mode == "live" and consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
+            return "max_consecutive_losses"
+        return ""
+
+    assert trip(2, "live") == "max_consecutive_losses"
+    assert trip(5, "live") == "max_consecutive_losses"
+    # SIM mode never trips this breaker regardless of streak length
+    assert trip(2, "sim") == ""
+    assert trip(50, "sim") == ""

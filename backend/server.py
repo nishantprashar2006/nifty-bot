@@ -502,6 +502,34 @@ def manual_lots_default() -> dict[str, Any]:
     }
 
 
+@api.post("/bot/reset_state")
+def reset_breakers() -> dict[str, Any]:
+    """Clear `_consecutive_losses`, `_trades_today`, and `_api_reject_count`
+    counters in the bot daemon. If the FSM is in SHUTDOWN (and no open
+    position), it returns to IDLE so manual entries can resume. Use this
+    to recover from a SIM-mode breaker lockout or after reviewing a LIVE
+    incident — no daemon restart needed."""
+    import json
+    try:
+        out = subprocess.run(
+            ["supervisorctl", "status", "nifty_bot"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        sup_state = out.split()[1] if out else "UNKNOWN"
+    except Exception:
+        sup_state = "UNKNOWN"
+    if sup_state != "RUNNING":
+        raise HTTPException(503, "bot is not running — start it first")
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO commands(timestamp, action, payload, status) "
+            "VALUES (?, 'reset_breakers', ?, 'pending')",
+            (datetime.now(timezone.utc).isoformat(), json.dumps({})),
+        )
+        cmd_id = cur.lastrowid
+    return {"queued": True, "cmd_id": cmd_id}
+
+
 @api.post("/bot/manual_entry")
 def manual_entry(req: ManualEntryRequest) -> dict[str, Any]:
     """Queue a discretionary CALL or PUT entry. The bot picks this up on its

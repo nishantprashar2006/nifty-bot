@@ -438,6 +438,13 @@ class NiftyOptionsBot:
                     self.db.complete_command(cmd_id, True, "FORCED_EXIT triggered")
                 else:
                     self.db.complete_command(cmd_id, False, "no open position to exit")
+            elif action == "reset_breakers":
+                prev = self.reset_breakers()
+                self.db.complete_command(
+                    cmd_id, True,
+                    f"reset OK (was: trades={prev['trades_today']}, "
+                    f"losses={prev['consecutive_losses']}, state={prev['state']})",
+                )
             else:
                 self.db.complete_command(cmd_id, False, f"unknown action {action}")
         except Exception as exc:
@@ -481,7 +488,13 @@ class NiftyOptionsBot:
     def _trip_circuit_breakers(self) -> Optional[str]:
         if self._trades_today >= config.MAX_TRADES_DAILY:
             return "max_trades_daily"
-        if self._consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
+        # In SIM mode, the consecutive-losses breaker is intentionally relaxed
+        # — paper testing should never lock the user out for the day. The
+        # check stays strict in LIVE mode.
+        if (
+            config.TRADING_MODE == "live"
+            and self._consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES
+        ):
             return "max_consecutive_losses"
         if self._api_reject_count >= config.MAX_API_REJECT_EVENTS:
             return "max_api_rejects"
@@ -1135,9 +1148,33 @@ class NiftyOptionsBot:
             self._transition(config.State.FORCED_EXIT)
             return
 
-        # trail stop using latest premium
         q = self._last_option_quote.get(pos.contract_token, {})
         ltp = q.get("ltp")
+
+        # ── Synthetic SL/TP enforcement (PRIMARY in SIM, SAFETY-NET in LIVE)
+        # The protective legs we placed on the broker may not fire on time:
+        #   • SIM mode  — no exchange runs against them, so they NEVER fire.
+        #     This block is the only enforcement path.
+        #   • LIVE mode — if a gap or network hiccup delays the broker fill,
+        #     the bot self-rescues by firing a MARKET sell here. A subsequent
+        #     broker SL fill simply finds nothing to flatten.
+        if ltp is not None and ltp > 0:
+            if ltp >= pos.target_price:
+                logger.info(
+                    "LTP ₹%.2f ≥ target ₹%.2f → firing TARGET exit",
+                    ltp, pos.target_price,
+                )
+                self._synthetic_exit(ltp, was_stop=False)
+                return
+            if ltp <= pos.stop_price:
+                logger.info(
+                    "LTP ₹%.2f ≤ stop ₹%.2f → firing STOP_LOSS exit",
+                    ltp, pos.stop_price,
+                )
+                self._synthetic_exit(ltp, was_stop=True)
+                return
+
+        # trail stop using latest premium
         if ltp:
             new_stop = self.positions.maybe_trail_stop(ltp)
             if new_stop is not None and pos.stop_order_id:
@@ -1194,6 +1231,55 @@ class NiftyOptionsBot:
                         "routing to FORCED_EXIT to flatten.", new_stop,
                     )
                     self._transition(config.State.FORCED_EXIT)
+
+    def _synthetic_exit(self, exit_price: float, was_stop: bool) -> None:
+        """Bot-driven exit (PART 3 §15 safety net + SIM-mode enforcement).
+        Cancels both protective legs, fires a MARKET sell to flatten, and
+        finalises the trade. Idempotent — if anything is already gone the
+        broker errors are swallowed."""
+        pos = self.positions.open_position
+        if pos is None:
+            return
+        for oid in (pos.target_order_id, pos.stop_order_id):
+            if oid:
+                try:
+                    self.broker.cancel_order(oid)
+                except Exception:
+                    pass
+        try:
+            self.broker.place_order({
+                "variety": "NORMAL",
+                "tradingsymbol": pos.contract_symbol,
+                "symboltoken": pos.contract_token,
+                "transactiontype": "SELL",
+                "exchange": "NFO",
+                "ordertype": "MARKET",
+                "producttype": "INTRADAY",
+                "duration": "DAY",
+                "quantity": pos.qty,
+                "price": 0,
+            })
+        except Exception:
+            logger.exception("Synthetic exit market sell failed (continuing)")
+        self._finalize_exit(exit_price, was_stop=was_stop)
+
+    def reset_breakers(self) -> dict:
+        """Admin reset for circuit-breaker counters. Lets the user clear an
+        accumulated SIM-mode lockout (or recover from a LIVE-mode breach
+        once they've reviewed the cause) without restarting the daemon."""
+        prev = {
+            "trades_today": self._trades_today,
+            "consecutive_losses": self._consecutive_losses,
+            "api_reject_count": self._api_reject_count,
+            "state": self.state.value,
+        }
+        self._trades_today = 0
+        self._consecutive_losses = 0
+        self._api_reject_count = 0
+        if self.state is config.State.SHUTDOWN and not self.positions.has_open_position:
+            self._transition(config.State.IDLE)
+        logger.warning("Circuit-breaker counters reset by user. Previous: %s", prev)
+        return prev
 
     def _step_forced_exit(self) -> None:
         pos = self.positions.open_position

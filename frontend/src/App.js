@@ -315,6 +315,22 @@ function App() {
     }
   };
 
+  const resetBreakers = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const { data } = await axios.post(`${API}/bot/reset_state`);
+      toast.success(`Breakers reset (cmd #${data.cmd_id})`, {
+        description: "Counters cleared — if FSM was SHUTDOWN it has returned to IDLE.",
+      });
+      await fetchAll();
+    } catch (err) {
+      toast.error(`Reset failed: ${err?.response?.data?.detail || err.message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const setOrderType = async (field, value) => {
     if (busy) return;
     setBusy(true);
@@ -718,6 +734,15 @@ function App() {
                 className="rounded-none bg-red-600 hover:bg-red-500 text-zinc-50 font-mono font-semibold disabled:opacity-40"
               >
                 <XOctagonIcon className="h-4 w-4 mr-2" /> Exit Position
+              </Button>
+            ) : fsm === "SHUTDOWN" ? (
+              <Button
+                data-testid="btn-reset-breakers"
+                onClick={resetBreakers}
+                disabled={busy}
+                className="rounded-none bg-amber-500 hover:bg-amber-400 text-zinc-950 font-mono font-semibold disabled:opacity-40"
+              >
+                Reset Breakers
               </Button>
             ) : (
               <>
