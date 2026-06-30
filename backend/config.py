@@ -48,8 +48,7 @@ MAX_POSITION_VALUE_PCT = 0.25  # nominal trade value <= 25% of equity
 # ────────────────────────────────────────────────────────────────────
 # 3. Circuit breakers
 # ────────────────────────────────────────────────────────────────────
-MAX_TRADES_DAILY = 4
-MAX_CONSECUTIVE_LOSSES = 2
+MAX_TRADES_DAILY = 3
 MAX_API_REJECT_EVENTS = 3        # terminal session threshold
 MAX_WS_RECONNECT_FAILS = 3       # consecutive WS connection failures
 

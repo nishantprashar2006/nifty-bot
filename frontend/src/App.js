@@ -666,7 +666,10 @@ function App() {
                     {openPos.direction}
                   </span>
                   <span className="text-zinc-500"> · </span>
-                  qty <span className="text-zinc-200">{openPos.qty}</span>
+                  <span data-testid="open-pos-lots">
+                    {openPos.lots ?? Math.floor((openPos.qty || 0) / 65)} lot{(openPos.lots ?? 1) === 1 ? "" : "s"}
+                    <span className="text-zinc-500"> ({openPos.qty} qty)</span>
+                  </span>
                   <span className="text-zinc-500"> · </span>
                   entry <span className="text-zinc-200">{fmtINR(openPos.entry_price)}</span>
                   {optionLtp != null && (
@@ -1212,6 +1215,7 @@ function App() {
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Trade ID</TableHead>
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Src</TableHead>
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Dir</TableHead>
+                        <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Lots</TableHead>
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Qty</TableHead>
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Entry</TableHead>
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Exit</TableHead>
@@ -1237,6 +1241,9 @@ function App() {
                             <span className={t.direction === "CALL" ? "text-emerald-300" : "text-red-300"}>
                               {t.direction}
                             </span>
+                          </TableCell>
+                          <TableCell className="text-amber-300 font-semibold" data-testid={`trade-lots-${t.trade_id}`}>
+                            {t.lots ?? Math.floor((t.qty || 0) / 65)}
                           </TableCell>
                           <TableCell className="text-zinc-300">{t.qty}</TableCell>
                           <TableCell className="text-zinc-300">{fmtINR(t.entry_price)}</TableCell>

@@ -206,18 +206,24 @@ def test_synthetic_exit_thresholds_fire_correctly():
     assert synth_decision(70.0)  == "STOP"
 
 
-# ──────────────────────────── SIM-mode consecutive-loss breaker is relaxed
-def test_consecutive_loss_breaker_relaxed_in_sim(monkeypatch):
-    """In SIM mode the bot must NOT auto-SHUTDOWN after N consecutive
-    losses — paper testing should never lock the user out for the day."""
+# ──────────────────────────── Consecutive-loss breaker removed entirely
+def test_breakers_only_use_trade_count_and_safety():
+    """Per user request: no consecutive-loss lockout. Only the daily-trade
+    cap and safety breakers (API rejects, WS reconnect, P&L guard) should
+    fire. Single-position lock is enforced separately by PositionManager."""
     # Recreate the breaker logic in isolation (matches main._trip_circuit_breakers)
-    def trip(consecutive_losses: int, mode: str) -> str:
-        if mode == "live" and consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
-            return "max_consecutive_losses"
+    def trip(trades_today: int, api_rejects: int) -> str:
+        if trades_today >= config.MAX_TRADES_DAILY:
+            return "max_trades_daily"
+        if api_rejects >= config.MAX_API_REJECT_EVENTS:
+            return "max_api_rejects"
         return ""
 
-    assert trip(2, "live") == "max_consecutive_losses"
-    assert trip(5, "live") == "max_consecutive_losses"
-    # SIM mode never trips this breaker regardless of streak length
-    assert trip(2, "sim") == ""
-    assert trip(50, "sim") == ""
+    # Trade-count limit is the headline rule
+    assert config.MAX_TRADES_DAILY == 3
+    assert trip(2, 0) == ""
+    assert trip(3, 0) == "max_trades_daily"
+    # Safety breakers still active
+    assert trip(0, config.MAX_API_REJECT_EVENTS) == "max_api_rejects"
+    # No consecutive-loss attribute used anywhere now
+    assert not hasattr(config, "MAX_CONSECUTIVE_LOSSES")

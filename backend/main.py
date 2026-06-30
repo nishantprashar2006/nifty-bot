@@ -486,16 +486,13 @@ class NiftyOptionsBot:
         return config.VIX_MIN <= v <= config.VIX_MAX
 
     def _trip_circuit_breakers(self) -> Optional[str]:
+        # PART 3 — only two execution rules now:
+        #   1. Hard daily-trade cap (MAX_TRADES_DAILY, default 3)
+        #   2. Single-position lock (enforced by PositionManager itself)
+        # The consecutive-losses breaker has been removed per user request —
+        # they want trade-count discipline, not loss-streak lockouts.
         if self._trades_today >= config.MAX_TRADES_DAILY:
             return "max_trades_daily"
-        # In SIM mode, the consecutive-losses breaker is intentionally relaxed
-        # — paper testing should never lock the user out for the day. The
-        # check stays strict in LIVE mode.
-        if (
-            config.TRADING_MODE == "live"
-            and self._consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES
-        ):
-            return "max_consecutive_losses"
         if self._api_reject_count >= config.MAX_API_REJECT_EVENTS:
             return "max_api_rejects"
         if self.ws and self.ws.reconnect_failures >= config.MAX_WS_RECONNECT_FAILS:

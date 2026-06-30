@@ -390,6 +390,19 @@ def bot_stats() -> dict[str, Any]:
     closed = int(row["total_trades"] or 0)
     wins = int(row["wins"] or 0)
     win_rate = (wins / closed) if closed else 0.0
+    # Derive lot count from qty (Nifty options = 65 / lot). Same logic
+    # everywhere — keeps the dashboard from hard-coding 65.
+    try:
+        from config import LOT_SIZE_NIFTY
+    except Exception:
+        LOT_SIZE_NIFTY = 65
+    open_payload = None
+    if open_row:
+        open_payload = dict(open_row)
+        try:
+            open_payload["lots"] = int(open_payload.get("qty") or 0) // LOT_SIZE_NIFTY
+        except Exception:
+            open_payload["lots"] = None
     return {
         "closed_trades": closed,
         "total_pnl": float(row["total_pnl"] or 0.0),
@@ -399,7 +412,8 @@ def bot_stats() -> dict[str, Any]:
         "avg_pnl": float(row["avg_pnl"] or 0.0),
         "best_trade": float(row["best_trade"] or 0.0),
         "worst_trade": float(row["worst_trade"] or 0.0),
-        "open_position": dict(open_row) if open_row else None,
+        "lot_size": LOT_SIZE_NIFTY,
+        "open_position": open_payload,
     }
 
 
@@ -642,11 +656,23 @@ def set_paper_capital(req: PaperCapitalRequest) -> dict[str, Any]:
 
 @api.get("/bot/trades")
 def bot_trades(limit: int = 50) -> list[dict[str, Any]]:
+    try:
+        from config import LOT_SIZE_NIFTY
+    except Exception:
+        LOT_SIZE_NIFTY = 65
     with _conn() as c:
         rows = c.execute(
             "SELECT * FROM trades ORDER BY entry_time DESC LIMIT ?", (limit,)
         ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["lots"] = int(d.get("qty") or 0) // LOT_SIZE_NIFTY
+        except Exception:
+            d["lots"] = None
+        out.append(d)
+    return out
 
 
 @api.get("/bot/equity")
