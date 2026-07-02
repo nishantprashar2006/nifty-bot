@@ -1076,7 +1076,7 @@ function App() {
             Grade: 95+ A+ · 90+ A · 85+ B+ · 80+ B · 75+ C · &lt;75 D.
             <span className="block mt-1">
               Weights: HTF Trend 20 · Structure 15 · BOS/CHoCH 20 · Sweep 15 · OB Retest 15 · FVG 10 · Premium/Discount 5.
-              5m execution · 15m HTF (structure-based) · 09:20–15:00 IST · auto-expire after SMC_MAX_SIGNAL_AGE_MIN.
+              5m execution · 15m HTF (structure-based) · 09:20–15:15 IST · auto-expire after SMC_MAX_SIGNAL_AGE_MIN.
             </span>
           </div>
         </Card>

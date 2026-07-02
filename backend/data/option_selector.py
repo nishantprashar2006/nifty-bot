@@ -70,20 +70,41 @@ class OptionSelector:
         ]
 
     def _nearest_expiry(self, rows: list[dict]) -> str:
+        """Pick the nearest **weekly Tuesday** Nifty expiry.
+
+        NSE's Nifty weekly expiry runs on Tuesdays (as of the 2026 rework).
+        Older code returned the earliest future date in the scrip master,
+        which occasionally selected a further-dated monthly contract with
+        materially higher premium. This variant strictly prefers Tuesday
+        expiries; only if no Tuesday exists in the master (e.g. an NSE
+        holiday shifted the weekly) do we fall back to the earliest.
+        """
         today = datetime.now(timezone.utc).date()
-        candidates: list[tuple[datetime, str]] = []
+        weekly: list[tuple[datetime, str]] = []
+        any_future: list[tuple[datetime, str]] = []
         for r in rows:
             exp = r.get("expiry", "")
             try:
                 d = datetime.strptime(exp, "%d%b%Y").date()
             except ValueError:
                 continue
-            if d >= today:
-                candidates.append((datetime.combine(d, datetime.min.time()), exp))
+            if d < today:
+                continue
+            slot = (datetime.combine(d, datetime.min.time()), exp)
+            any_future.append(slot)
+            if d.weekday() == 1:   # 0=Mon, 1=Tue, 2=Wed, 3=Thu…
+                weekly.append(slot)
+        candidates = weekly or any_future
         if not candidates:
             raise RuntimeError("No future Nifty option expiries found in scrip master.")
         candidates.sort()
-        return candidates[0][1]
+        chosen = candidates[0][1]
+        if not weekly:
+            logger.warning(
+                "No Tuesday expiry in scrip master — falling back to earliest (%s). "
+                "This can happen around NSE holidays.", chosen,
+            )
+        return chosen
 
     # ------------------------------------------------------------------ pick
     def select_atm(self, spot_price: float) -> tuple[OptionContract, OptionContract]:

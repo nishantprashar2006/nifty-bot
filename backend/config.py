@@ -48,7 +48,7 @@ MAX_POSITION_VALUE_PCT = 0.25  # nominal trade value <= 25% of equity
 # ────────────────────────────────────────────────────────────────────
 # 3. Circuit breakers
 # ────────────────────────────────────────────────────────────────────
-MAX_TRADES_DAILY = 3
+MAX_TRADES_DAILY = 4
 MAX_API_REJECT_EVENTS = 3        # terminal session threshold
 MAX_WS_RECONNECT_FAILS = 3       # consecutive WS connection failures
 
@@ -172,7 +172,7 @@ ANGEL_TOTP_KEY = os.getenv("ANGEL_TOTP_KEY", "")
 # 12. SMC Engine (independent — does NOT influence indicator engine)
 # ────────────────────────────────────────────────────────────────────
 SMC_WINDOW_START = time(9, 20)
-SMC_WINDOW_END = time(15, 0)
+SMC_WINDOW_END = time(15, 15)
 # Auto-expire a generated SMC signal after this many minutes if it hasn't
 # been executed. Configurable via env so users can tune without code changes.
 try:
@@ -196,6 +196,6 @@ def _pct(env_key: str, default: float) -> float:
     except ValueError:
         return default
 
-MANUAL_SL_PCT: float = _pct("MANUAL_SL_PCT", 15.0) / 100.0      # 15 % stop
-MANUAL_TP_PCT: float = _pct("MANUAL_TP_PCT", 30.0) / 100.0      # 30 % target
-TRAIL_STEP_PCT: float = _pct("TRAIL_STEP_PCT", 10.0) / 100.0    # 10 % trail step
+MANUAL_SL_PCT: float = _pct("MANUAL_SL_PCT", 10.0) / 100.0      # 10 % stop
+MANUAL_TP_PCT: float = _pct("MANUAL_TP_PCT", 20.0) / 100.0      # 20 % target
+TRAIL_STEP_PCT: float = _pct("TRAIL_STEP_PCT",  7.0) / 100.0    # 7 % trail step

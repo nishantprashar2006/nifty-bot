@@ -121,6 +121,12 @@ class NiftyOptionsBot:
         # current live SMC signal. Auto-expires after MAX_SIGNAL_AGE_MINUTES.
         self._smc_signal: Optional[dict] = None
 
+        # Explicit exit-reason hint for the next FORCED_EXIT / synthetic exit.
+        # Whoever triggers the exit sets this so `_finalize_exit` records the
+        # true cause (TIME_STOP / SQUARE_OFF / MANUAL / HEARTBEAT) instead
+        # of flattening everything to STOP_LOSS.
+        self._exit_reason_hint: Optional[str] = None
+
     # ────────────────────────────────────────────────────────── lifecycle
     def start(self) -> None:
         _configure_logging()
@@ -434,6 +440,7 @@ class NiftyOptionsBot:
                 logger.info("Manual command #%d → %s (%s)", cmd_id, "OK" if ok else "FAIL", msg)
             elif action == "panic_exit":
                 if self.positions.has_open_position:
+                    self._exit_reason_hint = config.ExitReason.MANUAL.value
                     self._transition(config.State.FORCED_EXIT)
                     self.db.complete_command(cmd_id, True, "FORCED_EXIT triggered")
                 else:
@@ -563,6 +570,7 @@ class NiftyOptionsBot:
                 )
             except Exception:
                 pass
+            self._exit_reason_hint = config.ExitReason.HEARTBEAT.value
             self._transition(config.State.FORCED_EXIT)
             return
         if ev.status == "rejected":
@@ -782,7 +790,10 @@ class NiftyOptionsBot:
             logger.exception("Failed to arm OCO: %s", exc)
             self._transition(config.State.FORCED_EXIT)
 
-    def _finalize_exit(self, exit_price: float, was_stop: bool) -> None:
+    def _finalize_exit(
+        self, exit_price: float, was_stop: bool,
+        reason: Optional[str] = None,
+    ) -> None:
         pos = self.positions.close_position(exit_was_stop=was_stop)
         if pos is None:
             return
@@ -795,14 +806,22 @@ class NiftyOptionsBot:
                 pass
 
         pnl = (exit_price - pos.entry_price) * pos.qty
-        reason = config.ExitReason.STOP_LOSS.value if was_stop else config.ExitReason.TARGET.value
-        self.db.update_trade_exit(pos.trade_id, exit_price, pnl, reason)
+        # Prefer an explicit reason if the caller supplied one — that lets
+        # MAX_HOLD, SQUARE_OFF, MANUAL, and HEARTBEAT paths label themselves
+        # correctly instead of everything being flattened to STOP_LOSS/TARGET.
+        if reason:
+            resolved = reason
+        elif was_stop:
+            resolved = config.ExitReason.STOP_LOSS.value
+        else:
+            resolved = config.ExitReason.TARGET.value
+        self.db.update_trade_exit(pos.trade_id, exit_price, pnl, resolved)
         self.pnl_guard.add_realized(pnl)
         self._trades_today += 1
         self._consecutive_losses = self._consecutive_losses + 1 if pnl < 0 else 0
         logger.info(
             "Trade closed %s pnl=₹%.2f trades_today=%d consec_loss=%d",
-            reason, pnl, self._trades_today, self._consecutive_losses,
+            resolved, pnl, self._trades_today, self._consecutive_losses,
         )
         self._enter_cooldown()
 
@@ -994,7 +1013,7 @@ class NiftyOptionsBot:
                     "confidence": 0,
                     "grade": "OFF",
                     "strength": "OFF",
-                    "reasons": ["outside SMC window 09:20–15:00 IST"],
+                    "reasons": ["outside SMC window 09:20–15:15 IST"],
                     "entry": None, "stop_loss": None, "target": None,
                     "market_structure": "—",
                     "htf_trend": "—",
@@ -1141,7 +1160,12 @@ class NiftyOptionsBot:
             return
 
         # square-off & max-hold guards
-        if self._past_square_off() or pos.age_seconds() >= config.MAX_HOLD_TIME_MIN * 60:
+        if self._past_square_off():
+            self._exit_reason_hint = config.ExitReason.SQUARE_OFF.value
+            self._transition(config.State.FORCED_EXIT)
+            return
+        if pos.age_seconds() >= config.MAX_HOLD_TIME_MIN * 60:
+            self._exit_reason_hint = config.ExitReason.TIME_STOP.value
             self._transition(config.State.FORCED_EXIT)
             return
 
@@ -1306,7 +1330,12 @@ class NiftyOptionsBot:
         except Exception:
             logger.exception("Market flatten failed.")
         ltp = self._last_option_quote.get(pos.contract_token, {}).get("ltp", pos.entry_price)
-        self._finalize_exit(ltp, was_stop=True)
+        # Consume the exit-reason hint set by whoever routed us here. If no
+        # hint (e.g. a bug path we forgot to tag), fall back to STOP_LOSS to
+        # preserve the old behaviour instead of silently misreporting.
+        reason = self._exit_reason_hint or config.ExitReason.STOP_LOSS.value
+        self._exit_reason_hint = None
+        self._finalize_exit(ltp, was_stop=(reason != config.ExitReason.TARGET.value), reason=reason)
 
     def _step_cooldown(self) -> None:
         breach = self._trip_circuit_breakers()
@@ -1365,6 +1394,7 @@ class NiftyOptionsBot:
                         break
 
             except HeartbeatLapse:
+                self._exit_reason_hint = config.ExitReason.HEARTBEAT.value
                 self._transition(config.State.FORCED_EXIT)
             except Exception:
                 logger.exception("Main loop iteration crashed; continuing.")

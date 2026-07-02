@@ -22,6 +22,9 @@ from starlette.middleware.cors import CORSMiddleware
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
+# Local config so the API surfaces the same defaults the bot daemon uses.
+import config  # noqa: E402
+
 DB_PATH = os.environ.get("BOT_DB_PATH", str(ROOT_DIR / "data_store" / "nifty_bot.db"))
 PAPER_MODE = os.environ.get("PAPER_MODE", "true").lower() == "true"
 
@@ -273,10 +276,10 @@ def bot_status() -> dict[str, Any]:
         "auto_entry_enabled": (
             _read_env_value("AUTO_ENTRY_ENABLED") or "false"
         ).lower() == "true",
-        "manual_sl_pct": float(_read_env_value("MANUAL_SL_PCT") or 15.0),
-        "manual_tp_pct": float(_read_env_value("MANUAL_TP_PCT") or 30.0),
-        "trail_step_pct": float(_read_env_value("TRAIL_STEP_PCT") or 10.0),
-        "smc_max_signal_age_min": int(_read_env_value("SMC_MAX_SIGNAL_AGE_MIN") or 5),
+        "manual_sl_pct": float(_read_env_value("MANUAL_SL_PCT") or (config.MANUAL_SL_PCT * 100)),
+        "manual_tp_pct": float(_read_env_value("MANUAL_TP_PCT") or (config.MANUAL_TP_PCT * 100)),
+        "trail_step_pct": float(_read_env_value("TRAIL_STEP_PCT") or (config.TRAIL_STEP_PCT * 100)),
+        "smc_max_signal_age_min": int(_read_env_value("SMC_MAX_SIGNAL_AGE_MIN") or config.MAX_SIGNAL_AGE_MINUTES),
     }
 
 

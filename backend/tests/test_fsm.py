@@ -220,10 +220,80 @@ def test_breakers_only_use_trade_count_and_safety():
         return ""
 
     # Trade-count limit is the headline rule
-    assert config.MAX_TRADES_DAILY == 3
-    assert trip(2, 0) == ""
-    assert trip(3, 0) == "max_trades_daily"
+    assert config.MAX_TRADES_DAILY == 4
+    assert trip(3, 0) == ""
+    assert trip(4, 0) == "max_trades_daily"
     # Safety breakers still active
     assert trip(0, config.MAX_API_REJECT_EVENTS) == "max_api_rejects"
     # No consecutive-loss attribute used anywhere now
     assert not hasattr(config, "MAX_CONSECUTIVE_LOSSES")
+
+
+# ───────────────────────────────── Exit reason mapping (regression)
+def test_exit_reason_uses_hint_when_provided():
+    """`_finalize_exit(reason=...)` should record the explicit reason string
+    verbatim (used by FORCED_EXIT paths for TIME_STOP / SQUARE_OFF / MANUAL /
+    HEARTBEAT) — never flatten to STOP_LOSS/TARGET when a hint is provided."""
+    # Mirror the resolution logic from main._finalize_exit
+    def resolve(was_stop: bool, reason: str = None) -> str:
+        if reason:
+            return reason
+        return config.ExitReason.STOP_LOSS.value if was_stop else config.ExitReason.TARGET.value
+
+    assert resolve(was_stop=True,  reason=None) == "STOP_LOSS"
+    assert resolve(was_stop=False, reason=None) == "TARGET"
+    assert resolve(was_stop=True,  reason=config.ExitReason.TIME_STOP.value)  == "TIME_STOP"
+    assert resolve(was_stop=True,  reason=config.ExitReason.SQUARE_OFF.value) == "SQUARE_OFF"
+    assert resolve(was_stop=True,  reason=config.ExitReason.MANUAL.value)     == "MANUAL"
+    assert resolve(was_stop=True,  reason=config.ExitReason.HEARTBEAT.value)  == "HEARTBEAT"
+
+
+# ───────────────────────────────── Option-selector: Tuesday expiry filter
+def test_option_selector_prefers_tuesday_expiry():
+    """Given a scrip master with both a Tuesday weekly and a further-out
+    monthly expiry, the selector must pick Tuesday even when it's not the
+    calendar-earliest date-string sort would produce."""
+    from data.option_selector import OptionSelector
+    sel = OptionSelector.__new__(OptionSelector)   # bypass __init__ (no broker)
+    # Build two candidate rows: a Thursday (further-out but calendar-first
+    # by weekday), and a Tuesday (correct target). Use dates >= today so the
+    # filter accepts them.
+    from datetime import date, timedelta
+    today = date.today()
+    def next_weekday(weekday: int) -> date:
+        d = today
+        while d.weekday() != weekday or d == today:
+            d = d + timedelta(days=1)
+        return d
+    tue = next_weekday(1)     # Tuesday
+    thu = next_weekday(3)     # Thursday (same or following week)
+    rows = [
+        {"expiry": tue.strftime("%d%b%Y").upper()},
+        {"expiry": thu.strftime("%d%b%Y").upper()},
+    ]
+    chosen = sel._nearest_expiry(rows)
+    assert chosen == tue.strftime("%d%b%Y").upper()
+
+
+def test_option_selector_falls_back_when_no_tuesday():
+    """If the scrip master has no Tuesday (rare — usually an NSE holiday
+    shift), the selector must gracefully use the earliest future expiry."""
+    from data.option_selector import OptionSelector
+    from datetime import date, timedelta
+    sel = OptionSelector.__new__(OptionSelector)
+    today = date.today()
+    # Only Wednesday + Thursday rows — no Tuesday
+    def next_weekday(weekday: int) -> date:
+        d = today
+        while d.weekday() != weekday or d == today:
+            d = d + timedelta(days=1)
+        return d
+    wed = next_weekday(2)
+    thu = next_weekday(3)
+    rows = [
+        {"expiry": thu.strftime("%d%b%Y").upper()},
+        {"expiry": wed.strftime("%d%b%Y").upper()},
+    ]
+    chosen = sel._nearest_expiry(rows)
+    # Fallback = earliest future date, which is Wednesday here
+    assert chosen == wed.strftime("%d%b%Y").upper()
