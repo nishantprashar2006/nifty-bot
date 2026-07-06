@@ -196,9 +196,9 @@ def _pct(env_key: str, default: float) -> float:
     except ValueError:
         return default
 
-MANUAL_SL_PCT: float = _pct("MANUAL_SL_PCT", 10.0) / 100.0      # 10 % stop
-MANUAL_TP_PCT: float = _pct("MANUAL_TP_PCT", 20.0) / 100.0      # 20 % target
-TRAIL_STEP_PCT: float = _pct("TRAIL_STEP_PCT",  7.0) / 100.0    # 7 % trail step
+MANUAL_SL_PCT: float = _pct("MANUAL_SL_PCT", 15.0) / 100.0      # 15 % stop
+MANUAL_TP_PCT: float = _pct("MANUAL_TP_PCT", 30.0) / 100.0      # 30 % target
+TRAIL_STEP_PCT: float = _pct("TRAIL_STEP_PCT", 10.0) / 100.0    # 10 % trail step
 
 # ────────────────────────────────────────────────────────────────────
 # 14. Telegram notifications (advisory only — never touches trading)
