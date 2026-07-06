@@ -280,6 +280,10 @@ def bot_status() -> dict[str, Any]:
         "manual_tp_pct": float(_read_env_value("MANUAL_TP_PCT") or (config.MANUAL_TP_PCT * 100)),
         "trail_step_pct": float(_read_env_value("TRAIL_STEP_PCT") or (config.TRAIL_STEP_PCT * 100)),
         "smc_max_signal_age_min": int(_read_env_value("SMC_MAX_SIGNAL_AGE_MIN") or config.MAX_SIGNAL_AGE_MINUTES),
+        "telegram_enabled": (
+            _read_env_value("TELEGRAM_ENABLED") or "false"
+        ).lower() == "true",
+        "smc_alert_threshold": int(_read_env_value("SMC_ALERT_THRESHOLD") or config.SMC_ALERT_THRESHOLD),
     }
 
 

@@ -37,6 +37,7 @@ from strategy.position_manager import PendingEntry, PositionManager
 from strategy.regime_filter import RegimeFilter
 from strategy.signal_generator import SignalGenerator
 from strategy.smc_engine import classify_strength as smc_classify, evaluate as smc_evaluate
+from notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger("nifty_bot")
 
@@ -127,6 +128,10 @@ class NiftyOptionsBot:
         # of flattening everything to STOP_LOSS.
         self._exit_reason_hint: Optional[str] = None
 
+        # Telegram notifier — advisory only; never touches trading logic.
+        # Reads env config at construction and swallows any downstream error.
+        self.telegram = TelegramNotifier()
+
     # ────────────────────────────────────────────────────────── lifecycle
     def start(self) -> None:
         _configure_logging()
@@ -178,6 +183,13 @@ class NiftyOptionsBot:
         # mark it closed (bot lost in-memory state on restart). User can
         # re-open via Buy Call/Put manually.
         self._recover_orphan_trade()
+
+        # One-off Telegram startup ping — proves the bot is alive and the
+        # credentials are configured. No-op if TELEGRAM_ENABLED=false.
+        try:
+            self.telegram.send_startup()
+        except Exception:
+            logger.exception("Telegram startup ping raised (ignored)")
 
         # main loop
         try:
@@ -1089,6 +1101,11 @@ class NiftyOptionsBot:
                 "timestamp": ist_now,
             }
             self.db.set_state("smc_score", json.dumps(payload))
+            # Advisory notification — swallows all Telegram errors internally.
+            try:
+                self.telegram.maybe_notify_smc(payload)
+            except Exception:
+                logger.exception("Telegram maybe_notify_smc raised (ignored)")
         except Exception:
             logger.debug("SMC scoring tick failed (continuing)", exc_info=True)
 

@@ -199,3 +199,14 @@ def _pct(env_key: str, default: float) -> float:
 MANUAL_SL_PCT: float = _pct("MANUAL_SL_PCT", 10.0) / 100.0      # 10 % stop
 MANUAL_TP_PCT: float = _pct("MANUAL_TP_PCT", 20.0) / 100.0      # 20 % target
 TRAIL_STEP_PCT: float = _pct("TRAIL_STEP_PCT",  7.0) / 100.0    # 7 % trail step
+
+# ────────────────────────────────────────────────────────────────────
+# 14. Telegram notifications (advisory only — never touches trading)
+# ────────────────────────────────────────────────────────────────────
+TELEGRAM_ENABLED: bool = os.getenv("TELEGRAM_ENABLED", "false").lower() == "true"
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+try:
+    SMC_ALERT_THRESHOLD: int = int(os.getenv("SMC_ALERT_THRESHOLD", "40"))
+except ValueError:
+    SMC_ALERT_THRESHOLD = 40
