@@ -59,8 +59,15 @@ OB_LOOKBACK: int = 40
 FVG_LOOKBACK: int = 40
 
 # Regime classifier thresholds (applied to ATR / price)
+# Regime classifier thresholds (applied to ATR / price)
 REGIME_HIGH_VOL_PCT: float = 0.008   # ATR > 0.8 % of price  → high vol
 REGIME_LOW_VOL_PCT: float = 0.002    # ATR < 0.2 % of price  → low vol
+
+# Widen the "recent event" window for BOS/CHoCH and Liquidity Sweeps — an
+# event that fired on the previous bar is still a valid setup on the
+# current bar. Prevents genuine signals from evaporating after a single
+# 5-minute candle roll. 3 bars ≈ 15 minutes on the 5m execution series.
+RECENT_EVENT_BARS: int = 3
 
 # Confidence multipliers per regime (regime never suppresses, only attenuates)
 REGIME_CONF_MULT: dict[str, float] = {
@@ -259,26 +266,32 @@ def detect_bos_choch(
             # ambiguous bar — keep the trend, no event emitted
             pass
 
-    # Only surface bos/choch if they came from the LAST bar — keeps the
-    # signal "current". Older events influenced `trend` but aren't fresh.
-    if last_event_idx != len(bars) - 1:
+    # Surface bos/choch if they fired within the last RECENT_EVENT_BARS —
+    # a genuine BOS or CHoCH remains actionable for ~15 min after it forms.
+    if last_event_idx < len(bars) - RECENT_EVENT_BARS:
         return None, None, trend
     return last_bos, last_choch, trend
 
 
 def detect_liquidity_sweep(bars: list[Bar], swings: list[Swing]) -> Optional[Direction]:
-    """Wick beyond a recent swing then close back inside it (same candle)."""
+    """Wick beyond a recent swing then close back inside it (same candle).
+
+    Scans the last RECENT_EVENT_BARS candles instead of only the current one —
+    a sweep that printed 5-10 minutes ago is still a valid setup context.
+    Returns the direction of the most recent sweep, if any.
+    """
     if not bars or len(swings) < 1:
         return None
-    last = bars[-1]
     recent_highs = [s for s in swings[-8:] if s.side == "HIGH"]
     recent_lows = [s for s in swings[-8:] if s.side == "LOW"]
-    for s in recent_highs:
-        if last.high > s.price and last.close < s.price:
-            return "PUT"   # swept buy-side liquidity → bearish
-    for s in recent_lows:
-        if last.low < s.price and last.close > s.price:
-            return "CALL"  # swept sell-side liquidity → bullish
+    # Walk the last N bars newest-first so we surface the freshest sweep
+    for candle in reversed(bars[-RECENT_EVENT_BARS:]):
+        for s in recent_highs:
+            if candle.high > s.price and candle.close < s.price:
+                return "PUT"   # swept buy-side liquidity → bearish
+        for s in recent_lows:
+            if candle.low < s.price and candle.close > s.price:
+                return "CALL"  # swept sell-side liquidity → bullish
     return None
 
 

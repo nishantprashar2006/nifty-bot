@@ -226,3 +226,65 @@ def test_regime_attenuates_confidence_in_sideways():
     flat = [_bar(i, 100, 100.5, 99.5, 100) for i in range(40)]
     res = evaluate(flat, flat[:20])
     assert res.confidence <= 30
+
+
+# ─────────────────────────── Widened recent-event windows (PART 3 tweak)
+def test_liquidity_sweep_detects_within_recent_window():
+    """A sweep that fired 2 bars ago should still be surfaced within the
+    RECENT_EVENT_BARS window (default 3 bars ≈ 15 min on 5m). Verifies we
+    don't lose valid sweep credit on the very next candle."""
+    from strategy.smc_engine import RECENT_EVENT_BARS, detect_liquidity_sweep
+    from data.swing_finder import Swing
+    assert RECENT_EVENT_BARS >= 2   # widened from 1
+    bars = [
+        _bar(0, 100, 101, 99, 100),
+        _bar(1, 100, 101, 99, 100),
+        _bar(2, 101, 108, 100, 107),
+        _bar(3, 107, 108, 106, 107),
+        _bar(4, 107, 109, 93, 108),    # ← sweep of the low at 95 (wick to 93, close back)
+        _bar(5, 108, 109, 107, 108),   # 1 bar after sweep — still fresh
+        _bar(6, 108, 109, 107, 108),   # 2 bars after — still within window
+    ]
+    swings = [
+        Swing(idx=3, price=95.0, side="LOW", ts=bars[3].ts),
+        Swing(idx=1, price=110.0, side="HIGH", ts=bars[1].ts),
+    ]
+    assert detect_liquidity_sweep(bars, swings) == "CALL"
+
+
+def test_liquidity_sweep_expires_after_window():
+    """Sweeps older than RECENT_EVENT_BARS should stop being credited —
+    we're not letting stale events pollute current confidence."""
+    from strategy.smc_engine import RECENT_EVENT_BARS, detect_liquidity_sweep
+    from data.swing_finder import Swing
+    bars = [_bar(0, 100, 108, 92, 108)]   # sweep bar
+    # Pad with N+2 flat bars to push the sweep out of the recent window
+    for i in range(1, RECENT_EVENT_BARS + 3):
+        bars.append(_bar(i, 108, 109, 107, 108))
+    swings = [Swing(idx=0, price=95.0, side="LOW", ts=bars[0].ts)]
+    # The sweep candle at idx 0 is way outside the last RECENT_EVENT_BARS window
+    assert detect_liquidity_sweep(bars, swings) is None
+
+
+# ─────────────────────────── Near-OTM strike selection
+def test_option_selector_near_otm_strike_math():
+    """Near-OTM selection contract (independent of scrip-master noise):
+      • CE strike = smallest 50-multiple STRICTLY greater than spot
+      • PE strike = largest  50-multiple STRICTLY less    than spot
+    Boundary case: when spot IS an exact 50-multiple, both legs push
+    outward by an additional 50 (no ATM overlap)."""
+    import math
+    step = 50
+
+    def near_otm(spot: float) -> tuple[int, int]:
+        ce = math.floor(spot / step) * step + step
+        pe = math.ceil(spot / step) * step - step
+        if ce - spot <= 0: ce += step
+        if spot - pe <= 0: pe -= step
+        return ce, pe
+
+    assert near_otm(24555) == (24600, 24550)   # spot 24555 → CE 24600, PE 24550
+    assert near_otm(24500) == (24550, 24450)   # exact strike → push both out
+    assert near_otm(24501) == (24550, 24500)
+    assert near_otm(24549) == (24550, 24500)
+    assert near_otm(24550) == (24600, 24500)   # exact strike again

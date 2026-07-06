@@ -108,19 +108,38 @@ class OptionSelector:
 
     # ------------------------------------------------------------------ pick
     def select_atm(self, spot_price: float) -> tuple[OptionContract, OptionContract]:
-        """Return (CE, PE) ATM contracts for the nearest weekly expiry."""
+        """Return (CE, PE) contracts for the nearest weekly Tuesday expiry.
+
+        Per user preference (see PRD), we pick **Near-OTM** strikes — this
+        matches Angel One's "Most Traded" tag which retail flow gravitates
+        towards (better liquidity, higher gamma leverage, lower entry cost).
+
+            CE strike = smallest 50-multiple **strictly greater** than spot
+            PE strike = largest  50-multiple **strictly less**    than spot
+
+        Both legs are still on the same weekly expiry so the position
+        management logic stays symmetric.
+        """
         rows = self._nifty_options()
         expiry = self._nearest_expiry(rows)
         nearest = [r for r in rows if r.get("expiry") == expiry]
 
-        # round to nearest 50 strike (Nifty convention)
-        atm_strike = round(spot_price / 50) * 50
+        import math
+        step = config.NIFTY_STRIKE_STEP if hasattr(config, "NIFTY_STRIKE_STEP") else 50
+        # Smallest 50-strike strictly > spot  (for CE Near-OTM)
+        ce_strike = math.floor(spot_price / step) * step + step
+        # Largest  50-strike strictly < spot  (for PE Near-OTM)
+        pe_strike = math.ceil(spot_price / step) * step - step
+        # Edge cases when spot is EXACTLY on a strike boundary
+        if ce_strike - spot_price <= 0:
+            ce_strike += step
+        if spot_price - pe_strike <= 0:
+            pe_strike -= step
 
-        def find(opt_type: str) -> dict:
+        def find(opt_type: str, target_strike: float) -> dict:
             best = None
             best_diff = float("inf")
             for r in nearest:
-                # strike comes as paise integer string in scrip master
                 try:
                     strike = float(r.get("strike", 0)) / 100
                 except (TypeError, ValueError):
@@ -128,16 +147,16 @@ class OptionSelector:
                 sym = r.get("symbol", "")
                 if not sym.endswith(opt_type):
                     continue
-                diff = abs(strike - atm_strike)
+                diff = abs(strike - target_strike)
                 if diff < best_diff:
                     best_diff = diff
                     best = r
             if best is None:
-                raise RuntimeError(f"No ATM {opt_type} candidate found.")
+                raise RuntimeError(f"No Near-OTM {opt_type} candidate at {target_strike} found.")
             return best
 
-        ce = find("CE")
-        pe = find("PE")
+        ce = find("CE", ce_strike)
+        pe = find("PE", pe_strike)
 
         def to_contract(r: dict, otype: str) -> OptionContract:
             return OptionContract(
