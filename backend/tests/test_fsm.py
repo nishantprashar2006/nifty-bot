@@ -353,3 +353,48 @@ def test_liquidity_penalty_median_of_last_three():
     leg2(0.03)          # wide
     p = leg2(0.03)      # median of (0.001, 0.03, 0.03) = 0.03 → 60 → capped 50
     assert p == 50
+
+
+
+def test_synthetic_ltp_median_smoothing_absorbs_single_spike():
+    """3-tick median smoothing on the LTP used for synthetic SL/TP/trail.
+
+    A single wide bid-ask spike (or stale tick) that would otherwise punch
+    below the stop or above the target gets medianed out. Two consecutive
+    reads that stay through the threshold still trigger the exit — same
+    formula as `main.py::_step_position_open`.
+    """
+    from collections import deque
+    hist = deque(maxlen=3)
+
+    def smoothed(ltp: float) -> float:
+        hist.append(ltp)
+        ordered = sorted(hist)
+        return ordered[len(ordered) // 2]
+
+    # Position: entry ₹100, stop ₹85, target ₹130
+    stop, target = 85.0, 130.0
+
+    # Healthy prints then one bad tick that pierces stop
+    assert smoothed(105.0) > stop        # tick 1 — safe
+    assert smoothed(106.0) > stop        # tick 2 — safe
+    assert smoothed(70.0)  > stop        # tick 3 — spike medianed out
+    # Two more healthy prints — spike falls out of the deque
+    assert smoothed(105.0) > stop
+    assert smoothed(106.0) > stop
+
+    # Genuine breakdown: two consecutive lows push median through stop
+    hist2 = deque(maxlen=3)
+    def s2(x):
+        hist2.append(x); o = sorted(hist2); return o[len(o) // 2]
+    s2(105.0)
+    s2(80.0)
+    assert s2(80.0) <= stop              # median(105, 80, 80) = 80 → stop hit
+
+    # Same behaviour on the target side — one lone spike above target is filtered
+    hist3 = deque(maxlen=3)
+    def s3(x):
+        hist3.append(x); o = sorted(hist3); return o[len(o) // 2]
+    s3(120.0)
+    s3(121.0)
+    assert s3(200.0) < target            # median(120, 121, 200) = 121 → no false TP

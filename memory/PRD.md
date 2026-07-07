@@ -133,3 +133,24 @@ modular layout (config, broker, data, strategy, risk, database, main).
 ## Next tasks
 - User to confirm a paper-mode session end-to-end on a market day
 - After at least one successful paper session, flip `PAPER_MODE=false` and run a single 1-lot pilot before scaling
+
+
+## Session update (2026-02-06 — post-fork verification)
+- **Completed the incomplete synthetic SL/TP smoothing edit**: the `_ltp_history`
+  deque had been declared in `__init__` but the actual median-smoothing was
+  never wired into `_step_position_open`. Fixed by feeding raw `q["ltp"]`
+  through a per-token `deque(maxlen=3)` and using the median as the price
+  compared against `pos.target_price`, `pos.stop_price`, and passed into
+  `positions.maybe_trail_stop(ltp)`. Nothing else changed — same thresholds,
+  same exit routing, same order placement, same trailing logic.
+- **New regression test** `test_synthetic_ltp_median_smoothing_absorbs_single_spike`
+  in `tests/test_fsm.py` verifies:
+    • One transient spike below stop / above target is medianed out
+    • Two consecutive genuine breaches still trigger the exit
+    • Deque behaviour matches the exact formula used in `main.py`
+- **Full suite**: 68 passing (was 67; +1 new). No regressions.
+- **Live smoke**: backend restarted cleanly, `GET /api/bot/status` returns
+  200 with all expected keys (`setup_score`, `smc_score`, `fsm_state`, …).
+- **No behavioural changes to**: SMC confidence, SMC Buy Call/Put signals,
+  Indicator Engine, Telegram alerts, entry logic, SL/TP percentages, or
+  trailing-SL step %.

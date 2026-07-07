@@ -135,6 +135,10 @@ class NiftyOptionsBot:
         # formula, same 50-point ceiling — only the input is smoothed.
         from collections import deque
         self._spread_history: dict[str, deque] = {}
+        # Rolling per-token LTP history for the SMC synthetic SL/TP and
+        # trailing-SL price reads (shared smoothing primitive with the
+        # spread penalty). Same 3-tick median, same helper.
+        self._ltp_history: dict[str, deque] = {}
 
         # Telegram notifier — advisory only; never touches trading logic.
         # Reads env config at construction and swallows any downstream error.
@@ -1208,7 +1212,22 @@ class NiftyOptionsBot:
             return
 
         q = self._last_option_quote.get(pos.contract_token, {})
-        ltp = q.get("ltp")
+        raw_ltp = q.get("ltp")
+
+        # 3-tick median smoothing on the LTP used for synthetic SL/TP and
+        # trailing-SL evaluation. Same source quote as before; only the value
+        # fed into the SL/TP comparators is the median of the last 3 reads.
+        # Purpose: absorb a single transient wide bid-ask spike so a healthy
+        # position isn't flushed on one bad tick. SL/TP thresholds, trail
+        # step %, exit routing, and order placement are all unchanged — the
+        # ONLY difference is that `ltp` below is the smoothed price.
+        ltp = None
+        if raw_ltp is not None and raw_ltp > 0:
+            from collections import deque as _deque
+            hist = self._ltp_history.setdefault(pos.contract_token, _deque(maxlen=3))
+            hist.append(raw_ltp)
+            ordered = sorted(hist)
+            ltp = ordered[len(ordered) // 2]   # median of last ≤3 ticks
 
         # ── Synthetic SL/TP enforcement (PRIMARY in SIM, SAFETY-NET in LIVE)
         # The protective legs we placed on the broker may not fire on time:
@@ -1233,7 +1252,7 @@ class NiftyOptionsBot:
                 self._synthetic_exit(ltp, was_stop=True)
                 return
 
-        # trail stop using latest premium
+        # trail stop using latest premium (same smoothed LTP)
         if ltp:
             new_stop = self.positions.maybe_trail_stop(ltp)
             if new_stop is not None and pos.stop_order_id:
