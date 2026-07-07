@@ -288,3 +288,60 @@ def test_option_selector_near_otm_strike_math():
     assert near_otm(24501) == (24550, 24500)
     assert near_otm(24549) == (24550, 24500)
     assert near_otm(24550) == (24600, 24500)   # exact strike again
+
+
+# ─────────────────────────── HTF: last-3 endpoint majority
+def test_structure_last3_ignores_middle_anomaly():
+    """One noisy middle swing should no longer force NEUTRAL.
+    Endpoint check `highs[-1] > highs[-3]` and `lows[-1] > lows[-3]`."""
+    from data.swing_finder import Swing
+    from strategy.smc_engine import detect_structure
+    from datetime import datetime, timezone
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # Highs march up cleanly: 100 → 110 → 120
+    # Lows: 90 → 85 (dip) → 95   ← middle low broke pattern under old rule
+    swings = [
+        Swing(idx=0,  price=100, side="HIGH", ts=ts),
+        Swing(idx=1,  price=90,  side="LOW",  ts=ts),
+        Swing(idx=2,  price=110, side="HIGH", ts=ts),
+        Swing(idx=3,  price=85,  side="LOW",  ts=ts),   # anomalous dip
+        Swing(idx=4,  price=120, side="HIGH", ts=ts),
+        Swing(idx=5,  price=95,  side="LOW",  ts=ts),
+    ]
+    assert detect_structure(swings) == "CALL"
+
+
+def test_structure_last3_falls_back_to_last2_when_scarce():
+    """When only 2 confirmed swings per side exist, use the strict last-2
+    rule (preserves early-session warm-up behaviour)."""
+    from data.swing_finder import Swing
+    from strategy.smc_engine import detect_structure
+    from datetime import datetime, timezone
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    swings = [
+        Swing(idx=0, price=100, side="HIGH", ts=ts),
+        Swing(idx=1, price=90,  side="LOW",  ts=ts),
+        Swing(idx=2, price=110, side="HIGH", ts=ts),
+        Swing(idx=3, price=95,  side="LOW",  ts=ts),
+    ]
+    assert detect_structure(swings) == "CALL"
+
+
+def test_structure_last3_stays_neutral_on_flat_endpoints():
+    """If highs endpoints don't advance, the answer must remain NEUTRAL —
+    the last-3 rule must not fabricate a trend."""
+    from data.swing_finder import Swing
+    from strategy.smc_engine import detect_structure
+    from datetime import datetime, timezone
+    ts = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # highs: 100 → 115 (up middle) → 100 (back to same endpoint)
+    # lows:  90 → 85 (dip) → 90
+    swings = [
+        Swing(idx=0, price=100, side="HIGH", ts=ts),
+        Swing(idx=1, price=90,  side="LOW",  ts=ts),
+        Swing(idx=2, price=115, side="HIGH", ts=ts),
+        Swing(idx=3, price=85,  side="LOW",  ts=ts),
+        Swing(idx=4, price=100, side="HIGH", ts=ts),
+        Swing(idx=5, price=90,  side="LOW",  ts=ts),
+    ]
+    assert detect_structure(swings) == "NEUTRAL"

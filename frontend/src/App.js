@@ -902,7 +902,7 @@ function App() {
             <div className="mt-3 pt-3 border-t border-zinc-800 text-[10px] font-mono text-zinc-500">
               base call <span className="text-zinc-300">{score.base_call}</span> · base put <span className="text-zinc-300">{score.base_put}</span> · liquidity penalty <span className="text-amber-300">−{score.penalty}</span>
               <span className="block mt-1">
-                ≥80 STRONG · ≥60 GOOD · ≥40 NEUTRAL · ≥20 WEAK · &lt;20 AVOID. Score = EMA15m (20) + EMA9/21 3m (20) + ADX (10) + ADX-Δ (15) + VWAP (15) + VIX-band (10) − bid-ask spread penalty.
+                ≥60 STRONG · ≥45 GOOD · ≥30 NEUTRAL · ≥15 WEAK · &lt;15 AVOID. Score = EMA15m (20) + EMA9/21 3m (20) + ADX (10) + ADX-Δ (15) + VWAP (15) + VIX-band (10) − bid-ask spread penalty.
               </span>
             </div>
           </Card>

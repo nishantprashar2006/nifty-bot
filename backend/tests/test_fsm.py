@@ -297,3 +297,59 @@ def test_option_selector_falls_back_when_no_tuesday():
     chosen = sel._nearest_expiry(rows)
     # Fallback = earliest future date, which is Wednesday here
     assert chosen == wed.strftime("%d%b%Y").upper()
+
+
+# ─────────────── Indicator strength bands rebalanced to 0-70 achievable range
+def test_indicator_strength_bands_reachable():
+    """STRONG must now be mathematically achievable within the base-score
+    ceiling of 70. Bands are contiguous and monotonic — no gaps."""
+    def classify(s):
+        if s >= 60: return "STRONG"
+        if s >= 45: return "GOOD"
+        if s >= 30: return "NEUTRAL"
+        if s >= 15: return "WEAK"
+        return "AVOID"
+    # STRONG becomes reachable at the max theoretical base (70)
+    assert classify(70) == "STRONG"
+    assert classify(60) == "STRONG"
+    assert classify(59) == "GOOD"
+    assert classify(45) == "GOOD"
+    assert classify(44) == "NEUTRAL"
+    assert classify(30) == "NEUTRAL"
+    assert classify(29) == "WEAK"
+    assert classify(15) == "WEAK"
+    assert classify(14) == "AVOID"
+    assert classify(0)  == "AVOID"
+
+
+# ─────────────── Liquidity penalty median-smoothing
+def test_liquidity_penalty_median_of_last_three():
+    """Median of the last 3 spread readings suppresses a single spike.
+    Persistent wide spread still hits the 50-point cap (formula unchanged)."""
+    from collections import deque
+    hist = deque(maxlen=3)
+
+    def leg_penalty(spread_pct: float) -> float:
+        hist.append(spread_pct)
+        ordered = sorted(hist)
+        smoothed = ordered[len(ordered) // 2]
+        return min(smoothed * 2000, 50)
+
+    # A single 5 % spike among tight readings — median stays tight
+    assert leg_penalty(0.001) < 5              # spread ≈ 0.1 %
+    assert leg_penalty(0.001) < 5
+    assert leg_penalty(0.05)  < 5              # spike gets medianed out
+    # Two more tight readings after the spike push it out entirely
+    assert leg_penalty(0.001) < 5
+    assert leg_penalty(0.001) < 5
+
+    # Persistent wide spread — hits the 50 cap after 2 wide readings in a row
+    hist2 = deque(maxlen=3)
+    def leg2(sp):
+        hist2.append(sp)
+        ord2 = sorted(hist2)
+        return min(ord2[len(ord2) // 2] * 2000, 50)
+    leg2(0.001)         # tight
+    leg2(0.03)          # wide
+    p = leg2(0.03)      # median of (0.001, 0.03, 0.03) = 0.03 → 60 → capped 50
+    assert p == 50

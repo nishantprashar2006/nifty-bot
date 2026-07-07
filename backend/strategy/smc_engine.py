@@ -183,15 +183,40 @@ def detect_htf_trend(bars_15m: list[Bar]) -> Direction:
 
 
 def detect_structure(swings: list[Swing]) -> Direction:
-    """HH+HL → CALL · LH+LL → PUT · else NEUTRAL. Uses last 2 highs and lows."""
-    highs = [s for s in swings if s.side == "HIGH"][-2:]
-    lows = [s for s in swings if s.side == "LOW"][-2:]
-    if len(highs) < 2 or len(lows) < 2:
+    """Structure-based bias.
+
+    Prefers the **last 3 confirmed swings on each side** using endpoint
+    comparison — `highs[-1]` vs `highs[-3]` and `lows[-1]` vs `lows[-3]`.
+    Endpoint comparison ignores a single anomalous middle swing (e.g. a
+    noisy pullback low) that used to force NEUTRAL under the strict
+    last-2 rule.
+
+    Falls back to the original strict last-2 comparison when only 2
+    confirmed swings exist (early session warm-up), so no early-session
+    behaviour is lost.
+
+    Fully deterministic — no tolerances, EMAs, ATR, or new primitives.
+    HH+HL → CALL ·  LH+LL → PUT ·  otherwise NEUTRAL.
+    """
+    highs = [s for s in swings if s.side == "HIGH"]
+    lows = [s for s in swings if s.side == "LOW"]
+
+    if len(highs) >= 3 and len(lows) >= 3:
+        # Endpoint check across the last 3 confirmed swings per side —
+        # one anomalous middle swing no longer flips the verdict.
+        hh = highs[-1].price > highs[-3].price
+        hl = lows[-1].price > lows[-3].price
+        lh = highs[-1].price < highs[-3].price
+        ll = lows[-1].price < lows[-3].price
+    elif len(highs) >= 2 and len(lows) >= 2:
+        # Warm-up fallback — original strict last-2 rule.
+        hh = highs[-1].price > highs[-2].price
+        hl = lows[-1].price > lows[-2].price
+        lh = highs[-1].price < highs[-2].price
+        ll = lows[-1].price < lows[-2].price
+    else:
         return "NEUTRAL"
-    hh = highs[1].price > highs[0].price
-    hl = lows[1].price > lows[0].price
-    lh = highs[1].price < highs[0].price
-    ll = lows[1].price < lows[0].price
+
     if hh and hl:
         return "CALL"
     if lh and ll:

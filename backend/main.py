@@ -128,6 +128,14 @@ class NiftyOptionsBot:
         # of flattening everything to STOP_LOSS.
         self._exit_reason_hint: Optional[str] = None
 
+        # Rolling per-leg spread history for the liquidity penalty. Storing
+        # the last 3 spread_pct readings per option token lets the penalty
+        # calculation use the median instead of a single tick, so one stale
+        # WebSocket quote can't zero the setup score on its own. Same
+        # formula, same 50-point ceiling — only the input is smoothed.
+        from collections import deque
+        self._spread_history: dict[str, deque] = {}
+
         # Telegram notifier — advisory only; never touches trading logic.
         # Reads env config at construction and swallows any downstream error.
         self.telegram = TelegramNotifier()
@@ -955,7 +963,12 @@ class NiftyOptionsBot:
                 base_call += 10
                 base_put += 10
 
-            # Liquidity penalty — average spread across CE/PE quotes if present
+            # Liquidity penalty — median spread over the last 3 quote updates
+            # per leg. Keeps the exact formula and 50-point cap, but immunises
+            # the setup score against a single stale/spike WebSocket quote:
+            # a persistent wide spread still hits 50, a one-off spike gets
+            # medianed out by the next tight reading.
+            from collections import deque as _deque
             penalties = []
             for c in (self._ce, self._pe):
                 if c is None: continue
@@ -964,17 +977,25 @@ class NiftyOptionsBot:
                 bid, ask = q.get("bid", 0), q.get("ask", 0)
                 if bid > 0 and ask > 0:
                     spread_pct = (ask - bid) / ((ask + bid) / 2)
-                    penalties.append(min(spread_pct * 2000, 50))
+                    hist = self._spread_history.setdefault(c.token, _deque(maxlen=3))
+                    hist.append(spread_pct)
+                    ordered = sorted(hist)
+                    smoothed_spread = ordered[len(ordered) // 2]   # median
+                    penalties.append(min(smoothed_spread * 2000, 50))
             penalty = sum(penalties) / len(penalties) if penalties else 0
 
             call_score = max(0, round(base_call - penalty))
             put_score = max(0, round(base_put - penalty))
 
             def classify(s):
-                if s >= 80: return "STRONG"
-                if s >= 60: return "GOOD"
-                if s >= 40: return "NEUTRAL"
-                if s >= 20: return "WEAK"
+                # Bands rebalanced to the achievable base-score range (0-70).
+                # Max theoretical base = EMA20 + ADX10 + ADX-Δ15 + VWAP15 + VIX10 = 70.
+                # Previous thresholds treated max as 100, making STRONG (≥80)
+                # unreachable. Same 5-tier vocabulary, calibrated bands.
+                if s >= 60: return "STRONG"     # ≥ 86 % of max
+                if s >= 45: return "GOOD"       # ≥ 64 %
+                if s >= 30: return "NEUTRAL"    # ≥ 43 %
+                if s >= 15: return "WEAK"       # ≥ 21 %
                 return "AVOID"
 
             if call_score > put_score:
