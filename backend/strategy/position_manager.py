@@ -36,6 +36,11 @@ class OpenPosition:
     entry_ts: datetime
     target_price: float
     stop_price: float
+    # P0-4: full contract identity persisted with every trade
+    strike: float = 0.0
+    expiry: str = ""
+    option_type: str = ""    # "CE" | "PE"
+    lot_size: int = 0
     target_order_id: Optional[str] = None
     stop_order_id: Optional[str] = None
     trail_anchor: float = 0.0    # last premium high used to trail SL up
@@ -58,6 +63,12 @@ class PendingEntry:
     qty: int
     target_price: float
     stop_price: float
+    # P0-4: full contract identity carried through the pending phase so it
+    # can be persisted verbatim on fill, without re-reading self._ce/_pe.
+    strike: float = 0.0
+    expiry: str = ""
+    option_type: str = ""
+    lot_size: int = 0
     sl_points: float = 0.0     # ATR-derived; used to re-anchor on actual fill
     tp_points: float = 0.0
     # PART 3 — when > 0 these supersede sl/tp_points and recompute the legs
@@ -145,6 +156,11 @@ class PositionManager:
                 entry_ts=datetime.now(timezone.utc),
                 target_price=target_price,
                 stop_price=stop_price,
+                # P0-4: carry the full contract identity from pending → open
+                strike=p.strike,
+                expiry=p.expiry,
+                option_type=p.option_type,
+                lot_size=p.lot_size,
                 trail_anchor=fill_price,
                 trail_step_pct=p.trail_step_pct,
             )

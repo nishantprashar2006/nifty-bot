@@ -97,19 +97,22 @@ def test_liquidity_fails_low_volume():
 
 # ──────────────────────────────────────────────────────────── pnl guard
 def test_pnl_guard_loss_breach():
-    g = PnlGuard(daily_loss_cap=-1500, daily_profit_lock=3000)
+    g = PnlGuard(daily_loss_cap=-1500)
     g.add_realized(-1500)
     assert g.evaluate().breached
+    assert "loss_cap_hit" in g.evaluate().reason
 
 
-def test_pnl_guard_profit_breach():
-    g = PnlGuard(-1500, 3000)
-    g.add_realized(3000)
-    assert g.evaluate().breached
+def test_pnl_guard_profit_never_breaches():
+    """P0-7: profit lock has been removed. Even a massive gain must not
+    trigger the shutdown path."""
+    g = PnlGuard(-1500)
+    g.add_realized(50_000)          # huge profit
+    assert not g.evaluate().breached
 
 
 def test_pnl_guard_no_breach_in_range():
-    g = PnlGuard(-1500, 3000)
+    g = PnlGuard(-1500)
     g.add_realized(500)
     assert not g.evaluate().breached
 

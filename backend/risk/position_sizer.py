@@ -21,7 +21,6 @@ class SizingResult:
     peak_equity: float
     current_equity: float
     daily_loss_cap: float       # negative number (rupees)
-    daily_profit_lock: float    # positive
     scale_multiplier: float
 
 
@@ -57,9 +56,9 @@ class PositionSizer:
 
         effective_lots = max(config.MIN_LOTS, min(effective_lots, config.MAX_LOTS_DYNAMIC))
 
-        # daily breakers — locked once finalized for the session
+        # daily breaker — locked once finalized for the session.
+        # Profit lock removed (P0-7); only the loss cap remains.
         daily_loss_cap = -config.LOSS_PER_LOT * effective_lots
-        daily_profit_lock = config.PROFIT_PER_LOT * effective_lots
 
         self._db.log_equity_point(
             current_equity=current_equity,
@@ -76,7 +75,6 @@ class PositionSizer:
             peak_equity=peak_equity,
             current_equity=current_equity,
             daily_loss_cap=float(daily_loss_cap),
-            daily_profit_lock=float(daily_profit_lock),
             scale_multiplier=scale,
         )
 

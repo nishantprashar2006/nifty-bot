@@ -267,6 +267,7 @@ def bot_status() -> dict[str, Any]:
         "live_quotes": quotes,
         "setup_score": _setup_score(),
         "smc_score": _smc_score(),
+        "atm_snapshot": _atm_snapshot(),
         "db_path": DB_PATH,
         "server_time_utc": datetime.now(timezone.utc).isoformat(),
         # PART 3 — execution gating + manual-mode policy
@@ -360,6 +361,29 @@ def _smc_score() -> dict[str, Any]:
         with _conn() as c:
             row = c.execute(
                 "SELECT value, updated FROM bot_state WHERE key='smc_score'"
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    if not row:
+        return {}
+    try:
+        d = json.loads(row["value"])
+        d["updated"] = row["updated"]
+        return d
+    except Exception:
+        return {}
+
+
+def _atm_snapshot() -> dict[str, Any]:
+    """P0-5: currently-resolved Near-OTM CE & PE picks with fresh premiums.
+    Published by the bot every ~10s and on every manual-entry click. The
+    dashboard reads this to show the exact contract in the confirm modal
+    so what you SEE is what will actually be TRADED."""
+    import json
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT value, updated FROM bot_state WHERE key='atm_snapshot'"
             ).fetchone()
     except sqlite3.OperationalError:
         return {}

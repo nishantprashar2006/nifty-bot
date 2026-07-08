@@ -382,6 +382,13 @@ function App() {
     ? (Date.now() - new Date(smc.updated).getTime()) / 1000 > 10
     : false;
 
+  // P0-5: currently-resolved Near-OTM contracts (refreshed every ~10s by the
+  // bot). Used inside the manual-entry confirmation modal so the user sees
+  // EXACTLY which strike/expiry/token/premium will be sent to the broker.
+  const atm = status?.atm_snapshot || {};
+  const atmLeg = confirmManual === "CALL" ? atm.ce : (confirmManual === "PUT" ? atm.pe : null);
+  const atmStale = atm.ts ? (Date.now() / 1000 - atm.ts) > 20 : true;
+
   // Buy-button glow = bias from the currently selected engine only
   const selectedBias =
     engine === "smc" ? (smc.direction === "CALL" || smc.direction === "PUT" ? smc.direction : null)
@@ -682,6 +689,23 @@ function App() {
                     <span className="ml-2 px-1.5 py-0.5 text-[10px] border border-amber-700 text-amber-300 font-mono">
                       MANUAL
                     </span>
+                  )}
+                  {openPos.contract_symbol && (
+                    <div
+                      data-testid="open-pos-contract"
+                      className="mt-1 text-[11px] text-amber-300"
+                    >
+                      {openPos.contract_symbol}
+                      {openPos.strike != null && (
+                        <span className="text-zinc-500"> · strike {openPos.strike}</span>
+                      )}
+                      {openPos.expiry && (
+                        <span className="text-zinc-500"> · exp {openPos.expiry}</span>
+                      )}
+                      {openPos.contract_token && (
+                        <span className="text-zinc-600"> · tok {openPos.contract_token}</span>
+                      )}
+                    </div>
                   )}
                   {livePnl != null && (
                     <div
@@ -1373,10 +1397,43 @@ function App() {
               }
             </AlertDialogTitle>
             <AlertDialogDescription className="text-zinc-400 text-sm leading-relaxed">
-              The bot will buy the <span className="text-amber-300">ATM weekly {confirmManual}</span> contract immediately.
+              {atmLeg ? (
+                <div
+                  data-testid="confirm-contract-card"
+                  className={`mb-3 p-3 border rounded-none ${
+                    atmStale ? "border-amber-800 bg-amber-950/20" : "border-zinc-700 bg-zinc-900"
+                  }`}
+                >
+                  <div className="text-xs uppercase tracking-wider text-zinc-500 mb-1">
+                    Resolved contract {atmStale && <span className="text-amber-300">(snapshot &gt;20s old)</span>}
+                  </div>
+                  <div className="text-amber-300 text-lg font-semibold" data-testid="confirm-contract-symbol">
+                    {atmLeg.symbol || "—"}
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-1 mt-2 text-zinc-300">
+                    <div>Strike: <span className="text-zinc-100" data-testid="confirm-strike">{atmLeg.strike ?? "—"}</span></div>
+                    <div>Type: <span className="text-zinc-100" data-testid="confirm-option-type">{atmLeg.option_type || "—"}</span></div>
+                    <div>Expiry: <span className="text-zinc-100" data-testid="confirm-expiry">{atmLeg.expiry || "—"}</span></div>
+                    <div>Token: <span className="text-zinc-500 text-xs" data-testid="confirm-token">{atmLeg.token || "—"}</span></div>
+                    <div className="col-span-2 mt-1">
+                      Premium: <span className="text-amber-300 font-semibold" data-testid="confirm-premium">
+                        {atmLeg.ltp != null ? `₹${Number(atmLeg.ltp).toFixed(2)}` : "—"}
+                      </span>
+                      {atm.spot && <span className="text-zinc-500 text-xs ml-2">(spot ₹{Number(atm.spot).toFixed(2)})</span>}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="mb-3 p-3 border border-red-800 bg-red-950/20 text-red-300 text-sm" data-testid="confirm-contract-missing">
+                  No ATM snapshot available yet — the bot may still be booting. Please retry in a few seconds.
+                </div>
+              )}
+              The bot will refresh the strike again at execution time and buy
+              the newest Near-OTM {confirmManual} contract. At execution the
+              actual fill price becomes the entry price, SL/TP recalc from it.
               {status?.trading_mode === "live"
                 ? <span className="block mt-1 text-red-300">Mode is LIVE — this places a REAL order on NSE/NFO.</span>
-                : <span className="block mt-1 text-blue-300">Mode is SIM — order is simulated.</span>
+                : <span className="block mt-1 text-blue-300">Mode is SIM — order is simulated at the WS/REST premium above.</span>
               }
               <ul className="list-disc list-inside mt-3 space-y-1 text-zinc-300">
                 <li>Engine: <span className="text-amber-300 uppercase">{engine}</span> (drives the SL/TP/Trail policy)</li>
@@ -1386,9 +1443,6 @@ function App() {
                 <li>Trailing step: <span className="text-amber-300">{status?.trail_step_pct ?? 10}%</span></li>
                 <li>Single-position lock + cooldown after exit</li>
               </ul>
-              <span className="block mt-3 text-zinc-500">
-                Position size and SL/TP recalc from your ACTUAL fill price — no theoretical math.
-              </span>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

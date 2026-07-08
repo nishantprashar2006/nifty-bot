@@ -194,3 +194,48 @@ modular layout (config, broker, data, strategy, risk, database, main).
 - **User-acknowledged side effect**: users with a low `SMC_ALERT_THRESHOLD`
   may receive Telegram alerts earlier in the morning if confidence
   legitimately crosses the threshold before 12:00 IST.
+
+## Session update (2026-02-06 — P0 execution-correctness pass, v1.7)
+
+### Root cause of the entry-price mismatch
+Two independent defects compounded:
+
+1. **Stale contract cache**: `self._ce` / `self._pe` were picked ONCE at startup by `_refresh_atm_contracts()` and never refreshed as spot drifted. Clicks late in the day sent orders for the startup strikes, not the strikes the user was viewing in Angel One.
+2. **LIVE MARKET fill_price bug**: `_handle_fill` read `ev.fill_price` (mapped from `msg["price"]` in the WS payload) — which is `0.0` for MARKET orders. `ev.avg_price` (mapped from `msg["averageprice"]`) holds the real fill. Invisible in SIM because `force_order()` synthesised both fields to the same value.
+
+Additionally: `trades` had no `contract_symbol / token / strike / expiry / option_type / lot_size` columns, so the dashboard could not display which contract each entry belonged to. `reset_breakers` did not flush pending commands, allowing a queued manual entry to fire moments after SHUTDOWN was cleared. Daily profit lock at ₹1,500/lot was tripping SHUTDOWN after two winning trades.
+
+### Fixes shipped (all P0)
+- **P0-1** `main.py::_handle_manual_entry` unconditionally calls `_refresh_atm_contracts()` before picking the contract. Startup cache is never trusted for manual entries.
+- **P0-2** `_place_entry` adds a one-shot `broker.ltp(...)` REST fallback when `_last_option_quote[token]` is empty (freshly-picked strike, WS not yet subscribed). Aborts cleanly if REST also fails — no more ₹100 synthetic fallback.
+- **P0-3** `_handle_fill` prefers `ev.avg_price` (falls back to `ev.fill_price` only if `avg_price ≤ 0`). Applies to both entry and exit fills. SIM behaviour bit-identical (both fields already equal). Defensive abort if both are 0.
+- **P0-4** Idempotent migration adds `contract_symbol, contract_token, strike, expiry, option_type, lot_size` to `trades`. `PendingEntry` / `OpenPosition` carry them; `insert_trade_entry` persists them; `/api/bot/stats::open_position` and `/api/bot/trades` expose them via `SELECT *`.
+- **P0-5** New `atm_snapshot` bot_state key (refreshed every ~10s) exposed in `/api/bot/status`. Confirmation modal now shows the exact strike/expiry/token/premium that will be traded instead of "ATM weekly CALL".
+- **P0-6** `_transition(SHUTDOWN)` and `reset_breakers()` both call `db.cancel_pending_commands(...)` — flushes all pending/running command rows so a stale click cannot fire after the state changes.
+- **P0-7** `PROFIT_PER_LOT` constant deleted from `config.py`. `PnlGuard` now takes a single `daily_loss_cap` argument; profit branch of `evaluate()` removed. `SizingResult.daily_profit_lock` field removed.
+- **P0-8** Loss cap intact (`daily_loss_cap_hit`), `MAX_TRADES_DAILY=4` intact.
+
+### Files modified
+- `backend/config.py` — removed `PROFIT_PER_LOT`
+- `backend/risk/pnl_guard.py` — single-arg constructor, no profit branch
+- `backend/risk/position_sizer.py` — removed `daily_profit_lock` from result
+- `backend/strategy/position_manager.py` — added `strike/expiry/option_type/lot_size` to `PendingEntry` + `OpenPosition`, carried through `promote_to_open`
+- `backend/database/sqlite_logger.py` — new columns migration, `insert_trade_entry` extended, new `cancel_pending_commands()` method
+- `backend/main.py` — pre-entry refresh, REST LTP fallback, `avg_price` preference, `atm_snapshot` publisher, SHUTDOWN + reset command cancellation
+- `backend/server.py` — `atm_snapshot` exposed via `/api/bot/status`
+- `backend/tests/test_execution_correctness.py` — **NEW**, 14 regression tests
+- `backend/tests/test_fsm.py` — PnlGuard tests updated (no profit branch)
+- `backend/tests/test_position_sizer.py` — profit-lock assertion removed
+- `frontend/src/App.js` — confirmation modal displays resolved contract; open-position card shows contract identity
+
+### Migration summary
+Idempotent `ALTER TABLE trades ADD COLUMN …` for six new columns. Runs automatically on daemon start via `SqliteLogger.__init__`. Existing rows stay untouched (NULL in new columns). Verified against `/app/backend/data_store/nifty_bot.db` — all six columns present.
+
+### Test results
+- Full suite: **86 passing** (was 72; +14 new). Zero regressions.
+- Backend service restart: clean, `/api/bot/status` → HTTP 200 with `atm_snapshot` key present.
+- End-to-end trace: BUY PUT and BUY CALL executed against a fake broker; broker payload, DB row, and open-position render all reference the **same** symbol/token/strike/expiry/premium with zero divergence. Reset-breakers and SHUTDOWN both cancel pending commands as designed.
+
+### Untouched (per user's explicit instruction)
+Indicator Engine, SMC weights, SMC confidence, HTF trend logic, `RECENT_EVENT_BARS`, regime multipliers, trailing SL, SL%, TP%, Telegram alerts, signal generation.
+

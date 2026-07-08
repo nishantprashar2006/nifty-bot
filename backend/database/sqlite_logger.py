@@ -123,6 +123,14 @@ class SqliteLogger:
                 "ALTER TABLE trades ADD COLUMN reasons TEXT",
                 "ALTER TABLE trades ADD COLUMN sl_price REAL",
                 "ALTER TABLE trades ADD COLUMN tp_price REAL",
+                # P0-4 — full option-contract identity per trade so dashboard,
+                # DB, broker, and execution pipeline can never diverge.
+                "ALTER TABLE trades ADD COLUMN contract_symbol TEXT",
+                "ALTER TABLE trades ADD COLUMN contract_token TEXT",
+                "ALTER TABLE trades ADD COLUMN strike REAL",
+                "ALTER TABLE trades ADD COLUMN expiry TEXT",
+                "ALTER TABLE trades ADD COLUMN option_type TEXT",
+                "ALTER TABLE trades ADD COLUMN lot_size INTEGER",
             ):
                 try:
                     cur.execute(ddl)
@@ -178,20 +186,46 @@ class SqliteLogger:
         reasons: Optional[list] = None,
         sl_price: Optional[float] = None,
         tp_price: Optional[float] = None,
+        # P0-4: full contract identity, mandatory going forward
+        contract_symbol: Optional[str] = None,
+        contract_token: Optional[str] = None,
+        strike: Optional[float] = None,
+        expiry: Optional[str] = None,
+        option_type: Optional[str] = None,
+        lot_size: Optional[int] = None,
     ) -> None:
         import json as _json
         with self._cursor() as cur:
             cur.execute(
                 "INSERT INTO trades(trade_id, entry_time, direction, qty, "
-                "entry_price, source, engine, confidence, reasons, sl_price, tp_price) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "entry_price, source, engine, confidence, reasons, sl_price, tp_price, "
+                "contract_symbol, contract_token, strike, expiry, option_type, lot_size) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     trade_id, entry_time or _utc_iso(), direction, qty, entry_price,
                     source, engine, confidence,
                     _json.dumps(reasons) if reasons else None,
                     sl_price, tp_price,
+                    contract_symbol, contract_token, strike, expiry, option_type, lot_size,
                 ),
             )
+
+    def cancel_pending_commands(self, reason: str = "cancelled") -> int:
+        """P0-6: mark every currently-pending command as cancelled.
+
+        Called both when the FSM transitions into SHUTDOWN and when the user
+        clicks Reset Breakers. Guarantees a queued manual_entry cannot fire
+        after the state has changed under it.
+
+        Returns the number of rows cancelled.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "UPDATE commands SET status='cancelled', result=? "
+                "WHERE status IN ('pending','running')",
+                (reason,),
+            )
+            return int(cur.rowcount or 0)
 
     def update_trade_exit(
         self,

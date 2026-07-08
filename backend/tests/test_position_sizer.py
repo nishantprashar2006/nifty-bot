@@ -46,7 +46,8 @@ def test_full_sizing_no_drawdown(sizer):
     assert res.effective_lots == min(config.MAX_LOTS_DYNAMIC, 4)
     assert res.drawdown_pct == 0.0
     assert res.daily_loss_cap == -config.LOSS_PER_LOT * res.effective_lots
-    assert res.daily_profit_lock == config.PROFIT_PER_LOT * res.effective_lots
+    # P0-7: profit lock removed — the SizingResult no longer carries one.
+    assert not hasattr(res, "daily_profit_lock")
 
 
 def test_drawdown_forces_floor(sizer):

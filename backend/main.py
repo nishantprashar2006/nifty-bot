@@ -122,6 +122,9 @@ class NiftyOptionsBot:
         # current live SMC signal. Auto-expires after MAX_SIGNAL_AGE_MINUTES.
         self._smc_signal: Optional[dict] = None
 
+        # P0-5: throttle for periodic atm_snapshot refresh (~every 10s).
+        self._last_atm_publish_ts: float = 0.0
+
         # Explicit exit-reason hint for the next FORCED_EXIT / synthetic exit.
         # Whoever triggers the exit sets this so `_finalize_exit` records the
         # true cause (TIME_STOP / SQUARE_OFF / MANUAL / HEARTBEAT) instead
@@ -162,11 +165,12 @@ class NiftyOptionsBot:
         self.sizer = PositionSizer(self.db)
         sized = self.sizer.update_equity_and_size(current_equity=capital)
         self._effective_lots = sized.effective_lots
-        self.pnl_guard = PnlGuard(sized.daily_loss_cap, sized.daily_profit_lock)
+        self.pnl_guard = PnlGuard(sized.daily_loss_cap)
         logger.info(
-            "Morning sizing → lots=%d (scale=%.2f, dd=%.2f%%) loss_cap=₹%.0f profit_lock=₹%.0f",
+            "Morning sizing → lots=%d (scale=%.2f, dd=%.2f%%) loss_cap=₹%.0f "
+            "(profit lock removed per P0-7)",
             sized.effective_lots, sized.scale_multiplier,
-            sized.drawdown_pct * 100, sized.daily_loss_cap, sized.daily_profit_lock,
+            sized.drawdown_pct * 100, sized.daily_loss_cap,
         )
 
         # Scrip master + ATM picks (only when using a live broker)
@@ -357,7 +361,13 @@ class NiftyOptionsBot:
         return subs
 
     def _refresh_atm_contracts(self) -> None:
-        """Pick ATM CE/PE for the nearest expiry using current Nifty spot LTP."""
+        """Pick ATM CE/PE for the nearest expiry using current Nifty spot LTP.
+
+        Also publishes an `atm_snapshot` row to bot_state so the dashboard's
+        confirmation modal shows the *actual* strike/expiry/token/premium
+        that would be sent to the broker — no more generic 'ATM weekly CE'
+        placeholder text.
+        """
         try:
             spot = self.broker.ltp("NSE", "NIFTY", config.NIFTY_SPOT_TOKEN)
         except Exception:
@@ -371,8 +381,46 @@ class NiftyOptionsBot:
                 "ATM picks → CE=%s (token=%s), PE=%s (token=%s) [spot=%.2f]",
                 ce.symbol, ce.token, pe.symbol, pe.token, spot,
             )
+            self._publish_atm_snapshot(spot)
         except Exception:
             logger.exception("ATM contract resolution failed.")
+
+    def _publish_atm_snapshot(self, spot: float) -> None:
+        """P0-5: expose the currently-resolved CE/PE picks + a best-effort
+        premium (WS quote if we have one, else REST LTP) so the dashboard
+        can display the exact contract in the confirmation dialog."""
+        import json as _json
+        try:
+            def _leg(c: Optional[OptionContract]) -> Optional[dict]:
+                if c is None:
+                    return None
+                q = self._last_option_quote.get(c.token, {})
+                ltp = float(q.get("ltp") or 0.0)
+                if ltp <= 0:
+                    # One-shot REST LTP so the modal has a real number to show.
+                    try:
+                        ltp = float(self.broker.ltp(c.exchange, c.symbol, c.token) or 0.0)
+                    except Exception:
+                        ltp = 0.0
+                return {
+                    "symbol": c.symbol,
+                    "token": c.token,
+                    "strike": c.strike,
+                    "expiry": c.expiry,
+                    "option_type": c.option_type,
+                    "lot_size": c.lot_size,
+                    "exchange": c.exchange,
+                    "ltp": round(ltp, 2) if ltp > 0 else None,
+                }
+            snap = {
+                "spot": round(float(spot), 2),
+                "ce": _leg(self._ce),
+                "pe": _leg(self._pe),
+                "ts": time.time(),
+            }
+            self.db.set_state("atm_snapshot", _json.dumps(snap))
+        except Exception:
+            logger.exception("Failed to publish atm_snapshot.")
 
     # ────────────────────────────────────────────────────── manual entries
     def _handle_manual_entry(
@@ -385,7 +433,13 @@ class NiftyOptionsBot:
     ) -> tuple[bool, str]:
         """Fire a discretionary entry. PART 3 §6-8: manual SL = 15 % of fill,
         TP = 30 %, trailing step = 10 %. Same single-position lock, sizing
-        guards, OCO, and cooldown as the auto path."""
+        guards, OCO, and cooldown as the auto path.
+
+        P0-1: ALWAYS refresh the Near-OTM contract right before the order is
+        built. Startup-cached _ce/_pe are never used for manual entries —
+        the strike, expiry, and token that go to the broker are always the
+        ones computed against the latest spot at the moment of execution.
+        """
         # Hard guards — same single-position lock used by auto entries
         if self.state is config.State.SHUTDOWN:
             return False, "bot is in SHUTDOWN"
@@ -396,13 +450,20 @@ class NiftyOptionsBot:
         breach = self._trip_circuit_breakers()
         if breach:
             return False, f"circuit breaker: {breach}"
-        # Need an ATM contract picked
+        # P0-1: mandatory pre-entry refresh. Never trust startup cache.
+        try:
+            self._refresh_atm_contracts()
+        except Exception:
+            logger.exception("Pre-entry ATM refresh failed; aborting manual entry.")
+            return False, "ATM refresh failed — could not resolve current strike"
         contract = self._ce if direction is config.Direction.LONG else self._pe
         if contract is None:
-            self._refresh_atm_contracts()
-            contract = self._ce if direction is config.Direction.LONG else self._pe
-        if contract is None:
-            return False, "ATM contract not yet resolved"
+            return False, "ATM contract not yet resolved after refresh"
+        logger.info(
+            "Manual %s → resolved contract %s (strike=%s expiry=%s token=%s)",
+            direction.value, contract.symbol, contract.strike,
+            contract.expiry, contract.token,
+        )
         # Remember the engine + advisory snapshot so the post-fill row in the
         # trades table can record which engine triggered the entry.
         self._pending_engine = engine
@@ -421,6 +482,7 @@ class NiftyOptionsBot:
             return (
                 True,
                 f"manual {direction.value} placed [{engine.upper()}] · "
+                f"{contract.symbol} · "
                 f"SL={config.MANUAL_SL_PCT*100:.0f}%  TP={config.MANUAL_TP_PCT*100:.0f}%  "
                 f"trail={config.TRAIL_STEP_PCT*100:.0f}%",
             )
@@ -501,6 +563,20 @@ class NiftyOptionsBot:
             self.state = new_state
             self.db.log_state_transition(old, new_state.name)
             logger.info("FSM %s → %s", old, new_state.name)
+        # P0-6: entering SHUTDOWN must invalidate every queued command so a
+        # stale manual_entry can never fire when we later flip back to IDLE
+        # (e.g. via Reset Breakers). Done OUTSIDE the state lock to avoid
+        # any chance of contention with the DB thread lock.
+        if new_state is config.State.SHUTDOWN:
+            try:
+                n = self.db.cancel_pending_commands(reason="shutdown_cancelled")
+                if n:
+                    logger.warning(
+                        "SHUTDOWN — cancelled %d pending command(s) to prevent stale fires.",
+                        n,
+                    )
+            except Exception:
+                logger.exception("Failed to cancel pending commands on SHUTDOWN.")
 
     def _in_entry_window(self) -> bool:
         t = _ist_time()
@@ -607,6 +683,11 @@ class NiftyOptionsBot:
             self._handle_fill(ev)
 
     def _handle_fill(self, ev: OrderEvent) -> None:
+        # P0-3: prefer the broker's ACTUAL average execution price over the
+        # order-slot "price" field (which is 0 for MARKET, and the LIMIT
+        # value — not the fill — for LIMIT). For SIM this is a no-op because
+        # force_order() sets both fields to the same synthesised value.
+        fill_px = float(ev.avg_price) if ev.avg_price and ev.avg_price > 0 else float(ev.fill_price or 0.0)
         pending = self.positions.pending_entry
         if pending and ev.order_id == pending.order_id:
             # Slippage check — wider tolerance for MARKET orders since some
@@ -616,15 +697,26 @@ class NiftyOptionsBot:
                 if config.ENTRY_ORDER_TYPE == "MARKET"
                 else config.FILL_TOLERANCE_PCT
             )
-            if ev.fill_price > pending.expected_price * (1 + tol):
+            if fill_px > pending.expected_price * (1 + tol):
                 logger.warning(
                     "Fill %.2f exceeds %.0f%% tolerance vs ref %.2f — emergency exit.",
-                    ev.fill_price, tol * 100, pending.expected_price,
+                    fill_px, tol * 100, pending.expected_price,
                 )
                 self.positions.clear_pending()
                 self._transition(config.State.FORCED_EXIT)
                 return
-            pos = self.positions.promote_to_open(ev.fill_price)
+            if fill_px <= 0:
+                # Defensive guard — should never happen after the avg_price
+                # preference, but if the broker ever returns neither field
+                # populated we must NOT anchor SL/TP to zero.
+                logger.error(
+                    "Fill event has no usable price (fill=%.2f avg=%.2f) — aborting.",
+                    ev.fill_price or 0.0, ev.avg_price or 0.0,
+                )
+                self.positions.clear_pending()
+                self._transition(config.State.FORCED_EXIT)
+                return
+            pos = self.positions.promote_to_open(fill_px)
             source = self._pending_source if self._pending_source else "auto"
             engine = self._pending_engine if self._pending_engine else None
             confidence = self._pending_confidence
@@ -641,15 +733,22 @@ class NiftyOptionsBot:
                 reasons=reasons,
                 sl_price=pos.stop_price,
                 tp_price=pos.target_price,
+                # P0-4: persist the exact contract that was executed
+                contract_symbol=pos.contract_symbol,
+                contract_token=pos.contract_token,
+                strike=pos.strike or None,
+                expiry=pos.expiry or None,
+                option_type=pos.option_type or None,
+                lot_size=pos.lot_size or None,
             )
             self._place_protective_legs(pos.target_price, pos.stop_price)
             self._transition(config.State.POSITION_OPEN)
             return
 
-        # Exit-leg fill
+        # Exit-leg fill — same avg_price preference for correct PnL.
         pos = self.positions.open_position
         if pos and ev.order_id in (pos.target_order_id, pos.stop_order_id):
-            self._finalize_exit(ev.fill_price, was_stop=ev.order_id == pos.stop_order_id)
+            self._finalize_exit(fill_px, was_stop=ev.order_id == pos.stop_order_id)
 
     # ────────────────────────────────────────────────────────── order flow
     def _place_entry(
@@ -658,11 +757,37 @@ class NiftyOptionsBot:
         sl_pct: float = 0.0, tp_pct: float = 0.0, trail_step_pct: float = 0.0,
         lot_override: Optional[int] = None,
     ) -> bool:
+        # P0-2: prefer the live WebSocket quote; fall back to a one-shot REST
+        # LTP ONLY when the WS has no tick yet for this token (typical when
+        # the strike was just re-picked and never subscribed). SL/TP anchor
+        # to that real price; subsequent trailing/exits continue via WS.
         quote = self._last_option_quote.get(contract.token)
-        if not quote and not config.SIMULATE_ORDERS:
+        premium = float((quote or {}).get("ltp") or 0.0)
+        if premium <= 0:
+            try:
+                premium = float(self.broker.ltp(
+                    contract.exchange, contract.symbol, contract.token,
+                ) or 0.0)
+                logger.info(
+                    "REST LTP fallback for %s (token=%s) → ₹%.2f",
+                    contract.symbol, contract.token, premium,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "REST LTP fallback failed for %s: %s", contract.symbol, exc,
+                )
+                premium = 0.0
+        if premium <= 0:
+            if config.SIMULATE_ORDERS:
+                # SIM must never fabricate a fill on an unknown price; abort
+                # cleanly instead so the operator sees the failure.
+                logger.warning(
+                    "No premium for %s (WS empty, REST failed) — aborting SIM entry.",
+                    contract.symbol,
+                )
+                return False
             logger.info("No quote for %s yet; skipping.", contract.symbol)
             return False
-        premium = (quote or {}).get("ltp", 100.0)
 
         # Premium-spike guard
         lots = self.sizer.premium_spike_guard(
@@ -736,6 +861,11 @@ class NiftyOptionsBot:
                 qty=qty,
                 target_price=target_px,
                 stop_price=stop_px,
+                # P0-4: full contract identity travels with the pending entry
+                strike=float(contract.strike or 0.0),
+                expiry=contract.expiry or "",
+                option_type=contract.option_type or "",
+                lot_size=int(contract.lot_size or config.LOT_SIZE_NIFTY),
                 sl_points=sl_pts,
                 tp_points=tp_pts,
                 sl_pct=sl_pct,
@@ -1344,19 +1474,34 @@ class NiftyOptionsBot:
     def reset_breakers(self) -> dict:
         """Admin reset for circuit-breaker counters. Lets the user clear an
         accumulated SIM-mode lockout (or recover from a LIVE-mode breach
-        once they've reviewed the cause) without restarting the daemon."""
+        once they've reviewed the cause) without restarting the daemon.
+
+        P0-6: cancels every pending/running command BEFORE flipping the FSM
+        back to IDLE, so a queued manual_entry the user submitted while in
+        SHUTDOWN cannot suddenly execute the moment the state clears.
+        """
         prev = {
             "trades_today": self._trades_today,
             "consecutive_losses": self._consecutive_losses,
             "api_reject_count": self._api_reject_count,
             "state": self.state.value,
         }
+        try:
+            cancelled = self.db.cancel_pending_commands(reason="reset_breakers_cancelled")
+        except Exception:
+            logger.exception("cancel_pending_commands failed during reset_breakers")
+            cancelled = 0
         self._trades_today = 0
         self._consecutive_losses = 0
         self._api_reject_count = 0
         if self.state is config.State.SHUTDOWN and not self.positions.has_open_position:
             self._transition(config.State.IDLE)
-        logger.warning("Circuit-breaker counters reset by user. Previous: %s", prev)
+        logger.warning(
+            "Circuit-breaker counters reset by user. Previous: %s. "
+            "Cancelled %d pending command(s).",
+            prev, cancelled,
+        )
+        prev["cancelled_commands"] = cancelled
         return prev
 
     def _step_forced_exit(self) -> None:
@@ -1422,6 +1567,19 @@ class NiftyOptionsBot:
                 # SMC Engine — completely independent of the indicator engine.
                 # Own 5m/15m series, own 09:20–15:00 IST window, own state key.
                 self._update_smc_score()
+
+                # P0-5: keep the atm_snapshot fresh (~every 10s) so the
+                # dashboard confirmation modal always shows the actual
+                # strike, expiry and premium that will be traded. This is
+                # display-only — the truth of what gets executed still
+                # comes from _refresh_atm_contracts() at click time.
+                now_ts = time.time()
+                if now_ts - self._last_atm_publish_ts >= 10.0:
+                    try:
+                        self._refresh_atm_contracts()
+                    except Exception:
+                        logger.exception("Periodic ATM snapshot refresh failed.")
+                    self._last_atm_publish_ts = now_ts
 
                 breach = self._trip_circuit_breakers()
                 if breach and self.state is not config.State.SHUTDOWN:

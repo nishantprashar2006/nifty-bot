@@ -42,7 +42,10 @@ MAX_LOTS_DYNAMIC = 10
 LOT_SIZE_NIFTY = 65  # NSE standard lot size for Nifty 50 options
 
 LOSS_PER_LOT = 750        # ₹ per lot daily loss cap
-PROFIT_PER_LOT = 1_500    # ₹ per lot daily profit lock
+# NOTE: Daily profit LOCK removed by user request (P0-7). The bot now trades
+# until (a) MAX_TRADES_DAILY, (b) daily loss cap, or (c) user stops it.
+# The old PROFIT_PER_LOT constant is intentionally deleted so any lingering
+# reference fails loud rather than silently re-enabling the profit shutdown.
 MAX_POSITION_VALUE_PCT = 0.25  # nominal trade value <= 25% of equity
 
 # ────────────────────────────────────────────────────────────────────
