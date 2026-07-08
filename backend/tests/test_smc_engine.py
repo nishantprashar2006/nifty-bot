@@ -87,11 +87,93 @@ def _zigzag_up(n: int = 50) -> list[Bar]:
 
 
 # ─────────────────────────────────────────── unit cases
-def test_warming_up_when_insufficient_bars():
+def test_empty_input_returns_neutral_with_awaiting_reason():
+    """Global warm-up gate removed (v1.6). Only truly empty 5m bars produce
+    a stub result; the engine no longer blocks on bar-count thresholds."""
     res = evaluate([], [])
     assert res.direction == "NEUTRAL"
     assert res.confidence == 0
-    assert res.reasons == ["warming_up"]
+    assert res.reasons == ["awaiting first 5m bar"]
+    assert res.entry is None and res.stop_loss is None and res.target is None
+
+
+def test_short_5m_no_swings_returns_zero_without_crash():
+    """< 11 5 m bars → no confirmed swings. Engine must not raise, must
+    include a diagnostic reason indicating what's pending. Small primitives
+    that don't need swings (e.g. FVG) may fire legitimately, but swing-
+    derived weights (HTF, 5m structure, BOS/CHoCH, Sweep, OB retest,
+    Prem/Disc) must NOT contribute."""
+    tiny = _trend("up", n=8)   # 8 bars — far below the old 15-bar gate
+    res = evaluate(tiny, [])
+    # No crash — the whole point of removing the gate
+    assert res.confidence >= 0
+    # Diagnostic reasons must be present (either pending-notes or the
+    # 'awaiting primitives' summary on a genuine zero-score tie)
+    assert res.reasons, "diagnostic reason(s) must be present"
+    joined = " ".join(res.reasons)
+    # Swing-derived weights must be OFF (structure/BOS/Sweep/OB/PremDisc/HTF)
+    for banned in (
+        "HTF trend bullish", "HTF trend bearish",
+        "5m structure HH+HL", "5m structure LH+LL",
+        "CHoCH bullish", "CHoCH bearish",
+        "BOS bullish", "BOS bearish",
+        "sell-side liquidity", "buy-side liquidity",
+        "Bull OB", "Bear OB",
+        "In discount zone", "In premium zone",
+    ):
+        assert banned not in joined, f"unexpected swing-derived weight lit: {banned}"
+    # Informational warm-up notes must appear (HTF + Swings pending at least)
+    assert "HTF pending" in joined
+    assert "Swings pending" in joined
+    # No SL/TP levels without swing structure
+    assert res.stop_loss is None and res.target is None
+
+
+def test_short_5m_zero_score_diagnostic_when_no_primitives():
+    """When both call_score and put_score tie at zero (nothing detected
+    yet), reasons[] must NOT be empty — the dashboard should never render
+    a blank Reasons box. Feed 2 5m bars: too few for any primitive
+    including FVG (which needs 3 consecutive bars)."""
+    tiny = _trend("up", n=2)
+    res = evaluate(tiny, [])
+    assert res.direction == "NEUTRAL"
+    assert res.confidence == 0
+    assert res.reasons, "diagnostic reason must be present, not empty"
+    joined = " ".join(res.reasons)
+    # Either the pending-notes appear, or the awaiting-primitives summary
+    # (both are acceptable diagnostics — we only forbid an empty list)
+    assert ("HTF pending" in joined
+            or "awaiting primitives" in joined
+            or "Swings pending" in joined)
+
+
+def test_progressive_activation_no_15m_still_scores():
+    """Once 5 m primitives light up, the engine must emit a real
+    confidence score even if the 15 m series is still empty (HTF pending).
+    The 'HTF pending — score cap 80' informational note must appear so
+    the operator understands why STRONG is unreachable."""
+    bars_5m = _zigzag_up(n=50)          # rich 5 m structure, no 15 m bars
+    res = evaluate(bars_5m, [])
+    assert res.confidence > 0, "engine must score without 15 m data"
+    # HTF is NEUTRAL → informational cap note must be present
+    assert any("HTF pending" in r for r in res.reasons)
+    # But the +20 HTF weight must NOT be silently added
+    assert not any("HTF trend bullish" in r for r in res.reasons)
+    assert not any("HTF trend bearish" in r for r in res.reasons)
+    # Confidence must stay under the theoretical 80-point cap for this window
+    # (regime attenuation may reduce it further; we only assert the ceiling)
+    assert res.confidence <= 80
+
+
+def test_warmup_notes_absent_when_all_primitives_active():
+    """Once ATR, swings and HTF are all live, none of the pending-notes
+    should appear — proving afternoon behaviour is untouched."""
+    bars_5m = _zigzag_up(n=50)
+    bars_15m = _zigzag_up(n=50)         # same shape on 15 m → HTF becomes CALL
+    res = evaluate(bars_5m, bars_15m)
+    assert not any("HTF pending" in r for r in res.reasons)
+    assert not any("ATR pending" in r for r in res.reasons)
+    assert not any("Swings pending" in r for r in res.reasons)
 
 
 def test_swing_window_default_is_five():

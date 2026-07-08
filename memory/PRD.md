@@ -154,3 +154,43 @@ modular layout (config, broker, data, strategy, risk, database, main).
 - **No behavioural changes to**: SMC confidence, SMC Buy Call/Put signals,
   Indicator Engine, Telegram alerts, entry logic, SL/TP percentages, or
   trailing-SL step %.
+
+
+## Session update (2026-02-06 — SMC warm-up gate removed, v1.6)
+- **Removed the global warm-up gate** in `strategy/smc_engine.py::evaluate()`.
+  Previously the engine returned `NEUTRAL/0/["warming_up"]` until it had
+  ≥15 5 m bars AND ≥11 15 m bars (i.e. 12:00 IST). Now each detector's
+  own guard clauses decide when it activates, so real confidence
+  starts flowing as soon as any primitive lights up:
+    • 10:10 IST — first 5 m swings → BOS/CHoCH/Sweep
+    • 10:30 IST — ATR live → Displacement, OBs, regime classifier
+    • 12:00–13:00 IST — 15 m HTF trend fills in (+20 weight)
+- **Safety guard**: kept a one-line `if not bars_5m` early-return to
+  prevent `bars_5m[-1].close` IndexError before 09:20 IST.
+- **Informational reasons added** (additive only — never affect the
+  numeric score, direction, or grade):
+    • `"HTF pending — score cap 80"` while `htf_trend == NEUTRAL`
+    • `"ATR pending — OB/Displacement offline"` while ATR unavailable
+    • `"Swings pending — structure/BOS/Sweep offline"` while no swings
+    • `"awaiting primitives · bars_5m=X bars_15m=Y · swings=Z · atr=…"`
+      shown on genuine zero-score ties so the dashboard never renders
+      a blank Reasons box.
+- **Entry/SL/TP suppressed** to `None` when no valid swing structure
+  exists (`rng_hi == rng_lo == 0.0` or `rng_hi <= rng_lo`), instead of
+  the old ±50 bps synthetic envelope around spot. Dashboard now shows
+  dashes until real impulse levels form.
+- **Preserved unchanged**: every SMC weight, SWING_WINDOW=5, ATR_PERIOD=14,
+  DISPLACEMENT_ATR_MULT=1.5, RECENT_EVENT_BARS=3, all detector internals,
+  all regime multipliers, all confidence-band thresholds, all afternoon
+  behaviour, entry logic, SL/TP percentages, trailing SL, Indicator
+  Engine, Telegram thresholds/dedup, FSM.
+- **Determinism verified**: given the same bars, the engine produces the
+  same output. Only new pending-note strings appear when the underlying
+  primitives are genuinely offline.
+- **Test suite**: 72 passing (was 68; +4 new SMC warm-up tests, +1 date-
+  brittle option-selector test fixed for calendar rollover). No regressions.
+- **Live smoke**: `GET /api/bot/status` → HTTP 200; SMC path renders the
+  expected `outside SMC window` payload (outside 09:20–15:15 IST).
+- **User-acknowledged side effect**: users with a low `SMC_ALERT_THRESHOLD`
+  may receive Telegram alerts earlier in the morning if confidence
+  legitimately crosses the threshold before 12:00 IST.

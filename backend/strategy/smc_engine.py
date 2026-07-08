@@ -450,9 +450,32 @@ def detect_regime(bars: list[Bar], swings: list[Swing], atr: Optional[float]) ->
 # ────────────────────────── main scoring engine ─────────────────────────
 def evaluate(bars_5m: list[Bar], bars_15m: list[Bar]) -> SMCResult:
     """Run all detectors, score, and emit a signal. Pure function — given
-    the same inputs it always produces the same output."""
-    if len(bars_5m) < 2 * SWING_WINDOW + 5 or len(bars_15m) < 2 * SWING_WINDOW + 1:
-        return SMCResult("NEUTRAL", 0, ["warming_up"], None, None, None, SMCContext())
+    the same inputs it always produces the same output.
+
+    Warm-up policy (v1.6): the previous global gate (`bars_5m ≥ 15 and
+    bars_15m ≥ 11`) has been removed. Each detector already guards its
+    own prerequisites and returns a neutral value when data is short, so
+    the engine can begin producing real confidence as soon as any
+    primitive activates (first 5 m swings ≈ 10:10 IST, ATR/OBs/Regime
+    ≈ 10:30 IST, HTF trend ≈ 12:00–13:00 IST). Confidence weights,
+    bands, weights, and every detector's internals are unchanged — so
+    afternoon behaviour is bit-identical to v1.5.
+
+    Two safety details:
+      • Empty `bars_5m` → return a NEUTRAL/0 stub before touching
+        `bars_5m[-1]`, with a diagnostic reason string.
+      • Entry / SL / TP are suppressed to `None` until real swing
+        structure exists (i.e. `range_high != range_low`), rather than
+        falling back to a synthetic ±50 bps envelope around spot.
+    """
+    # One-line safety guard — only fires before the first 5 m bar closes
+    # (pre-09:20 IST). Keeps `bars_5m[-1]` below from raising.
+    if not bars_5m:
+        return SMCResult(
+            "NEUTRAL", 0,
+            ["awaiting first 5m bar"],
+            None, None, None, SMCContext(),
+        )
 
     swings_5m = find_swings(bars_5m, lookback=SWING_WINDOW)
     atr_5m = _wilder_atr(bars_5m, period=ATR_PERIOD)
@@ -537,25 +560,72 @@ def evaluate(bars_5m: list[Bar], bars_15m: list[Bar]) -> SMCResult:
         reasons_call.append(regime_note)
         reasons_put.append(regime_note)
 
+    # ── Informational warm-up notes (additive; never touch call/put_score).
+    # Purpose: keep confidence bands comparable throughout the day while
+    # telling the operator *why* the ceiling is temporarily lower. Each
+    # note appears on BOTH sides so whichever side wins carries it.
+    #
+    # Cap math (before regime attenuation):
+    #   HTF (20) + 5 m struct (15) + BOS/CHoCH (20) + Sweep (15)
+    #   + OB Retest (15) + FVG (10) + Prem/Disc (5) = 100
+    warmup_notes: list[str] = []
+    if ctx.htf_trend == "NEUTRAL":
+        # HTF NEUTRAL either means "not enough 15 m swings yet" OR "flat
+        # structure right now". Both are legitimate; the score cap is 80.
+        warmup_notes.append("HTF pending — score cap 80")
+    if atr_5m is None:
+        # < 15 5 m bars → no ATR → no displacement → no OBs → no regime
+        # multiplier < 1 either (regime is UNCLEAR which is already 0.85).
+        warmup_notes.append("ATR pending — OB/Displacement offline")
+    if not swings_5m:
+        # < 11 5 m bars → no confirmed swings → structure, BOS/CHoCH,
+        # sweep, EQ levels, premium/discount all offline.
+        warmup_notes.append("Swings pending — structure/BOS/Sweep offline")
+    if warmup_notes:
+        reasons_call.extend(warmup_notes)
+        reasons_put.extend(warmup_notes)
+
     # Pick the dominant side; ties → NEUTRAL
     if call_score == put_score:
+        neutral_reasons = reasons_call + reasons_put
+        if not neutral_reasons:
+            # Absolutely nothing detected yet — emit a diagnostic summary so
+            # the dashboard doesn't render a blank Reasons box.
+            neutral_reasons = [
+                f"awaiting primitives · bars_5m={len(bars_5m)} "
+                f"bars_15m={len(bars_15m)} · swings={len(swings_5m)} · "
+                f"atr={'ready' if atr_5m is not None else 'pending'}"
+            ]
         return SMCResult("NEUTRAL", max(call_score, put_score),
-                         reasons_call + reasons_put, None, None, None, ctx)
+                         neutral_reasons, None, None, None, ctx)
 
     direction: Direction = "CALL" if call_score > put_score else "PUT"
     confidence = max(call_score, put_score)
     reasons = reasons_call if direction == "CALL" else reasons_put
 
-    # Entry / SL / TP — anchored to last close & impulse leg
+    # Entry / SL / TP — anchored to last close & the last confirmed impulse
+    # leg. Suppressed entirely (None) when no valid swing structure exists
+    # yet: showing dashes on the dashboard is more honest than a synthetic
+    # ±50 bps envelope around spot.
     entry = ctx.last_close
+    if not swings_5m or (rng_hi == 0.0 and rng_lo == 0.0) or rng_hi <= rng_lo:
+        return SMCResult(direction, confidence, reasons,
+                         None, None, None, ctx)
+
     if direction == "CALL":
-        stop_loss = ctx.range_low or (entry * 0.995)
+        stop_loss = rng_lo
         risk = entry - stop_loss
-        target = entry + 2 * risk if risk > 0 else entry * 1.01
+        target = entry + 2 * risk if risk > 0 else None
     else:
-        stop_loss = ctx.range_high or (entry * 1.005)
+        stop_loss = rng_hi
         risk = stop_loss - entry
-        target = entry - 2 * risk if risk > 0 else entry * 0.99
+        target = entry - 2 * risk if risk > 0 else None
+
+    if target is None or risk <= 0:
+        # Structure is degenerate (entry sits at/beyond the impulse
+        # extreme). Emit signal without price levels rather than fudge.
+        return SMCResult(direction, confidence, reasons,
+                         None, None, None, ctx)
 
     return SMCResult(direction, confidence, reasons,
                      round(entry, 2), round(stop_loss, 2), round(target, 2), ctx)

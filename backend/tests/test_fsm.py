@@ -295,8 +295,11 @@ def test_option_selector_falls_back_when_no_tuesday():
         {"expiry": wed.strftime("%d%b%Y").upper()},
     ]
     chosen = sel._nearest_expiry(rows)
-    # Fallback = earliest future date, which is Wednesday here
-    assert chosen == wed.strftime("%d%b%Y").upper()
+    # Fallback = earliest future date. Whichever of {wed, thu} is closer
+    # to today wins — depends on today's weekday, so compute it directly
+    # instead of hard-coding Wednesday.
+    earliest = min(wed, thu)
+    assert chosen == earliest.strftime("%d%b%Y").upper()
 
 
 # ─────────────── Indicator strength bands rebalanced to 0-70 achievable range
