@@ -397,3 +397,253 @@ def test_max_trades_daily_still_triggers_shutdown():
     bot.ws = None
     bot.pnl_guard = PnlGuard(-2000)
     assert bot._trip_circuit_breakers() == "max_trades_daily"
+
+
+
+# ─────────────────────────────── P0-Q1: WebSocket resubscribe on strike change
+def test_refresh_atm_resubscribes_ws_on_token_change():
+    """P0-Q1: when `_refresh_atm_contracts` picks a strike whose token
+    isn't in the current WS subscription set, the bot must call
+    ws.resubscribe(...) with the fresh token list. This is the fix for
+    the LTP-freeze regression."""
+    from main import NiftyOptionsBot
+    from data.option_selector import OptionContract
+
+    bot = NiftyOptionsBot.__new__(NiftyOptionsBot)
+    bot._state_lock = __import__("threading").RLock()
+    bot.state = config.State.IDLE
+    bot.db = SqliteLogger(tempfile.mktemp(suffix=".db"))
+    bot._last_option_quote = {}
+
+    # Startup subs: old CE/PE tokens
+    OLD_CE = OptionContract("OLD_CE", "1111", 24000, "07FEB26", "CE", 65)
+    OLD_PE = OptionContract("OLD_PE", "2222", 24100, "07FEB26", "PE", 65)
+    NEW_CE = OptionContract("NEW_CE", "9999", 24200, "07FEB26", "CE", 65)
+    NEW_PE = OptionContract("NEW_PE", "8888", 24250, "07FEB26", "PE", 65)
+    bot._ce, bot._pe = OLD_CE, OLD_PE
+
+    bot.broker = MagicMock()
+    bot.broker.ltp = MagicMock(return_value=24225.0)
+    bot.option_selector = MagicMock()
+    bot.option_selector.select_atm = MagicMock(return_value=(NEW_CE, NEW_PE))
+
+    resubscribed = {"calls": [], "returns": []}
+
+    class FakeWS:
+        def resubscribe(self, subs):
+            resubscribed["calls"].append(subs)
+            return True
+    bot.ws = FakeWS()
+
+    bot._refresh_atm_contracts()
+
+    assert bot._ce.token == "9999"
+    assert bot._pe.token == "8888"
+    assert len(resubscribed["calls"]) == 1, "resubscribe must fire exactly once"
+    # The new sub list must include both new tokens
+    flat = []
+    for group in resubscribed["calls"][0]:
+        flat.extend(group.get("tokens", []))
+    assert "9999" in flat and "8888" in flat
+
+
+def test_refresh_atm_skips_resubscribe_when_tokens_unchanged():
+    """Idempotency: if strikes didn't change, don't hammer the WS."""
+    from main import NiftyOptionsBot
+    from data.option_selector import OptionContract
+
+    bot = NiftyOptionsBot.__new__(NiftyOptionsBot)
+    bot._state_lock = __import__("threading").RLock()
+    bot.state = config.State.IDLE
+    bot.db = SqliteLogger(tempfile.mktemp(suffix=".db"))
+    bot._last_option_quote = {}
+    SAME_CE = OptionContract("CE", "1111", 24200, "07FEB26", "CE", 65)
+    SAME_PE = OptionContract("PE", "2222", 24250, "07FEB26", "PE", 65)
+    bot._ce, bot._pe = SAME_CE, SAME_PE
+
+    bot.broker = MagicMock()
+    bot.broker.ltp = MagicMock(return_value=24225.0)
+    bot.option_selector = MagicMock()
+    bot.option_selector.select_atm = MagicMock(return_value=(SAME_CE, SAME_PE))
+
+    called = {"n": 0}
+
+    class FakeWS:
+        def resubscribe(self, subs):
+            called["n"] += 1
+            return True
+    bot.ws = FakeWS()
+
+    bot._refresh_atm_contracts()
+    assert called["n"] == 0, "resubscribe fired despite unchanged strikes"
+
+
+# ─────────────────────────────── P0-Q1: LTP seed at entry
+def test_place_entry_seeds_last_option_quote_and_live_state(monkeypatch):
+    """P0-Q1 regression: after a successful `_place_entry`, both the
+    in-memory `_last_option_quote[token]` AND the persisted
+    `live_quotes.option_ltp / option_ltp_token` must reflect THIS
+    contract's premium — so the very first dashboard frame after entry
+    is never a stale value from a previous scenario."""
+    from main import NiftyOptionsBot
+    from data.option_selector import OptionContract
+
+    bot = NiftyOptionsBot.__new__(NiftyOptionsBot)
+    bot.state = config.State.IDLE
+    bot._state_lock = __import__("threading").RLock()
+    bot.positions = PositionManager()
+    bot.db = SqliteLogger(tempfile.mktemp(suffix=".db"))
+    bot._last_option_quote = {}
+    bot._pending_source = None
+    bot._pending_engine = None
+    bot._pending_confidence = None
+    bot._pending_reasons = []
+    bot._effective_lots = 1
+    bot.sizer = MagicMock()
+    bot.sizer.premium_spike_guard = MagicMock(return_value=1)
+    bot.broker = MagicMock()
+    bot.broker.get_net_available_cash = MagicMock(return_value=200_000.0)
+    bot.broker.place_order = MagicMock(return_value="ORD-SEED")
+    bot.broker.ltp = MagicMock(return_value=142.0)
+    bot.vix = MagicMock()
+    bot.vix.value = None
+    bot.ws = MagicMock()
+    monkeypatch.setattr(config, "SIMULATE_ORDERS", True)
+    monkeypatch.setattr(config, "ENTRY_ORDER_TYPE", "MARKET")
+
+    contract = OptionContract("NIFTY24500CE", "42424",
+                              24500, "07FEB26", "CE", 65)
+    ok = bot._place_entry(
+        Direction.LONG, contract,
+        sl_pts=0.0, tp_pts=0.0,
+        sl_pct=0.15, tp_pct=0.30, trail_step_pct=0.10,
+        source="manual",
+    )
+    assert ok
+
+    # In-memory seed
+    q = bot._last_option_quote.get("42424")
+    assert q is not None, "quote seed missing"
+    assert q["ltp"] == pytest.approx(142.0)
+    assert q["source"] == "seed"
+
+    # Persisted seed in bot_state.live_quotes
+    import json as _json
+    row = bot.db.get_state("live_quotes")
+    assert row is not None
+    payload = _json.loads(row[0])
+    assert payload["option_ltp"] == pytest.approx(142.0)
+    assert payload["option_ltp_token"] == "42424"
+    assert payload["option_ltp_ts"] > 0
+
+
+# ─────────────────────────────── P0-Q1: tick guard on token match
+def test_on_tick_ignores_option_ltp_when_token_doesnt_match_open_pos():
+    """A tick for a NON-open-position option token must not overwrite
+    `live_quotes.option_ltp` — otherwise cross-contract bleed causes the
+    dashboard to show a stranger's LTP for the currently-open position."""
+    from main import NiftyOptionsBot
+    from broker.websocket_manager import Tick
+    from strategy.position_manager import OpenPosition
+    from datetime import datetime, timezone
+
+    bot = NiftyOptionsBot.__new__(NiftyOptionsBot)
+    bot.db = SqliteLogger(tempfile.mktemp(suffix=".db"))
+    bot._last_option_quote = {}
+    from data.candle_manager import CandleManager
+    bot.candles = CandleManager()
+    bot.positions = PositionManager()
+    bot.vix = MagicMock()
+    bot.vix.value = None
+
+    # Open position on token X — seed the state
+    bot.positions._open = OpenPosition(
+        trade_id="T1", direction=Direction.LONG,
+        contract_symbol="X_CE", contract_token="X",
+        qty=65, lots=1, entry_price=100.0,
+        entry_ts=datetime.now(timezone.utc),
+        target_price=130.0, stop_price=85.0,
+        strike=24000, expiry="07FEB26", option_type="CE", lot_size=65,
+    )
+    bot._update_live_state(option_ltp=100.0, option_token="X")
+
+    # A tick arrives for token Y (a completely different contract)
+    stray = Tick(token="Y", ltp=63.30, volume=0, oi=0, bid=63.3, ask=63.4, ts=0.0)
+    bot._on_tick(stray)
+
+    # live_quotes.option_ltp MUST still be 100.0 (from token X seed).
+    import json as _json
+    payload = _json.loads(bot.db.get_state("live_quotes")[0])
+    assert payload["option_ltp"] == pytest.approx(100.0), (
+        f"cross-contract bleed: {payload}"
+    )
+    assert payload["option_ltp_token"] == "X"
+    # But the local quote cache DOES record token Y's LTP (for future use).
+    assert bot._last_option_quote["Y"]["ltp"] == pytest.approx(63.30)
+
+
+# ─────────────────────────────── P0-Q1: WS health snapshot
+def test_ws_manager_health_shape():
+    """WS health dict must expose the fields the dashboard renders."""
+    from broker.websocket_manager import WebSocketManager
+    ws = WebSocketManager(
+        feed_token="x", client_id="y", jwt="z",
+        token_subscriptions=[{"exchangeType": 2, "tokens": ["1111", "2222"]}],
+    )
+    h = ws.health()
+    for k in ("connected", "last_tick_ts", "seconds_since_last_tick",
+              "reconnect_failures", "subscribed_tokens", "subscribed_count"):
+        assert k in h, f"ws_health missing key {k}"
+    assert h["subscribed_count"] == 2
+    assert set(h["subscribed_tokens"]) == {"1111", "2222"}
+    assert h["connected"] is False   # sdk_ws is None outside a live connect
+
+
+def test_ws_manager_resubscribe_caches_tokens_when_socket_down():
+    """resubscribe() must always update `_token_subs` so the next
+    reconnect picks up the fresh list, even if the SDK object is not
+    currently connected."""
+    from broker.websocket_manager import WebSocketManager
+    ws = WebSocketManager(
+        feed_token="x", client_id="y", jwt="z",
+        token_subscriptions=[{"exchangeType": 2, "tokens": ["AAA"]}],
+    )
+    new = [{"exchangeType": 2, "tokens": ["BBB", "CCC"]}]
+    ok = ws.resubscribe(new)
+    assert ok is False   # no live sdk_ws
+    assert ws.subscribed_tokens() == ["BBB", "CCC"]
+
+
+# ─────────────────────────────── P0-Q2: no periodic REST hammer
+def test_no_periodic_atm_refresh_attr_on_bot():
+    """P0-Q2: the periodic refresh throttle var was removed; ensure
+    nothing accidentally re-introduces the 10-second REST timer."""
+    import main
+    src = open(main.__file__).read()
+    assert "_last_atm_publish_ts" not in src, (
+        "periodic ATM publish throttle re-appeared — REST hammer regression"
+    )
+    # And the drainable action must exist for the on-demand path
+    assert 'action == "refresh_atm"' in src
+
+
+# ─────────────────────────────── refresh_atm command handler
+def test_refresh_atm_command_calls_refresh():
+    """The `refresh_atm` action drained from the command queue must call
+    `_refresh_atm_contracts`."""
+    from main import NiftyOptionsBot
+    bot = NiftyOptionsBot.__new__(NiftyOptionsBot)
+    bot._state_lock = __import__("threading").RLock()
+    bot.state = config.State.IDLE
+    bot.db = SqliteLogger(tempfile.mktemp(suffix=".db"))
+    called = {"n": 0}
+    bot._refresh_atm_contracts = lambda: called.update(n=called["n"] + 1)
+
+    # Enqueue then drain
+    with bot.db._cursor() as cur:
+        cur.execute(
+            "INSERT INTO commands(timestamp, action, payload, status) "
+            "VALUES ('t','refresh_atm','{}','pending')"
+        )
+    bot._drain_command_queue()
+    assert called["n"] == 1

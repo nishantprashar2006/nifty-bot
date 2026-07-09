@@ -122,9 +122,6 @@ class NiftyOptionsBot:
         # current live SMC signal. Auto-expires after MAX_SIGNAL_AGE_MINUTES.
         self._smc_signal: Optional[dict] = None
 
-        # P0-5: throttle for periodic atm_snapshot refresh (~every 10s).
-        self._last_atm_publish_ts: float = 0.0
-
         # Explicit exit-reason hint for the next FORCED_EXIT / synthetic exit.
         # Whoever triggers the exit sets this so `_finalize_exit` records the
         # true cause (TIME_STOP / SQUARE_OFF / MANUAL / HEARTBEAT) instead
@@ -363,6 +360,11 @@ class NiftyOptionsBot:
     def _refresh_atm_contracts(self) -> None:
         """Pick ATM CE/PE for the nearest expiry using current Nifty spot LTP.
 
+        P0-Q1: after resolving new strikes, this method also pushes a fresh
+        WebSocket subscription list to the LIVE ws (if any) so ticks start
+        flowing for the newly-picked tokens immediately — no reconnect,
+        no stale-LTP window on the dashboard.
+
         Also publishes an `atm_snapshot` row to bot_state so the dashboard's
         confirmation modal shows the *actual* strike/expiry/token/premium
         that would be sent to the broker — no more generic 'ATM weekly CE'
@@ -375,12 +377,35 @@ class NiftyOptionsBot:
             return
         try:
             ce, pe = self.option_selector.select_atm(spot)
+            old_tokens = {
+                self._ce.token if self._ce else None,
+                self._pe.token if self._pe else None,
+            }
             self._ce = ce
             self._pe = pe
+            new_tokens = {ce.token, pe.token}
             logger.info(
                 "ATM picks → CE=%s (token=%s), PE=%s (token=%s) [spot=%.2f]",
                 ce.symbol, ce.token, pe.symbol, pe.token, spot,
             )
+            # P0-Q1: if the token set changed, push the new subs to the WS
+            # so LTPs for the freshly-picked strikes actually reach us.
+            if self.ws is not None and new_tokens != old_tokens:
+                try:
+                    subs = self._build_token_subscriptions()
+                    accepted = self.ws.resubscribe(subs)
+                    if accepted:
+                        logger.info(
+                            "WS resubscribed after ATM shift (new tokens: %s)",
+                            sorted(t for t in new_tokens if t),
+                        )
+                    else:
+                        logger.warning(
+                            "WS resubscribe not applied live (socket down?); "
+                            "subs cached for next reconnect.",
+                        )
+                except Exception:
+                    logger.exception("WS resubscribe raised.")
             self._publish_atm_snapshot(spot)
         except Exception:
             logger.exception("ATM contract resolution failed.")
@@ -538,6 +563,16 @@ class NiftyOptionsBot:
                     f"reset OK (was: trades={prev['trades_today']}, "
                     f"losses={prev['consecutive_losses']}, state={prev['state']})",
                 )
+            elif action == "refresh_atm":
+                # P0-Q2: on-demand ATM refresh. Fired by the dashboard when
+                # the confirmation modal opens (or the operator hits a
+                # 'refresh contract' button). Keeps REST usage tied to
+                # user intent rather than a background timer.
+                try:
+                    self._refresh_atm_contracts()
+                    self.db.complete_command(cmd_id, True, "ATM refreshed")
+                except Exception as exc:
+                    self.db.complete_command(cmd_id, False, f"refresh_atm failed: {exc}")
             else:
                 self.db.complete_command(cmd_id, False, f"unknown action {action}")
         except Exception as exc:
@@ -624,36 +659,59 @@ class NiftyOptionsBot:
             return
         # Option tick
         self._last_option_quote[t.token] = {
-            "ltp": t.ltp, "bid": t.bid, "ask": t.ask, "volume": t.volume, "oi": t.oi,
+            "ltp": t.ltp, "bid": t.bid, "ask": t.ask,
+            "volume": t.volume, "oi": t.oi,
+            "ts": t.ts, "source": "ws",
         }
         self.candles.series(t.token, 3).ingest_tick(t.ltp, t.volume)
-        # If this is the open position's contract, push live LTP into bot_state
+        # If this is the open position's contract, push live LTP into
+        # bot_state. Also stamp the token + freshness so the dashboard can
+        # detect cross-contract bleed or a frozen stream.
         pos = self.positions.open_position
         if pos and pos.contract_token == t.token:
-            self._update_live_state(option_ltp=t.ltp)
+            self._update_live_state(option_ltp=t.ltp, option_token=t.token)
 
     def _update_live_state(self, spot: Optional[float] = None,
-                            option_ltp: Optional[float] = None) -> None:
+                            option_ltp: Optional[float] = None,
+                            option_token: Optional[str] = None) -> None:
         try:
             import json
             current = self.db.get_state("live_quotes")
             payload = json.loads(current[0]) if current else {}
+            now_ts = time.time()
             if spot is not None:
                 payload["spot"] = spot
+                payload["spot_ts"] = now_ts
             if option_ltp is not None:
                 payload["option_ltp"] = option_ltp
+                payload["option_ltp_ts"] = now_ts
+                if option_token is not None:
+                    payload["option_ltp_token"] = option_token
             vix_val = self.vix.value
             if vix_val is not None:
                 payload["vix"] = vix_val
-            payload["ts"] = time.time()
+            payload["ts"] = now_ts
             self.db.set_state("live_quotes", json.dumps(payload))
             # PART 3 §11 — heartbeat a 'connected' status so the dashboard
             # can show a 🟢 broker badge independent of supervisor state.
             self.db.set_state(
                 "broker_status",
-                json.dumps({"state": "connected", "ts": time.time()}),
+                json.dumps({"state": "connected", "ts": now_ts}),
             )
         except Exception:
+            pass
+
+    def _publish_ws_health(self) -> None:
+        """P0 diagnostics — pushes ws.health() into bot_state.ws_health for
+        the dashboard. Cheap read-only snapshot; called once per tick."""
+        try:
+            import json as _json
+            if self.ws is None:
+                return
+            h = self.ws.health()
+            self.db.set_state("ws_health", _json.dumps(h))
+        except Exception:
+            # Diagnostics must never crash the main loop.
             pass
 
     def _on_order(self, ev: OrderEvent) -> None:
@@ -880,6 +938,22 @@ class NiftyOptionsBot:
             source.upper(), config.ENTRY_ORDER_TYPE, contract.symbol, qty,
             limit_px, tp_pts, sl_pts, order_id,
         )
+
+        # P0-Q1: seed `_last_option_quote[contract.token]` with the premium
+        # we just placed against so the very first frame the dashboard
+        # renders after this entry uses THIS contract's real price — not a
+        # stale option_ltp from an earlier scenario. If a WS tick arrives
+        # a moment later, it will simply overwrite this seed.
+        self._last_option_quote[contract.token] = {
+            "ltp": float(premium),
+            "bid": float(premium),
+            "ask": float(premium),
+            "volume": 0,
+            "oi": 0,
+            "ts": time.time(),
+            "source": "seed",     # cleared to 'ws' on next real tick
+        }
+        self._update_live_state(option_ltp=float(premium), option_token=contract.token)
 
         # PAPER / SIM mode: synthesise an immediate fill so the FSM advances
         if config.SIMULATE_ORDERS and self.ws is not None:
@@ -1243,6 +1317,11 @@ class NiftyOptionsBot:
                 "strength": "EXPIRED" if expired else smc_classify(result.confidence),
                 "reasons": (["signal expired — re-scanning"] if expired
                             else list(result.reasons or [])),
+                # P0-Q3: informational notes separate from weight-carrying
+                # reasons. `notes` holds warm-up hints ("HTF pending — cap
+                # 80") and the regime multiplier note. Dashboard should
+                # render this list distinctly (e.g. as a subtle strip).
+                "notes": list(result.notes or []),
                 "entry": None if expired else result.entry,
                 "stop_loss": None if expired else result.stop_loss,
                 "target": None if expired else result.target,
@@ -1568,18 +1647,15 @@ class NiftyOptionsBot:
                 # Own 5m/15m series, own 09:20–15:00 IST window, own state key.
                 self._update_smc_score()
 
-                # P0-5: keep the atm_snapshot fresh (~every 10s) so the
-                # dashboard confirmation modal always shows the actual
-                # strike, expiry and premium that will be traded. This is
-                # display-only — the truth of what gets executed still
-                # comes from _refresh_atm_contracts() at click time.
-                now_ts = time.time()
-                if now_ts - self._last_atm_publish_ts >= 10.0:
-                    try:
-                        self._refresh_atm_contracts()
-                    except Exception:
-                        logger.exception("Periodic ATM snapshot refresh failed.")
-                    self._last_atm_publish_ts = now_ts
+                # P0-Q2: periodic ATM refresh REMOVED (was every 10 s in v1.7).
+                # Confirmation-modal accuracy is achieved by:
+                #   (a) `_handle_manual_entry` still refreshes at click time
+                #       (P0-1), so the executed contract is always fresh, and
+                #   (b) the frontend queues a `refresh_atm` command when the
+                #       confirmation dialog opens, which the daemon drains on
+                #       the next tick — bounded REST usage tied to user intent
+                #       rather than a background hammer.
+                self._publish_ws_health()
 
                 breach = self._trip_circuit_breakers()
                 if breach and self.state is not config.State.SHUTDOWN:

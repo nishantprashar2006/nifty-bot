@@ -366,7 +366,17 @@ function App() {
   const lastTickTs = lq.ts ? new Date(lq.ts * 1000) : null;
   const tickAgeSec = lastTickTs ? Math.max(0, Math.round((Date.now() - lastTickTs.getTime()) / 1000)) : null;
   const optionLtp = lq.option_ltp ?? null;
-  const livePnl = openPos && optionLtp != null
+  // P0-Q1: only trust option_ltp when its token matches the currently-open
+  // position. Prevents cross-contract bleed where the last displayed LTP
+  // came from a previously-open contract that no longer flows.
+  const optionLtpToken = lq.option_ltp_token ?? null;
+  const optionLtpTs = lq.option_ltp_ts ? new Date(lq.option_ltp_ts * 1000) : null;
+  const optionLtpAgeSec = optionLtpTs ? Math.max(0, Math.round((Date.now() - optionLtpTs.getTime()) / 1000)) : null;
+  const optionLtpMatchesPos = openPos?.contract_token && optionLtpToken
+    ? String(openPos.contract_token) === String(optionLtpToken)
+    : true;   // no open position → no mismatch possible
+  const optionLtpFresh = optionLtpAgeSec != null && optionLtpAgeSec <= 15 && optionLtpMatchesPos;
+  const livePnl = openPos && optionLtp != null && optionLtpMatchesPos
     ? (optionLtp - openPos.entry_price) * openPos.qty
     : null;
 
@@ -382,9 +392,17 @@ function App() {
     ? (Date.now() - new Date(smc.updated).getTime()) / 1000 > 10
     : false;
 
-  // P0-5: currently-resolved Near-OTM contracts (refreshed every ~10s by the
-  // bot). Used inside the manual-entry confirmation modal so the user sees
-  // EXACTLY which strike/expiry/token/premium will be sent to the broker.
+  // P0-Q1 diagnostics: WebSocket feed health
+  const wsHealth = status?.ws_health || {};
+  const wsConnected = !!wsHealth.connected;
+  const wsSecondsSinceTick = wsHealth.seconds_since_last_tick;
+  const wsReconnectFails = wsHealth.reconnect_failures ?? 0;
+  const wsSubscribedCount = wsHealth.subscribed_count ?? 0;
+  const wsHealthy = wsConnected && wsSecondsSinceTick != null && wsSecondsSinceTick < 15;
+
+  // P0-5: currently-resolved Near-OTM contracts. No longer refreshed on a
+  // background timer (P0-Q2) — refreshed on click-time and whenever the
+  // confirmation modal is opened via /api/bot/refresh_atm.
   const atm = status?.atm_snapshot || {};
   const atmLeg = confirmManual === "CALL" ? atm.ce : (confirmManual === "PUT" ? atm.pe : null);
   const atmStale = atm.ts ? (Date.now() / 1000 - atm.ts) > 20 : true;
@@ -487,6 +505,20 @@ function App() {
                   <span className="text-blue-300">VIX {lq.vix.toFixed(2)}</span>
                 </>
               )}
+              {/* P0-Q1: WS feed integrity strip — connected + subs + failure count */}
+              <span className="text-zinc-600 mx-1">·</span>
+              <span
+                data-testid="ws-health-strip"
+                className={wsHealthy ? "text-emerald-300" : "text-red-300"}
+                title={
+                  `WS ${wsConnected ? "connected" : "down"} · ` +
+                  `${wsSubscribedCount} tokens subscribed · ` +
+                  `${wsReconnectFails} reconnect failure(s) · ` +
+                  `last tick ${wsSecondsSinceTick != null ? wsSecondsSinceTick.toFixed(0) + "s ago" : "—"}`
+                }
+              >
+                ws {wsHealthy ? "OK" : "!"}  ({wsSubscribedCount})
+              </span>
             </div>
             <span className="text-[10px] font-mono text-zinc-500 hidden md:inline">
               {lastUpdate ? `synced ${fmtTime(lastUpdate.toISOString())}` : "syncing…"}
@@ -682,8 +714,23 @@ function App() {
                   {optionLtp != null && (
                     <>
                       <span className="text-zinc-500"> · </span>
-                      LTP <span className="text-zinc-200">{fmtINR(optionLtp)}</span>
+                      <span data-testid="option-ltp" className={
+                        !optionLtpMatchesPos ? "text-red-300" :
+                        !optionLtpFresh ? "text-amber-300" : "text-zinc-200"
+                      }>
+                        LTP {fmtINR(optionLtp)}
+                        {optionLtpAgeSec != null && (
+                          <span className="text-[10px] text-zinc-500 ml-1">
+                            ({optionLtpAgeSec}s ago)
+                          </span>
+                        )}
+                      </span>
                     </>
+                  )}
+                  {openPos.contract_token && !optionLtpMatchesPos && (
+                    <div data-testid="ltp-token-mismatch" className="mt-1 text-[11px] text-red-300 border border-red-800 bg-red-950/20 px-2 py-1">
+                      ⚠ LTP shown is from a different contract ({optionLtpToken}). Live P&amp;L suppressed until this contract starts ticking.
+                    </div>
                   )}
                   {openPos.source === "manual" && (
                     <span className="ml-2 px-1.5 py-0.5 text-[10px] border border-amber-700 text-amber-300 font-mono">
@@ -801,7 +848,7 @@ function App() {
                 </div>
                 <Button
                   data-testid="btn-buy-call"
-                  onClick={() => setConfirmManual("CALL")}
+                  onClick={() => { setConfirmManual("CALL"); axios.post(`${API}/bot/refresh_atm`).catch(() => {}); }}
                   disabled={busy || !canTrade}
                   className={`rounded-none bg-emerald-600 hover:bg-emerald-500 text-zinc-950 font-mono font-semibold disabled:opacity-40 text-emerald-300 ${glowClass(callGlow)}`}
                 >
@@ -809,7 +856,7 @@ function App() {
                 </Button>
                 <Button
                   data-testid="btn-buy-put"
-                  onClick={() => setConfirmManual("PUT")}
+                  onClick={() => { setConfirmManual("PUT"); axios.post(`${API}/bot/refresh_atm`).catch(() => {}); }}
                   disabled={busy || !canTrade}
                   className={`rounded-none bg-red-600 hover:bg-red-500 text-zinc-50 font-mono font-semibold disabled:opacity-40 text-red-300 ${glowClass(putGlow)}`}
                 >
@@ -1091,6 +1138,20 @@ function App() {
               <ul className="space-y-0.5 font-mono text-[11px] text-zinc-300" data-testid="smc-reasons">
                 {smc.reasons.map((r, i) => (
                   <li key={i} className="leading-snug">· {r}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* P0-Q3: informational notes — warm-up hints, regime attenuation
+              — kept SEPARATE from the weight-carrying reasons above. This
+              is context, not evidence. */}
+          {smc.notes && smc.notes.length > 0 && (
+            <div className="border-t border-zinc-800 pt-3">
+              <div className="text-[10px] uppercase tracking-wider text-zinc-500 font-mono mb-1.5">Notes</div>
+              <ul className="space-y-0.5 font-mono text-[11px] text-zinc-500" data-testid="smc-notes">
+                {smc.notes.map((n, i) => (
+                  <li key={i} className="leading-snug italic">· {n}</li>
                 ))}
               </ul>
             </div>

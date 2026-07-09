@@ -89,6 +89,12 @@ class WebSocketManager:
         self._order_thread: Optional[threading.Thread] = None
         self._watch_thread: Optional[threading.Thread] = None
 
+        # P0-Q1: hold a reference to the live SDK ws object so we can call
+        # its `subscribe()` again when new option strikes are picked mid-day.
+        # `None` while the socket is between reconnects.
+        self._sdk_ws = None
+        self._sub_lock = threading.RLock()
+
     # --------------------------------------------------------------- lifecycle
     def start(self) -> None:
         self._stop.clear()
@@ -198,7 +204,15 @@ class WebSocketManager:
                         logger.exception("ws subscribe failed")
 
                 ws.on_open = on_open
-                ws.connect()  # blocking until closed
+                # P0-Q1: expose the live SDK object so mid-session
+                # resubscribe() calls can push new tokens without a reconnect.
+                with self._sub_lock:
+                    self._sdk_ws = ws
+                try:
+                    ws.connect()  # blocking until closed
+                finally:
+                    with self._sub_lock:
+                        self._sdk_ws = None
                 attempt = 0
             except Exception as exc:
                 self._reconnect_failures += 1
@@ -310,3 +324,60 @@ class WebSocketManager:
     @property
     def reconnect_failures(self) -> int:
         return self._reconnect_failures
+
+    # ------------------------------------------------------------ P0-Q1 API
+    def resubscribe(self, token_subscriptions: list[dict[str, Any]]) -> bool:
+        """Push a new subscription list to the LIVE websocket without a
+        reconnect. Called by the bot whenever `_refresh_atm_contracts()`
+        picks a strike whose token is not already subscribed.
+
+        Returns True if the SDK accepted the subscribe call; False if we
+        couldn't reach it (socket down, PAPER mode, SDK stub missing). In
+        that case the new list is still cached on `_token_subs` so the
+        next successful reconnect will pick it up.
+        """
+        with self._sub_lock:
+            self._token_subs = token_subscriptions or []
+            sdk = self._sdk_ws
+        if sdk is None:
+            return False
+        try:
+            sdk.subscribe(
+                correlation_id=f"nifty-bot-resub-{int(time.time())}",
+                mode=3,
+                token_list=self._token_subs,
+            )
+            logger.info(
+                "WS resubscribed to %d instrument group(s)",
+                len(self._token_subs),
+            )
+            return True
+        except Exception:
+            logger.exception("ws resubscribe failed")
+            return False
+
+    def subscribed_tokens(self) -> list[str]:
+        """Flat list of tokens currently on the subscription list. Used by
+        the /api/bot/status ws_health block."""
+        out: list[str] = []
+        with self._sub_lock:
+            for group in self._token_subs:
+                for t in group.get("tokens", []) or []:
+                    out.append(str(t))
+        return out
+
+    def health(self) -> dict[str, Any]:
+        """P0 diagnostics — everything the dashboard/API needs to reason
+        about feed integrity in a single call."""
+        now = time.time()
+        with self._sub_lock:
+            sdk_up = self._sdk_ws is not None
+            tokens = self.subscribed_tokens()
+        return {
+            "connected": bool(sdk_up),
+            "last_tick_ts": float(self._last_tick_ts),
+            "seconds_since_last_tick": max(0.0, now - self._last_tick_ts),
+            "reconnect_failures": int(self._reconnect_failures),
+            "subscribed_tokens": tokens,
+            "subscribed_count": len(tokens),
+        }

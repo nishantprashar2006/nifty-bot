@@ -268,6 +268,7 @@ def bot_status() -> dict[str, Any]:
         "setup_score": _setup_score(),
         "smc_score": _smc_score(),
         "atm_snapshot": _atm_snapshot(),
+        "ws_health": _ws_health(),
         "db_path": DB_PATH,
         "server_time_utc": datetime.now(timezone.utc).isoformat(),
         # PART 3 — execution gating + manual-mode policy
@@ -395,6 +396,29 @@ def _atm_snapshot() -> dict[str, Any]:
         return d
     except Exception:
         return {}
+
+
+def _ws_health() -> dict[str, Any]:
+    """P0-Q1/diagnostics: WebSocket feed integrity — connected flag,
+    seconds since last tick, reconnect failure count, currently-subscribed
+    token list. Refreshed by the bot every tick."""
+    import json
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT value, updated FROM bot_state WHERE key='ws_health'"
+            ).fetchone()
+    except sqlite3.OperationalError:
+        return {}
+    if not row:
+        return {}
+    try:
+        d = json.loads(row["value"])
+        d["updated"] = row["updated"]
+        return d
+    except Exception:
+        return {}
+
 
 
 @api.get("/bot/stats")
@@ -640,6 +664,23 @@ def panic_exit() -> dict[str, Any]:
         cur = c.execute(
             "INSERT INTO commands(timestamp, action, payload, status) "
             "VALUES (?, 'panic_exit', ?, 'pending')",
+            (datetime.now(timezone.utc).isoformat(), json.dumps({})),
+        )
+        return {"queued": True, "cmd_id": cur.lastrowid}
+
+
+@api.post("/bot/refresh_atm")
+def refresh_atm() -> dict[str, Any]:
+    """P0-Q2: on-demand ATM refresh. Called by the frontend when the
+    confirmation modal opens so the modal shows the freshest possible
+    strike/expiry/premium — without the daemon needing to hammer REST on
+    a background timer. Read the resulting `atm_snapshot` on the next
+    `/api/bot/status` poll (usually within ~1s)."""
+    import json
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO commands(timestamp, action, payload, status) "
+            "VALUES (?, 'refresh_atm', ?, 'pending')",
             (datetime.now(timezone.utc).isoformat(), json.dumps({})),
         )
         return {"queued": True, "cmd_id": cur.lastrowid}

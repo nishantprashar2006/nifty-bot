@@ -102,15 +102,16 @@ def test_short_5m_no_swings_returns_zero_without_crash():
     include a diagnostic reason indicating what's pending. Small primitives
     that don't need swings (e.g. FVG) may fire legitimately, but swing-
     derived weights (HTF, 5m structure, BOS/CHoCH, Sweep, OB retest,
-    Prem/Disc) must NOT contribute."""
+    Prem/Disc) must NOT contribute.
+
+    P0-Q3: notes (warm-up/regime) are now on `res.notes`, not `res.reasons`.
+    """
     tiny = _trend("up", n=8)   # 8 bars — far below the old 15-bar gate
     res = evaluate(tiny, [])
     # No crash — the whole point of removing the gate
     assert res.confidence >= 0
-    # Diagnostic reasons must be present (either pending-notes or the
-    # 'awaiting primitives' summary on a genuine zero-score tie)
-    assert res.reasons, "diagnostic reason(s) must be present"
-    joined = " ".join(res.reasons)
+    joined_reasons = " ".join(res.reasons)
+    joined_notes = " ".join(res.notes)
     # Swing-derived weights must be OFF (structure/BOS/Sweep/OB/PremDisc/HTF)
     for banned in (
         "HTF trend bullish", "HTF trend bearish",
@@ -121,42 +122,69 @@ def test_short_5m_no_swings_returns_zero_without_crash():
         "Bull OB", "Bear OB",
         "In discount zone", "In premium zone",
     ):
-        assert banned not in joined, f"unexpected swing-derived weight lit: {banned}"
-    # Informational warm-up notes must appear (HTF + Swings pending at least)
-    assert "HTF pending" in joined
-    assert "Swings pending" in joined
+        assert banned not in joined_reasons, f"unexpected swing-derived weight lit: {banned}"
+    # Informational warm-up notes must appear (HTF + swings pending at least)
+    assert "HTF warming up" in joined_notes, f"missing HTF note: {joined_notes}"
+    assert "5m swings warming up" in joined_notes, f"missing swings note: {joined_notes}"
     # No SL/TP levels without swing structure
     assert res.stop_loss is None and res.target is None
 
 
 def test_short_5m_zero_score_diagnostic_when_no_primitives():
     """When both call_score and put_score tie at zero (nothing detected
-    yet), reasons[] must NOT be empty — the dashboard should never render
-    a blank Reasons box. Feed 2 5m bars: too few for any primitive
-    including FVG (which needs 3 consecutive bars)."""
+    yet), reasons[] OR notes[] must NOT be empty — the dashboard should
+    never render a blank Reasons box. Feed 2 5m bars: too few for any
+    primitive including FVG (which needs 3 consecutive bars)."""
     tiny = _trend("up", n=2)
     res = evaluate(tiny, [])
     assert res.direction == "NEUTRAL"
     assert res.confidence == 0
-    assert res.reasons, "diagnostic reason must be present, not empty"
-    joined = " ".join(res.reasons)
-    # Either the pending-notes appear, or the awaiting-primitives summary
-    # (both are acceptable diagnostics — we only forbid an empty list)
-    assert ("HTF pending" in joined
+    joined = " ".join(res.reasons) + " " + " ".join(res.notes)
+    # Either the warm-up notes appear, or the awaiting-primitives summary
+    assert ("HTF warming up" in joined
             or "awaiting primitives" in joined
-            or "Swings pending" in joined)
+            or "5m swings warming up" in joined)
+
+
+def test_notes_never_duplicated_on_neutral_tie():
+    """P0-Q3 regression: on a NEUTRAL tie (both scores 0), warmup notes
+    must appear at most once each. Previously they appeared twice because
+    they were appended to reasons_call AND reasons_put, then concatenated."""
+    tiny = _trend("up", n=8)
+    res = evaluate(tiny, [])
+    # Every note must be unique
+    assert len(res.notes) == len(set(res.notes)), (
+        f"duplicate notes found: {res.notes}"
+    )
+    # Regression check on the specific note that used to double up
+    htf_count = sum(1 for n in res.notes if "HTF" in n)
+    assert htf_count <= 1, f"HTF note appears {htf_count} times: {res.notes}"
+
+
+def test_reasons_stay_weight_only():
+    """P0-Q3: `reasons` must contain only weight-carrying detection
+    strings ("+15", "+20", etc.), never informational context like
+    'HTF pending' or 'Regime LOW_VOL — × 0.90'."""
+    bars_5m = _zigzag_up(n=50)
+    bars_15m = _zigzag_up(n=50)
+    res = evaluate(bars_5m, bars_15m)
+    for r in res.reasons:
+        assert "warming up" not in r.lower(), f"note leaked into reasons: {r}"
+        assert not r.startswith("Regime "), f"regime note leaked into reasons: {r}"
+        assert "score cap" not in r.lower(), f"cap hint leaked into reasons: {r}"
 
 
 def test_progressive_activation_no_15m_still_scores():
     """Once 5 m primitives light up, the engine must emit a real
     confidence score even if the 15 m series is still empty (HTF pending).
-    The 'HTF pending — score cap 80' informational note must appear so
-    the operator understands why STRONG is unreachable."""
-    bars_5m = _zigzag_up(n=50)          # rich 5 m structure, no 15 m bars
+    The HTF warming-up note must appear on `res.notes` so the operator
+    understands why STRONG is unreachable."""
+    bars_5m = _zigzag_up(n=50)
     res = evaluate(bars_5m, [])
     assert res.confidence > 0, "engine must score without 15 m data"
-    # HTF is NEUTRAL → informational cap note must be present
-    assert any("HTF pending" in r for r in res.reasons)
+    # HTF is warming up → note must be present on `notes`, NOT `reasons`
+    joined_notes = " ".join(res.notes)
+    assert "HTF warming up" in joined_notes
     # But the +20 HTF weight must NOT be silently added
     assert not any("HTF trend bullish" in r for r in res.reasons)
     assert not any("HTF trend bearish" in r for r in res.reasons)
@@ -166,14 +194,53 @@ def test_progressive_activation_no_15m_still_scores():
 
 
 def test_warmup_notes_absent_when_all_primitives_active():
-    """Once ATR, swings and HTF are all live, none of the pending-notes
-    should appear — proving afternoon behaviour is untouched."""
+    """Once ATR, swings and HTF are all live, none of the warming-up notes
+    should appear — proving afternoon behaviour is untouched. `res.notes`
+    may still contain a Regime attenuation entry (that's not a warm-up)."""
     bars_5m = _zigzag_up(n=50)
     bars_15m = _zigzag_up(n=50)         # same shape on 15 m → HTF becomes CALL
     res = evaluate(bars_5m, bars_15m)
-    assert not any("HTF pending" in r for r in res.reasons)
-    assert not any("ATR pending" in r for r in res.reasons)
-    assert not any("Swings pending" in r for r in res.reasons)
+    joined = " ".join(res.notes)
+    assert "HTF warming up" not in joined
+    assert "ATR warming up" not in joined
+    assert "5m swings warming up" not in joined
+
+
+def test_htf_neutral_after_data_shows_distinct_label():
+    """P0-Q3 semantic fix: with plenty of 15m data but a rangebound
+    structure that legitimately produces HTF=NEUTRAL, the note must NOT
+    say 'HTF warming up' (misleading — implies data is missing). It
+    should distinctly say 'HTF NEUTRAL — no clean HH+HL or LH+LL'."""
+    # Rangebound 15m data: HL then LH then HL then LH → structure mixed.
+    # We construct a synthetic series that guarantees swings but no clean
+    # HH+HL nor LH+LL.
+    bars_5m = _zigzag_up(n=50)   # 5m has plenty of data
+    # 15m rangebound: highs oscillate around 24100, lows around 23900
+    from data.candle_manager import Bar
+    from datetime import datetime, timezone, timedelta
+    t0 = datetime(2026, 2, 6, 9, 30, tzinfo=timezone.utc)
+    prices = [24000, 24080, 23920, 24070, 23930, 24060, 23940, 24050, 23950,
+              24040, 23960, 24030, 23970, 24020, 23980, 24010, 23990, 24000,
+              23990, 24010, 23980, 24020, 23970, 24030, 23960]  # 25 bars
+    bars_15m = [
+        Bar(ts=t0 + timedelta(minutes=15 * i),
+            open=prices[i], high=prices[i] + 5, low=prices[i] - 5,
+            close=prices[i], volume=1000)
+        for i in range(len(prices))
+    ]
+    res = evaluate(bars_5m, bars_15m)
+    joined = " ".join(res.notes)
+    # Enough bars → NOT warming up
+    assert "HTF warming up" not in joined, (
+        f"misleading 'warming up' emitted with {len(bars_15m)} 15m bars: {joined}"
+    )
+    # If HTF actually came back NEUTRAL, the specific 'no clean structure'
+    # note must be present. If it came back directional, no HTF note.
+    ctx = res.ctx
+    if ctx and ctx.htf_trend == "NEUTRAL":
+        assert "HTF NEUTRAL" in joined, (
+            f"HTF is NEUTRAL but the distinguishing note is missing: {joined}"
+        )
 
 
 def test_swing_window_default_is_five():

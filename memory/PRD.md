@@ -239,3 +239,97 @@ Idempotent `ALTER TABLE trades ADD COLUMN …` for six new columns. Runs automat
 ### Untouched (per user's explicit instruction)
 Indicator Engine, SMC weights, SMC confidence, HTF trend logic, `RECENT_EVENT_BARS`, regime multipliers, trailing SL, SL%, TP%, Telegram alerts, signal generation.
 
+
+## Session update (2026-02-06 — Post-v1.7 quote-pipeline & regression pass, v1.8)
+
+### What was broken
+The v1.7 pass fixed contract-selection correctness but introduced two
+downstream regressions:
+1. **Quote pipeline freeze**: `_refresh_atm_contracts` now ran every 10 s
+   and drifted `_ce`/`_pe` continuously, but the WebSocket subscription
+   was frozen at startup — so LTPs stopped flowing for freshly-picked
+   strikes, and `live_quotes.option_ltp` bled across contracts.
+2. **Duplicate reasons on the dashboard**: warm-up + regime notes were
+   appended to both `reasons_call` and `reasons_put`, then concatenated
+   on NEUTRAL ties → each note appeared twice.
+3. Semantic bug: "HTF pending" note fired at any NEUTRAL trend — even at
+   15:00 IST with plenty of data — confusing "warming up" with "genuine
+   neutral verdict".
+
+### P0-Q items shipped
+- **P0-Q1** WebSocket resubscribe on strike change
+  - `WebSocketManager.resubscribe(subs)` + `subscribed_tokens()` +
+    `health()` API; holds a live `_sdk_ws` reference so `subscribe(...)`
+    can be re-called without a reconnect.
+  - `_refresh_atm_contracts` compares old vs new tokens and calls
+    `ws.resubscribe(...)` on change (cached-only if socket is down).
+  - `_place_entry` seeds `_last_option_quote[contract.token]` AND
+    `live_quotes.option_ltp/token/ts` with the pre-entry premium so the
+    first dashboard frame after entry is never stale.
+  - `_on_tick` tags option ticks with `option_ltp_token`; the frontend
+    suppresses Live P&L when the token doesn't match the open position
+    (kills cross-contract bleed).
+- **P0-Q2** No more periodic REST hammer
+  - Removed the 10-second `_refresh_atm_contracts` timer.
+  - New `POST /api/bot/refresh_atm` endpoint + `refresh_atm` command
+    action; the confirmation modal invokes it on open so the preview
+    stays fresh without a background REST hammer.
+- **P0-Q3** Notes separated from Reasons
+  - `SMCResult.notes: list[str]` — warm-up hints + regime attenuation
+    live here. `SMCResult.reasons` stays weight-only.
+  - Exposed as `smc_score.notes` in `/api/bot/status`; dashboard renders
+    them in a subtle italic "Notes" strip.
+  - HTF/ATR/Swings notes now distinguish "warming up (X/Y bars)" from
+    "detector ran and returned NEUTRAL" — fixes the misleading label at
+    late-day NEUTRAL verdicts.
+- **WS health diagnostics**
+  - New `bot_state.ws_health` key (published every tick) with
+    `connected`, `last_tick_ts`, `seconds_since_last_tick`,
+    `reconnect_failures`, `subscribed_tokens`, `subscribed_count`.
+  - Exposed at `/api/bot/status.ws_health`.
+  - Dashboard header shows a compact `ws OK (N)` / `ws ! (N)` strip
+    with tooltip carrying the full detail.
+- **Quote freshness in the UI**
+  - `live_quotes.option_ltp_ts` timestamp + `option_ltp_token` added.
+  - Open-position card shows `LTP ₹X (Ns ago)` in colour that reflects
+    freshness (green ≤ 15 s, amber older, red on token mismatch).
+  - Live P&L now suppressed when LTP is from a different contract, with
+    a visible amber banner explaining why.
+
+### HTF diagnostic answers (code-level)
+- No `htf_pending` state flag exists; the note is a pure function of
+  `ctx.htf_trend == "NEUTRAL"` recomputed every tick.
+- The previous single-label bug conflated warm-up (data missing) with a
+  genuine NEUTRAL verdict. Fixed by splitting into two distinct labels.
+- HTF `NEUTRAL` at 15:00 with 23+ 15m bars is now correctly labelled
+  "HTF NEUTRAL — no clean HH+HL or LH+LL structure" — not "warming up".
+
+### Files modified
+- `backend/broker/websocket_manager.py` — resubscribe/subscribed_tokens/
+  health API; SDK ws reference + sub_lock; init fields.
+- `backend/main.py` — remove periodic ATM timer; WS resubscribe hook in
+  refresh; LTP seed on entry; ws_health publisher; option_token stamp on
+  live_quotes; refresh_atm command action.
+- `backend/strategy/smc_engine.py` — `SMCResult.notes` field;
+  reasons/notes split; two-label warm-up disambiguation.
+- `backend/server.py` — `_ws_health()` reader; `/api/bot/refresh_atm`
+  endpoint; expose ws_health in `/api/bot/status`; cleaned up stray
+  duplicate code block at end of file.
+- `backend/tests/test_execution_correctness.py` — +8 new tests
+- `backend/tests/test_smc_engine.py` — 4 tests updated for notes/reasons
+  split, +2 new (dedup, semantic distinction, weight-only reasons).
+- `frontend/src/App.js` — WS health strip; LTP freshness & staleness
+  colouring; token-mismatch banner; notes list in SMC card; refresh_atm
+  invoked on modal open; ws_health hooked into status polling.
+
+### Test results
+- **97 passed** (was 86; +11 new for P0-Q1/Q2/Q3 + WS diagnostics + HTF
+  semantic disambiguation). Zero regressions.
+- Backend restart clean; `/api/bot/status` returns HTTP 200 with the
+  new `ws_health` and `smc_score.notes` keys in the payload.
+
+### Untouched
+Indicator Engine, SMC weights, SMC confidence weights, HTF weight (+20),
+`RECENT_EVENT_BARS`, regime thresholds/multipliers, `SWING_WINDOW`,
+trailing SL, SL%, TP%, Telegram alerts, signal generation, entry logic.
+
