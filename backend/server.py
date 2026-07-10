@@ -573,30 +573,18 @@ def manual_lots_default() -> dict[str, Any]:
 
 @api.post("/bot/reset_state")
 def reset_breakers() -> dict[str, Any]:
-    """Clear `_consecutive_losses`, `_trades_today`, and `_api_reject_count`
-    counters in the bot daemon. If the FSM is in SHUTDOWN (and no open
-    position), it returns to IDLE so manual entries can resume. Use this
-    to recover from a SIM-mode breaker lockout or after reviewing a LIVE
-    incident — no daemon restart needed."""
-    import json
-    try:
-        out = subprocess.run(
-            ["supervisorctl", "status", "nifty_bot"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout.strip()
-        sup_state = out.split()[1] if out else "UNKNOWN"
-    except Exception:
-        sup_state = "UNKNOWN"
-    if sup_state != "RUNNING":
-        raise HTTPException(503, "bot is not running — start it first")
-    with _conn() as c:
-        cur = c.execute(
-            "INSERT INTO commands(timestamp, action, payload, status) "
-            "VALUES (?, 'reset_breakers', ?, 'pending')",
-            (datetime.now(timezone.utc).isoformat(), json.dumps({})),
-        )
-        cmd_id = cur.lastrowid
-    return {"queued": True, "cmd_id": cmd_id}
+    """DEPRECATED (v1.10) — retained as a NO-OP for backward compatibility.
+
+    Manual mid-session reset was removed per user request: once the daily
+    loss cap or trade cap trips, the bot stays shut down for the rest of
+    the day. Counters reset AUTOMATICALLY at the next daily rollover in
+    IST via `_daily_rollover_if_needed()` in the bot daemon.
+    """
+    return {
+        "queued": False,
+        "cmd_id": None,
+        "note": "reset_breakers is disabled; counters auto-reset at next-day rollover in IST",
+    }
 
 
 @api.post("/bot/manual_entry")
@@ -684,6 +672,71 @@ def refresh_atm() -> dict[str, Any]:
             (datetime.now(timezone.utc).isoformat(), json.dumps({})),
         )
         return {"queued": True, "cmd_id": cur.lastrowid}
+
+
+@api.get("/bot/trade/{trade_id}/timeline")
+def trade_timeline(trade_id: str) -> dict[str, Any]:
+    """v1.10 — ordered execution-audit timeline for a single trade.
+
+    Read-only. Reads the `execution_events` table populated by the bot
+    daemon's `TimelineLogger`. Returns entries in chronological order
+    alongside a lightweight snapshot of the current bot health (ws +
+    broker connectivity) for the "Execution Health" card at the top of
+    the timeline modal.
+
+    Every trade produces its own timeline; if a trade has zero events
+    (e.g. very old rows from before v1.10) we still return HTTP 200 with
+    an empty `events` list and a `note` explaining why.
+    """
+    import json
+    events: list[dict[str, Any]] = []
+    try:
+        with _conn() as c:
+            rows = c.execute(
+                "SELECT id, ts, event_type, message, payload "
+                "FROM execution_events WHERE trade_id=? ORDER BY id",
+                (trade_id,),
+            ).fetchall()
+        for r in rows:
+            item = {"id": r["id"], "ts": r["ts"],
+                    "event_type": r["event_type"], "message": r["message"]}
+            try:
+                item["payload"] = json.loads(r["payload"]) if r["payload"] else {}
+            except Exception:
+                item["payload"] = {}
+            events.append(item)
+    except sqlite3.OperationalError:
+        # Table doesn't exist yet (fresh DB before daemon booted)
+        events = []
+
+    # Also include the trade row itself so the summary card can render
+    # without a second round-trip.
+    trade: Optional[dict[str, Any]] = None
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT * FROM trades WHERE trade_id=?", (trade_id,),
+            ).fetchone()
+            if row:
+                trade = {k: row[k] for k in row.keys()}
+    except sqlite3.OperationalError:
+        pass
+
+    return {
+        "trade_id": trade_id,
+        "trade": trade,
+        "events": events,
+        "count": len(events),
+        "health": {
+            "ws": _ws_health(),
+            "broker": _broker_status(),
+        },
+        "note": (
+            None if events
+            else "No timeline events recorded for this trade (older than v1.10 or logging failed)."
+        ),
+    }
+
 
 
 

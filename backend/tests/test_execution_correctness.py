@@ -907,3 +907,68 @@ def test_live_position_snapshot_persists_and_restores_trail_anchor():
     assert snap["trail_bumps"] == 1
     assert snap["highest_ltp_seen"] == pytest.approx(118.0)
 
+
+
+# ─────────────────────────────────────────── v1.10 — Execution Timeline
+def test_timeline_logger_schema_and_write():
+    """v1.10: TimelineLogger creates the events table and INSERTs rows
+    without raising even if some payload keys are exotic."""
+    from execution_timeline import TimelineLogger, Event
+    db_path = tempfile.mktemp(suffix=".db")
+    tl = TimelineLogger(db_path)
+    tl.log("T-abc", Event.ENTRY_CLICK, "click", {"direction": "CALL"})
+    tl.log("T-abc", Event.CONTRACT_SELECTED, "picked", {"symbol": "NIFTY24500CE"})
+    events = tl.timeline_for("T-abc")
+    assert len(events) == 2
+    assert events[0]["event_type"] == "ENTRY_CLICK"
+    assert events[0]["payload"]["direction"] == "CALL"
+    assert events[1]["message"] == "picked"
+
+
+def test_timeline_logger_never_raises_on_bad_payload():
+    """log() must swallow exceptions — trading loop must never crash
+    because of a logging error."""
+    from execution_timeline import TimelineLogger, Event
+    tl = TimelineLogger(tempfile.mktemp(suffix=".db"))
+    # Non-JSON-serializable payload — should be logged & suppressed
+    class NotJSON:
+        pass
+    tl.log("T-x", Event.NOTE, "with weird payload", {"obj": NotJSON()})
+    # Timeline still returns an empty list; no exception propagated
+    events = tl.timeline_for("T-x")
+    assert isinstance(events, list)
+
+
+def test_timeline_rekey_session_reassigns_pre_fill_events():
+    """v1.10: events written under the session key before the fill must be
+    rewritten to the real trade_id, giving the UI one contiguous timeline."""
+    from execution_timeline import TimelineLogger, Event, new_session_id
+    tl = TimelineLogger(tempfile.mktemp(suffix=".db"))
+    sess = new_session_id()
+    tl.log(sess, Event.ENTRY_CLICK, "click")
+    tl.log(sess, Event.CONTRACT_SELECTED, "picked")
+    # simulate fill → learn trade_id
+    tl.rekey_session(sess, "T-real")
+    # Post-fill events go under real trade_id
+    tl.log("T-real", Event.ENTRY_FILL, "filled")
+    events = tl.timeline_for("T-real")
+    assert len(events) == 3
+    assert [e["event_type"] for e in events] == [
+        "ENTRY_CLICK", "CONTRACT_SELECTED", "ENTRY_FILL",
+    ]
+    assert tl.timeline_for(sess) == []
+
+
+def test_timeline_ordered_chronologically():
+    """Events must return in INSERT order (which is time order)."""
+    from execution_timeline import TimelineLogger, Event
+    tl = TimelineLogger(tempfile.mktemp(suffix=".db"))
+    for i, et in enumerate([
+        Event.ENTRY_CLICK, Event.ATM_REFRESH, Event.CONTRACT_SELECTED,
+        Event.ORDER_SUBMIT, Event.ENTRY_FILL, Event.SL_PLACED,
+        Event.TP_PLACED, Event.TRAIL_BUMP, Event.EXIT_FILL,
+    ]):
+        tl.log("T-order", et, f"step {i}")
+    ids = [e["id"] for e in tl.timeline_for("T-order")]
+    assert ids == sorted(ids), "events must be returned in id (chronological) order"
+

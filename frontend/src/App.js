@@ -130,6 +130,22 @@ function App() {
 
   // Manual entry confirmation
   const [confirmManual, setConfirmManual] = useState(null);  // null | "CALL" | "PUT"
+  // v1.10 — timeline modal state
+  const [timelineTrade, setTimelineTrade] = useState(null);
+  const [timelineData, setTimelineData] = useState(null);
+  useEffect(() => {
+    if (!timelineTrade) { setTimelineData(null); return; }
+    let cancelled = false;
+    (async () => {
+      try {
+        const { data } = await axios.get(`${API}/bot/trade/${timelineTrade.trade_id}/timeline`);
+        if (!cancelled) setTimelineData(data);
+      } catch {
+        if (!cancelled) setTimelineData({ events: [], count: 0, note: "Failed to load timeline" });
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [timelineTrade]);
 
   // Engine selector: 'indicator' | 'smc' — drives which advisory's bias
   // lights up the Buy Call / Buy Put buttons. Persists across reloads.
@@ -810,14 +826,15 @@ function App() {
                 <XOctagonIcon className="h-4 w-4 mr-2" /> Exit Position
               </Button>
             ) : fsm === "SHUTDOWN" ? (
-              <Button
-                data-testid="btn-reset-breakers"
-                onClick={resetBreakers}
-                disabled={busy}
-                className="rounded-none bg-amber-500 hover:bg-amber-400 text-zinc-950 font-mono font-semibold disabled:opacity-40"
+              <div
+                data-testid="shutdown-notice"
+                className="px-3 py-2 border border-amber-800 bg-amber-950/30 text-amber-300 text-xs font-mono max-w-xs text-right"
               >
-                Reset Breakers
-              </Button>
+                <div className="font-semibold">Trading halted for the day</div>
+                <div className="mt-1 text-amber-400/80">
+                  Counters auto-reset at next-day rollover (IST).
+                </div>
+              </div>
             ) : (
               <>
                 {/* PART 3 §5 — editable, sticky lot-size */}
@@ -1311,7 +1328,13 @@ function App() {
                     </TableHeader>
                     <TableBody>
                       {trades.map((t) => (
-                        <TableRow key={t.trade_id} className="border-zinc-800 hover:bg-zinc-900/40 font-mono text-sm">
+                        <TableRow
+                          key={t.trade_id}
+                          data-testid={`trade-row-${t.trade_id}`}
+                          onClick={() => setTimelineTrade(t)}
+                          className="border-zinc-800 hover:bg-zinc-900/40 font-mono text-sm cursor-pointer"
+                          title="Click to view execution timeline"
+                        >
                           <TableCell className="text-zinc-400">{t.trade_id}</TableCell>
                           <TableCell>
                             <span className={`px-1.5 py-0.5 text-[10px] border ${
@@ -1524,6 +1547,87 @@ function App() {
             >
               Confirm {confirmManual}
             </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* v1.10 — Execution Timeline modal (opens on trade-row click) */}
+      <AlertDialog open={!!timelineTrade} onOpenChange={(o) => !o && setTimelineTrade(null)}>
+        <AlertDialogContent className="bg-zinc-950 border-zinc-800 rounded-none max-w-3xl max-h-[85vh] overflow-y-auto">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-amber-300 font-mono">
+              Execution Timeline · {timelineTrade?.trade_id}
+            </AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="text-zinc-400 text-sm space-y-4">
+                {/* Summary card */}
+                {timelineTrade && (
+                  <div className="grid grid-cols-3 gap-3 border border-zinc-800 p-3 bg-zinc-900/40 font-mono text-[11px]">
+                    <div>Direction: <span className={timelineTrade.direction === "CALL" ? "text-emerald-300" : "text-red-300"}>{timelineTrade.direction}</span></div>
+                    <div>Entry: <span className="text-zinc-100">{fmtINR(timelineTrade.entry_price)}</span></div>
+                    <div>Exit: <span className="text-zinc-100">{timelineTrade.exit_price != null ? fmtINR(timelineTrade.exit_price) : "—"}</span></div>
+                    <div>PnL: <span className={timelineTrade.pnl >= 0 ? "text-emerald-300" : "text-red-300"}>{timelineTrade.pnl != null ? fmtINR(timelineTrade.pnl) : "open"}</span></div>
+                    <div>Exit Reason: <span className="text-amber-300">{timelineTrade.exit_reason || "—"}</span></div>
+                    <div>Source: <span className="text-zinc-100">{timelineTrade.source || "—"}</span></div>
+                    <div className="col-span-3">Contract: <span className="text-amber-300">{timelineTrade.contract_symbol || "—"}</span> {timelineTrade.strike && <span className="text-zinc-500">· strike {timelineTrade.strike}</span>} {timelineTrade.expiry && <span className="text-zinc-500">· exp {timelineTrade.expiry}</span>}</div>
+                  </div>
+                )}
+
+                {/* Health snapshot */}
+                {timelineData?.health && (
+                  <div className="border border-zinc-800 p-3 bg-zinc-900/40 font-mono text-[11px]">
+                    <div className="text-zinc-500 uppercase tracking-wider text-[10px] mb-1">Execution Health (now)</div>
+                    <div className="grid grid-cols-2 gap-1">
+                      <div>WS: <span className={timelineData.health.ws?.connected ? "text-emerald-300" : "text-red-300"}>{timelineData.health.ws?.connected ? "connected" : "down"}</span> {timelineData.health.ws?.subscribed_count != null && <span className="text-zinc-500">({timelineData.health.ws.subscribed_count} subs)</span>}</div>
+                      <div>Broker: <span className={timelineData.health.broker === "connected" ? "text-emerald-300" : "text-red-300"}>{timelineData.health.broker || "—"}</span></div>
+                      <div>Last tick: <span className="text-zinc-300">{timelineData.health.ws?.seconds_since_last_tick != null ? `${timelineData.health.ws.seconds_since_last_tick.toFixed(0)}s ago` : "—"}</span></div>
+                      <div>WS reconnects: <span className="text-zinc-300">{timelineData.health.ws?.reconnect_failures ?? 0}</span></div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Timeline */}
+                {timelineData == null ? (
+                  <div className="text-zinc-500 text-center py-6">Loading timeline…</div>
+                ) : (timelineData.events || []).length === 0 ? (
+                  <div className="text-zinc-500 text-center py-6 border border-zinc-800 bg-zinc-900/40">
+                    {timelineData.note || "No events recorded."}
+                  </div>
+                ) : (
+                  <ol data-testid="timeline-events" className="relative border-l border-zinc-800 ml-2 space-y-3 pt-2">
+                    {timelineData.events.map((e) => {
+                      const ico = e.event_type.startsWith("ENTRY") || e.event_type.includes("CONTRACT") || e.event_type === "ORDER_SUBMIT" || e.event_type === "ORDER_ACK" || e.event_type === "REST_LTP" || e.event_type === "ATM_REFRESH" ? "🟢"
+                        : e.event_type.includes("SL") || e.event_type.includes("TP") || e.event_type.includes("PROTECTION") ? "🛡"
+                        : e.event_type.includes("TRAIL") || e.event_type === "STOP_MODIFIED" ? "📈"
+                        : e.event_type === "STALE_FEED" || e.event_type === "FORCED_EXIT" ? "⚠"
+                        : e.event_type.startsWith("EXIT") ? "🔴" : "·";
+                      return (
+                        <li key={e.id} data-testid={`tl-${e.event_type}`} className="ml-4 pl-3 relative">
+                          <span className="absolute -left-[9px] top-1 w-3 h-3 flex items-center justify-center text-[10px]">{ico}</span>
+                          <div className="text-[10px] text-zinc-500 font-mono">{new Date(e.ts).toLocaleTimeString("en-IN", { hour12: false })}</div>
+                          <div className="text-zinc-200 text-[12px] font-mono">{e.message}</div>
+                          {e.payload && Object.keys(e.payload).length > 0 && (
+                            <div className="text-[10px] text-zinc-500 font-mono mt-0.5 flex flex-wrap gap-x-3 gap-y-0.5">
+                              {Object.entries(e.payload).map(([k, v]) => (
+                                <span key={k}>{k}: <span className="text-zinc-300">{String(v)}</span></span>
+                              ))}
+                            </div>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ol>
+                )}
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel
+              data-testid="timeline-close"
+              className="rounded-none border-zinc-700 text-zinc-300 hover:bg-zinc-900 font-mono"
+            >
+              Close
+            </AlertDialogCancel>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

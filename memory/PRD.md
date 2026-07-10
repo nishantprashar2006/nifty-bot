@@ -421,3 +421,74 @@ Indicator Engine, SMC weights, HTF trend logic, RECENT_EVENT_BARS,
 regime thresholds/multipliers, SWING_WINDOW, trailing SL step,
 SL%/TP%, Telegram alerts, signal generation, entry logic.
 
+
+## Session update (2026-02-06 — Execution Timeline + Reset removal, v1.10)
+
+### 1. Execution Timeline (observability-only)
+- New isolated module `backend/execution_timeline.py` with `TimelineLogger`
+  writing to a new `execution_events` table (idempotent DDL).
+- `NiftyOptionsBot` now emits events at every meaningful execution point:
+  ENTRY_CLICK, ATM_REFRESH, CONTRACT_SELECTED, REST_LTP, ORDER_SUBMIT,
+  ORDER_ACK, ENTRY_FILL, SL_PLACED, TP_PLACED, TRAIL_BUMP, EXIT_FILL,
+  STALE_FEED, FORCED_EXIT, NOTE.
+- Pre-fill events use a session key (S-…); rekeyed to the real trade_id
+  the moment `_handle_fill` promotes the pending entry, so the UI sees
+  ONE contiguous timeline per trade.
+- Safe helper `NiftyOptionsBot._tl()` guards every log call — a missing
+  timeline attribute or a writer exception is a silent no-op (trading
+  loop never crashes because of an audit-logging failure).
+- New endpoint `GET /api/bot/trade/{trade_id}/timeline` returns the
+  ordered events + the trade summary row + a live health snapshot (WS
+  + broker) for the "Execution Health" card at the top of the modal.
+- Frontend: trade rows are now clickable → open a side-modal titled
+  "Execution Timeline". Icons per category (🟢 entry · 🛡 protection ·
+  📈 trail · ⚠ safety · 🔴 exit). Chronological, expandable payload
+  per row.
+
+### 2. Reset Breakers removed (per user request)
+- `NiftyOptionsBot.reset_breakers()` is now a documented NO-OP.
+- `POST /api/bot/reset_state` returns `{queued: false, note: "…"}` for
+  backward compatibility.
+- New `_daily_rollover_if_needed()` runs once per tick — when the IST
+  calendar date changes, zeroes `_trades_today`, `_consecutive_losses`,
+  `_api_reject_count`, and flips SHUTDOWN → IDLE if flat. **Manual
+  mid-day reset is no longer possible; counters auto-reset at
+  next-day rollover only.**
+- Frontend "Reset Breakers" button replaced by an amber notice:
+  "Trading halted for the day · Counters auto-reset at next-day
+  rollover (IST)."
+
+### 3. Files touched
+- **New**: `backend/execution_timeline.py`
+- **Backend**: `main.py` (timeline instrumentation, `_tl` helper,
+  rollover, reset no-op), `server.py` (timeline endpoint, reset
+  endpoint no-op), `strategy/position_manager.py` (no change to logic —
+  telemetry from v1.9 already in place).
+- **Tests**: `tests/test_execution_correctness.py` (+4 timeline tests).
+- **Frontend**: `App.js` (timeline modal, trade-row click handler,
+  Reset Breakers → notice).
+
+### 4. Explanation of capital-to-lots (for user reference)
+- `risk/position_sizer.py::update_equity_and_size`:
+  - Tiered base lots by equity: <50k=1, <100k=2, <200k=3, else min(4, MAX_LOTS_DYNAMIC).
+  - Drawdown attenuation: >10 % = ×0.5, >5 % = ×0.75, else ×1.0.
+  - `effective_lots = max(1, floor(base × scale))`.
+- Broker balance comes from `broker.get_net_available_cash()` in
+  `broker/smartapi_client.py` → SmartAPI RMS endpoint (`getRMS`)
+  returns `net` = the "Available for New Positions" figure on the
+  Angel One app. Called once at bot startup and at each morning
+  sizing tick.
+
+### 5. Test results
+- **108 passed** (was 104; +4 new for timeline). Zero regressions.
+- Backend restart clean; `/api/bot/status` → 200; timeline endpoint → 200;
+  reset_state endpoint returns the no-op note as expected.
+
+### 6. Untouched (per your explicit hold)
+Indicator Engine, SMC weights, SMC confidence, HTF trend logic,
+BOS/CHoCH/OB/FVG/Sweep detection, Premium-Discount, signal generation,
+entry/exit rules, SL%, TP%, Trailing SL%, regime thresholds &
+multipliers, SWING_WINDOW, RECENT_EVENT_BARS, WebSocket logic, quote
+pipeline, broker integration, FSM transitions, risk management,
+position sizing, Telegram alerts, existing API behavior.
+

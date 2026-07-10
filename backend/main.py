@@ -122,6 +122,43 @@ class NiftyOptionsBot:
         # current live SMC signal. Auto-expires after MAX_SIGNAL_AGE_MINUTES.
         self._smc_signal: Optional[dict] = None
 
+        # v1.10 — isolated observability writer. Every meaningful execution
+        # event is appended here; the UI reads it via /api/bot/trade/{id}/timeline.
+        # Never influences trading decisions.
+        from execution_timeline import TimelineLogger
+        self.timeline = TimelineLogger(config.DB_PATH)
+        # Session key for the current pending entry (rewritten to real
+        # trade_id on fill via `timeline.rekey_session`).
+        self._timeline_session: Optional[str] = None
+
+    def _tl(self, trade_id: str, event_type: str, message: str, payload: Optional[dict] = None) -> None:
+        """v1.10 — SAFE timeline logging shim.
+
+        Wraps `self._tl(...)` with a getattr guard so any code
+        path that reaches this method without an initialised timeline
+        (e.g. tests using `NiftyOptionsBot.__new__`) is a silent no-op
+        rather than an AttributeError. Also swallows any exception
+        raised inside the writer — the trading loop never crashes
+        because of an observability log call.
+        """
+        tl = getattr(self, "timeline", None)
+        if tl is None or not trade_id:
+            return
+        try:
+            tl.log(trade_id, event_type, message, payload)
+        except Exception:
+            pass
+
+    def _tl_rekey(self, session_id: Optional[str], trade_id: str) -> None:
+        """Same guarded shim for rekey_session."""
+        tl = getattr(self, "timeline", None)
+        if tl is None or not session_id or not trade_id:
+            return
+        try:
+            tl.rekey_session(session_id, trade_id)
+        except Exception:
+            pass
+
         # Explicit exit-reason hint for the next FORCED_EXIT / synthetic exit.
         # Whoever triggers the exit sets this so `_finalize_exit` records the
         # true cause (TIME_STOP / SQUARE_OFF / MANUAL / HEARTBEAT) instead
@@ -514,15 +551,41 @@ class NiftyOptionsBot:
         breach = self._trip_circuit_breakers()
         if breach:
             return False, f"circuit breaker: {breach}"
+        # v1.10 — start a new timeline session for this click. All events
+        # before we know the real trade_id are recorded under this session
+        # key, then rewritten to the real trade_id inside _handle_fill.
+        from execution_timeline import new_session_id, Event
+        self._timeline_session = new_session_id()
+        self._tl(
+            self._timeline_session, Event.ENTRY_CLICK,
+            f"Manual BUY {direction.value} clicked",
+            {"direction": direction.value, "engine": engine,
+             "lots_override": lots_override, "confidence": confidence},
+        )
         # P0-1: mandatory pre-entry refresh. Never trust startup cache.
         try:
             self._refresh_atm_contracts()
+            self._tl(
+                self._timeline_session, Event.ATM_REFRESH,
+                "ATM contracts refreshed",
+            )
         except Exception:
             logger.exception("Pre-entry ATM refresh failed; aborting manual entry.")
+            self._tl(
+                self._timeline_session, Event.NOTE,
+                "ATM refresh failed — entry aborted",
+            )
             return False, "ATM refresh failed — could not resolve current strike"
         contract = self._ce if direction is config.Direction.LONG else self._pe
         if contract is None:
             return False, "ATM contract not yet resolved after refresh"
+        self._tl(
+            self._timeline_session, Event.CONTRACT_SELECTED,
+            f"Selected contract {contract.symbol}",
+            {"symbol": contract.symbol, "token": contract.token,
+             "strike": contract.strike, "expiry": contract.expiry,
+             "option_type": contract.option_type, "lot_size": contract.lot_size},
+        )
         logger.info(
             "Manual %s → resolved contract %s (strike=%s expiry=%s token=%s)",
             direction.value, contract.symbol, contract.strike,
@@ -844,6 +907,22 @@ class NiftyOptionsBot:
                 self._transition(config.State.FORCED_EXIT)
                 return
             pos = self.positions.promote_to_open(fill_px)
+            # v1.10 timeline — bind pre-fill events to the real trade_id,
+            # then emit the ENTRY_FILL event under that trade_id so
+            # subsequent protection/trail/exit events sit in one contiguous
+            # timeline the UI can render.
+            from execution_timeline import Event
+            if getattr(self, "_timeline_session", None):
+                self._tl_rekey(self._timeline_session, pos.trade_id)
+            self._tl(
+                pos.trade_id, Event.ENTRY_FILL,
+                f"Entry filled ₹{fill_px:.2f}",
+                {"fill_price": fill_px, "avg_price": ev.avg_price,
+                 "raw_fill_price": ev.fill_price, "order_id": ev.order_id,
+                 "contract_symbol": pos.contract_symbol,
+                 "contract_token": pos.contract_token},
+            )
+            self._timeline_session = None
             source = self._pending_source if self._pending_source else "auto"
             engine = self._pending_engine if self._pending_engine else None
             confidence = self._pending_confidence
@@ -899,6 +978,15 @@ class NiftyOptionsBot:
                     "REST LTP fallback for %s (token=%s) → ₹%.2f",
                     contract.symbol, contract.token, premium,
                 )
+                # v1.10 timeline
+                if getattr(self, "_timeline_session", None) and premium > 0:
+                    from execution_timeline import Event
+                    self._tl(
+                        self._timeline_session, Event.REST_LTP,
+                        f"REST premium fetched ₹{premium:.2f}",
+                        {"symbol": contract.symbol, "token": contract.token,
+                         "ltp": premium},
+                    )
             except Exception as exc:
                 logger.warning(
                     "REST LTP fallback failed for %s: %s", contract.symbol, exc,
@@ -1007,6 +1095,22 @@ class NiftyOptionsBot:
             source.upper(), config.ENTRY_ORDER_TYPE, contract.symbol, qty,
             limit_px, tp_pts, sl_pts, order_id,
         )
+        # v1.10 timeline — broker order submitted (and immediately ack'd since
+        # place_order returned a non-empty id). Broker fill event comes later
+        # from _handle_fill.
+        if getattr(self, "_timeline_session", None):
+            from execution_timeline import Event
+            self._tl(
+                self._timeline_session, Event.ORDER_SUBMIT,
+                f"Entry order submitted qty={qty} ref=₹{limit_px:.2f}",
+                {"order_id": order_id, "qty": qty, "limit_px": limit_px,
+                 "ordertype": config.ENTRY_ORDER_TYPE},
+            )
+            self._tl(
+                self._timeline_session, Event.ORDER_ACK,
+                f"Broker acknowledged order {order_id}",
+                {"order_id": order_id},
+            )
 
         # P0-Q1: seed `_last_option_quote[contract.token]` with the premium
         # we just placed against so the very first frame the dashboard
@@ -1083,6 +1187,21 @@ class NiftyOptionsBot:
                 "Protective OCO armed [SL=%s]: tgt=%s sl=%s  (target ₹%.2f, stop ₹%.2f)",
                 config.SL_ORDER_TYPE, tgt_id, sl_id, target_price, stop_price,
             )
+            # v1.10 timeline
+            from execution_timeline import Event
+            pos_for_log = self.positions.open_position
+            if pos_for_log:
+                self._tl(
+                    pos_for_log.trade_id, Event.TP_PLACED,
+                    f"Initial Target placed ₹{target_price:.2f}",
+                    {"order_id": tgt_id, "price": target_price},
+                )
+                self._tl(
+                    pos_for_log.trade_id, Event.SL_PLACED,
+                    f"Initial Stop placed ₹{stop_price:.2f}",
+                    {"order_id": sl_id, "price": stop_price,
+                     "order_type": config.SL_ORDER_TYPE},
+                )
             # v1.9 P1 — Post-place broker verification. Give SmartAPI a
             # brief moment to accept both legs, then confirm they appear
             # in the order book with an open/trigger_pending status. If
@@ -1200,6 +1319,14 @@ class NiftyOptionsBot:
                 pass
 
         pnl = (exit_price - pos.entry_price) * pos.qty
+        # v1.10 timeline — record trigger + fill BEFORE we clear the pos.
+        from execution_timeline import Event
+        self._tl(
+            pos.trade_id, Event.EXIT_FILL,
+            f"Exit filled ₹{exit_price:.2f}  PnL ₹{pnl:+.2f}",
+            {"exit_price": exit_price, "pnl": pnl, "was_stop": was_stop,
+             "explicit_reason": reason},
+        )
         # v1.9 — distinguish INITIAL_SL from TRAILING_STOP. If the current
         # stop is above the initial stop (any bump ever happened) and the
         # exit was on the stop side, it's a trailing stop, not a raw SL.
@@ -1621,6 +1748,14 @@ class NiftyOptionsBot:
                     "→ firing STALE_FEED exit to preserve capital.",
                     pos.contract_symbol, age, config.STALE_QUOTE_EXIT_SEC,
                 )
+                # v1.10 timeline
+                from execution_timeline import Event
+                self._tl(
+                    pos.trade_id, Event.STALE_FEED,
+                    f"Stale quote — no ticks for {age:.0f}s → forced exit",
+                    {"seconds_since_last_tick": age,
+                     "threshold": config.STALE_QUOTE_EXIT_SEC},
+                )
                 self._exit_reason_hint = config.ExitReason.STALE_FEED.value
                 self._transition(config.State.FORCED_EXIT)
                 return
@@ -1680,6 +1815,17 @@ class NiftyOptionsBot:
                 # anchor, not from `entry_price`. Cheap: single INSERT OR
                 # REPLACE into bot_state.
                 self._persist_live_position_state()
+                # v1.10 timeline — record the bump
+                from execution_timeline import Event
+                self._tl(
+                    pos.trade_id, Event.TRAIL_BUMP,
+                    f"Trail #{pos.trail_bumps} · stop moved to ₹{new_stop:.2f}",
+                    {"trail_bumps": pos.trail_bumps,
+                     "new_stop": new_stop,
+                     "trail_anchor": pos.trail_anchor,
+                     "highest_ltp_seen": pos.highest_ltp_seen,
+                     "current_ltp": ltp},
+                )
             if new_stop is not None and pos.stop_order_id:
                 # PART 3 §15 — cancel-replace SL atomically. If the cancel
                 # succeeds but the replace fails, the position has NO active
@@ -1767,37 +1913,56 @@ class NiftyOptionsBot:
         self._finalize_exit(exit_price, was_stop=was_stop)
 
     def reset_breakers(self) -> dict:
-        """Admin reset for circuit-breaker counters. Lets the user clear an
-        accumulated SIM-mode lockout (or recover from a LIVE-mode breach
-        once they've reviewed the cause) without restarting the daemon.
+        """DEPRECATED — kept as a NO-OP for backward compatibility.
 
-        P0-6: cancels every pending/running command BEFORE flipping the FSM
-        back to IDLE, so a queued manual_entry the user submitted while in
-        SHUTDOWN cannot suddenly execute the moment the state clears.
+        Manual mid-day reset was removed per user request: once the daily
+        loss cap or trade cap is hit, the bot stays shut down for the rest
+        of the session. Counters reset AUTOMATICALLY at the next daily
+        rollover (see `_daily_rollover_if_needed`), not by a button.
         """
-        prev = {
+        logger.warning(
+            "reset_breakers() invoked but is now a no-op. "
+            "Counters reset only at next-day rollover.",
+        )
+        return {
             "trades_today": self._trades_today,
             "consecutive_losses": self._consecutive_losses,
             "api_reject_count": self._api_reject_count,
             "state": self.state.value,
+            "cancelled_commands": 0,
+            "note": "reset_breakers is disabled; counters reset at next-day rollover",
         }
+
+    def _daily_rollover_if_needed(self) -> None:
+        """Auto-reset breakers when the calendar date changes in IST.
+
+        Fires once per tick (cheap: one string compare against a cached
+        session date). At the first tick of a new trading day, zeroes the
+        daily counters and — if the FSM was parked in SHUTDOWN from
+        yesterday's breach with no open position — flips back to IDLE so
+        today's session can begin. Never touches an open position.
+        """
         try:
-            cancelled = self.db.cancel_pending_commands(reason="reset_breakers_cancelled")
+            import pytz
+            today_ist = datetime.now(pytz.timezone("Asia/Kolkata")).date().isoformat()
         except Exception:
-            logger.exception("cancel_pending_commands failed during reset_breakers")
-            cancelled = 0
+            today_ist = datetime.now(timezone.utc).date().isoformat()
+        if getattr(self, "_session_date", None) == today_ist:
+            return
+        # First tick of a new day (or first-ever tick after boot)
+        prev = getattr(self, "_session_date", None)
+        self._session_date = today_ist
+        if prev is None:
+            return   # boot; no rollover reset needed
+        logger.warning(
+            "Daily rollover %s → %s — resetting circuit-breaker counters.",
+            prev, today_ist,
+        )
         self._trades_today = 0
         self._consecutive_losses = 0
         self._api_reject_count = 0
         if self.state is config.State.SHUTDOWN and not self.positions.has_open_position:
             self._transition(config.State.IDLE)
-        logger.warning(
-            "Circuit-breaker counters reset by user. Previous: %s. "
-            "Cancelled %d pending command(s).",
-            prev, cancelled,
-        )
-        prev["cancelled_commands"] = cancelled
-        return prev
 
     def _step_forced_exit(self) -> None:
         pos = self.positions.open_position
@@ -1872,6 +2037,7 @@ class NiftyOptionsBot:
                 #       the next tick — bounded REST usage tied to user intent
                 #       rather than a background hammer.
                 self._publish_ws_health()
+                self._daily_rollover_if_needed()
 
                 breach = self._trip_circuit_breakers()
                 if breach and self.state is not config.State.SHUTDOWN:
