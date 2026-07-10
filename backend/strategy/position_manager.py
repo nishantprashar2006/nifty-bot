@@ -47,6 +47,16 @@ class OpenPosition:
     # PART 3 manual-mode trailing — when > 0, premium percent step replaces
     # the global TRAILING_TRIGGER_STEP for this specific position.
     trail_step_pct: float = 0.0
+    # ─── Protection-state telemetry (v1.9) ─────────────────────────────
+    # These fields are updated live during the hold and persisted onto
+    # the `trades` row when the position closes. They exist so future
+    # audits like the T-8261be7125 debate can be answered from data
+    # instead of arithmetic inference.
+    initial_stop_price: float = 0.0    # frozen at promote_to_open()
+    initial_target_price: float = 0.0  # frozen at promote_to_open()
+    trail_bumps: int = 0               # count of maybe_trail_stop bumps
+    highest_ltp_seen: float = 0.0
+    lowest_ltp_seen: float = 0.0
 
     def age_seconds(self) -> float:
         return (datetime.now(timezone.utc) - self.entry_ts).total_seconds()
@@ -163,6 +173,13 @@ class PositionManager:
                 lot_size=p.lot_size,
                 trail_anchor=fill_price,
                 trail_step_pct=p.trail_step_pct,
+                # v1.9 telemetry — freeze the initial protection state
+                # so audits can distinguish "initial SL hit" from
+                # "trailing SL hit" after N bumps.
+                initial_stop_price=stop_price,
+                initial_target_price=target_price,
+                highest_ltp_seen=fill_price,
+                lowest_ltp_seen=fill_price,
             )
             self._open = pos
             self._pending = None
@@ -210,6 +227,7 @@ class PositionManager:
                 bump = step * (delta // step)
                 pos.stop_price += bump
                 pos.trail_anchor += bump
+                pos.trail_bumps += 1     # v1.9 telemetry
                 return pos.stop_price
             return None
 

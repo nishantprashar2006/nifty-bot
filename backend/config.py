@@ -125,12 +125,20 @@ class Direction(Enum):
 
 class ExitReason(Enum):
     TARGET = "TARGET"
-    STOP_LOSS = "STOP_LOSS"
+    STOP_LOSS = "STOP_LOSS"                  # initial (non-trailing) SL hit
+    TRAILING_STOP = "TRAILING_STOP"          # SL after ≥ 1 trail bump
     TIME_STOP = "TIME_STOP"
     SQUARE_OFF = "SQUARE_OFF"
     HEARTBEAT = "HEARTBEAT"
     MANUAL = "MANUAL"
     REJECTED = "REJECTED"
+    STALE_FEED = "STALE_FEED"                # quote stream frozen safety-exit
+
+
+# Stale-quote circuit breaker: force-exit if we have an open position and
+# the option token has not received a WS tick for this many seconds.
+# 0 disables the check (backward compatible / dev only).
+STALE_QUOTE_EXIT_SEC: int = int(os.environ.get("STALE_QUOTE_EXIT_SEC", "25"))
 
 
 # ────────────────────────────────────────────────────────────────────

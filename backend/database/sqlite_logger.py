@@ -131,6 +131,14 @@ class SqliteLogger:
                 "ALTER TABLE trades ADD COLUMN expiry TEXT",
                 "ALTER TABLE trades ADD COLUMN option_type TEXT",
                 "ALTER TABLE trades ADD COLUMN lot_size INTEGER",
+                # v1.9 — protection-state telemetry
+                "ALTER TABLE trades ADD COLUMN initial_sl_price REAL",
+                "ALTER TABLE trades ADD COLUMN initial_tp_price REAL",
+                "ALTER TABLE trades ADD COLUMN final_stop_price REAL",
+                "ALTER TABLE trades ADD COLUMN trail_bumps INTEGER",
+                "ALTER TABLE trades ADD COLUMN highest_ltp REAL",
+                "ALTER TABLE trades ADD COLUMN lowest_ltp REAL",
+                "ALTER TABLE trades ADD COLUMN exit_trigger TEXT",
             ):
                 try:
                     cur.execute(ddl)
@@ -234,12 +242,29 @@ class SqliteLogger:
         pnl: float,
         exit_reason: str,
         exit_time: Optional[str] = None,
+        # v1.9 telemetry (optional; only set from the bot's exit path)
+        final_stop_price: Optional[float] = None,
+        trail_bumps: Optional[int] = None,
+        highest_ltp: Optional[float] = None,
+        lowest_ltp: Optional[float] = None,
+        exit_trigger: Optional[str] = None,
+        initial_sl_price: Optional[float] = None,
+        initial_tp_price: Optional[float] = None,
     ) -> None:
         with self._cursor() as cur:
             cur.execute(
-                "UPDATE trades SET exit_time=?, exit_price=?, pnl=?, exit_reason=? "
+                "UPDATE trades SET exit_time=?, exit_price=?, pnl=?, exit_reason=?, "
+                "final_stop_price=COALESCE(?, final_stop_price), "
+                "trail_bumps=COALESCE(?, trail_bumps), "
+                "highest_ltp=COALESCE(?, highest_ltp), "
+                "lowest_ltp=COALESCE(?, lowest_ltp), "
+                "exit_trigger=COALESCE(?, exit_trigger), "
+                "initial_sl_price=COALESCE(?, initial_sl_price), "
+                "initial_tp_price=COALESCE(?, initial_tp_price) "
                 "WHERE trade_id=?",
-                (exit_time or _utc_iso(), exit_price, pnl, exit_reason, trade_id),
+                (exit_time or _utc_iso(), exit_price, pnl, exit_reason,
+                 final_stop_price, trail_bumps, highest_ltp, lowest_ltp,
+                 exit_trigger, initial_sl_price, initial_tp_price, trade_id),
             )
 
     def log_equity_point(

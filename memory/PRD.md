@@ -333,3 +333,91 @@ Indicator Engine, SMC weights, SMC confidence weights, HTF weight (+20),
 `RECENT_EVENT_BARS`, regime thresholds/multipliers, `SWING_WINDOW`,
 trailing SL, SL%, TP%, Telegram alerts, signal generation, entry logic.
 
+
+## Session update (2026-02-06 — protection telemetry & audit trail, v1.9)
+
+### What this pass shipped
+Following the T-8261be7125 execution audit, all 5 quality-of-life
+improvements requested by the user landed together, with no algorithm
+changes to Indicator/SMC/entry logic.
+
+#### P0 — Stale-quote circuit breaker
+- New `config.STALE_QUOTE_EXIT_SEC` (default 25s, env-overridable, 0 disables).
+- `_step_position_open` reads the option quote's `ts` field; when the
+  position has been held for at least the threshold AND the last tick is
+  older than the threshold, fires `FORCED_EXIT` with reason `STALE_FEED`.
+- Prevents the "frozen ₹63 LTP" scenario from ever becoming a real loss:
+  when the feed dies, the bot flattens instead of drifting to the
+  time-stop.
+- New `ExitReason.STALE_FEED` enum value.
+
+#### P0 — Protection-state telemetry on every trade row
+- Six new columns on `trades` (idempotent migration):
+  `initial_sl_price`, `initial_tp_price`, `final_stop_price`,
+  `trail_bumps`, `highest_ltp`, `lowest_ltp`, `exit_trigger`.
+- `OpenPosition` now carries live counterparts (`initial_stop_price`,
+  `initial_target_price`, `trail_bumps`, `highest_ltp_seen`,
+  `lowest_ltp_seen`), updated on every tick.
+- `_finalize_exit` writes them all through `update_trade_exit(...)`.
+- **Result**: future audits like the T-8261be7125 debate can be answered
+  in a single SQL query — no arithmetic reconstruction, no ambiguity
+  about whether trailing fired.
+
+#### P1 — TRAILING_STOP vs STOP_LOSS exit-reason differentiation
+- New `ExitReason.TRAILING_STOP` enum value.
+- `_finalize_exit` inspects `pos.trail_bumps` and `pos.stop_price >
+  pos.initial_stop_price` — labels the exit `TRAILING_STOP` when trailing
+  fired at least once, `STOP_LOSS` otherwise. Preserves the explicit
+  `reason` override used by MAX_HOLD/SQUARE_OFF/MANUAL/etc.
+
+#### P1 — Persist trail_anchor across restart
+- New `_persist_live_position_state()` writes a snapshot of the position's
+  mutable protection state (stop_price, trail_anchor, trail_bumps,
+  hi/lo/initial fields) into `bot_state.live_position` on every trail
+  bump — cheap, one INSERT OR REPLACE per bump (rare).
+- `_recover_orphan_trade` reads the snapshot at boot, guards against
+  stale snapshots via `trade_id + contract_token` match, and restores
+  the position with the correct anchor. Trailing resumes from where it
+  left off; no more "restart resets anchor to entry".
+
+#### P1 — Post-place broker verification
+- After `_place_protective_legs` places both legs, `_verify_protection_legs_placed()`
+  peeks at `broker.order_book()` and confirms both ids are present with
+  a non-terminal status. If missing, `_retry_missing_protection_legs()`
+  re-places ONLY the missing leg(s) (never duplicates a leg that's
+  already resting). If still missing on the second look, force
+  `REJECTED`-labelled forced exit. If `order_book()` itself raises,
+  we don't flip to false-negative flatten (fail-open — safer).
+
+### Files modified
+- `backend/config.py` — new ExitReason values + STALE_QUOTE_EXIT_SEC
+- `backend/database/sqlite_logger.py` — 7 new columns + extended
+  `update_trade_exit(...)`
+- `backend/strategy/position_manager.py` — OpenPosition telemetry fields +
+  trail_bumps increment inside `maybe_trail_stop`
+- `backend/main.py` — stale-quote CB, live_position snapshot,
+  orphan-recovery restore, protection-leg verification + retry, exit
+  reason differentiation, hi/lo tracking on the smoothed LTP
+- `backend/tests/test_execution_correctness.py` — +7 new regression tests
+
+### Test results
+- **104 passed** (was 97; +7 new). Zero regressions.
+- Backend restart clean; `/api/bot/status` → HTTP 200.
+- Live DB migration verified: all 7 new columns present in
+  `/app/backend/data_store/nifty_bot.db`.
+
+### T-8261be7125 status
+The audit's inference was **correct** — trailing SL fired once from
+₹71.485 to ₹79.895 after the option touched ≥ ₹92.51. With v1.9 in
+place, the same audit for future trades reduces to:
+```
+SELECT trade_id, initial_sl_price, final_stop_price, trail_bumps,
+       highest_ltp, exit_trigger FROM trades WHERE trade_id='...';
+```
+No arithmetic, no inference.
+
+### Untouched (per your explicit hold)
+Indicator Engine, SMC weights, HTF trend logic, RECENT_EVENT_BARS,
+regime thresholds/multipliers, SWING_WINDOW, trailing SL step,
+SL%/TP%, Telegram alerts, signal generation, entry logic.
+

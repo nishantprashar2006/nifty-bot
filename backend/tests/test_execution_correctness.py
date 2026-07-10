@@ -647,3 +647,263 @@ def test_refresh_atm_command_calls_refresh():
         )
     bot._drain_command_queue()
     assert called["n"] == 1
+
+
+# ─────────────────────────────────────────── v1.9 — protection telemetry
+def test_promote_to_open_freezes_initial_sl_and_tp():
+    """v1.9: `initial_stop_price` and `initial_target_price` must be
+    frozen at promotion time so audits can compare against them later."""
+    pm = PositionManager()
+    p = PendingEntry(
+        order_id="O", direction=Direction.LONG,
+        contract_symbol="X", contract_token="1",
+        expected_price=100.0, lots=1, qty=65,
+        target_price=130.0, stop_price=85.0,
+        sl_pct=0.15, tp_pct=0.30, trail_step_pct=0.10,
+    )
+    pm.register_pending_entry(p)
+    pos = pm.promote_to_open(fill_price=100.0)
+    assert pos.initial_stop_price == pytest.approx(85.0)
+    assert pos.initial_target_price == pytest.approx(130.0)
+    assert pos.trail_bumps == 0
+    assert pos.highest_ltp_seen == pytest.approx(100.0)
+    assert pos.lowest_ltp_seen == pytest.approx(100.0)
+
+
+def test_maybe_trail_stop_increments_bump_counter():
+    """v1.9: every stop bump must increment `trail_bumps` so we can
+    distinguish 'stop untouched' from 'stop moved N times' after the fact."""
+    pm = PositionManager()
+    p = PendingEntry(
+        order_id="O", direction=Direction.LONG,
+        contract_symbol="X", contract_token="1",
+        expected_price=100.0, lots=1, qty=65,
+        target_price=130.0, stop_price=85.0,
+        sl_pct=0.15, tp_pct=0.30, trail_step_pct=0.10,   # step = 10
+    )
+    pm.register_pending_entry(p)
+    pos = pm.promote_to_open(fill_price=100.0)
+    assert pos.trail_bumps == 0
+    # First bump: premium ≥ 110 → step of 10 → new stop 95
+    new_stop = pm.maybe_trail_stop(current_premium=115.0)
+    assert new_stop == pytest.approx(95.0)
+    assert pos.trail_bumps == 1
+    # Same premium: no bump
+    same = pm.maybe_trail_stop(current_premium=115.0)
+    assert same is None
+    assert pos.trail_bumps == 1
+    # Bigger jump: premium ≥ 125 relative to new anchor 110 → +10 bump
+    pm.maybe_trail_stop(current_premium=125.0)
+    assert pos.trail_bumps == 2
+
+
+def test_finalize_exit_uses_trailing_stop_label_when_bumped():
+    """v1.9: an SL exit after trail bumps must be labelled TRAILING_STOP,
+    not STOP_LOSS. This is the exact regression the T-8261be7125 audit
+    would have solved in one query."""
+    from main import NiftyOptionsBot
+    bot = NiftyOptionsBot.__new__(NiftyOptionsBot)
+    bot._state_lock = __import__("threading").RLock()
+    bot.state = config.State.POSITION_OPEN
+    bot.db = SqliteLogger(tempfile.mktemp(suffix=".db"))
+    bot.positions = PositionManager()
+    bot.pnl_guard = PnlGuard(-2000)
+    bot._trades_today = 0
+    bot._consecutive_losses = 0
+    bot._cooldown_until = None
+    bot.broker = MagicMock()
+    bot.broker.cancel_order = MagicMock()
+
+    # Simulate a promoted position that has trailed twice
+    p = PendingEntry(
+        order_id="O", direction=Direction.LONG,
+        contract_symbol="NIFTY24500CE", contract_token="111",
+        expected_price=84.10, lots=1, qty=65,
+        target_price=109.33, stop_price=71.49,
+        strike=24500, expiry="10JUL26", option_type="CE", lot_size=65,
+        sl_pct=0.15, tp_pct=0.30, trail_step_pct=0.10,
+    )
+    bot.positions.register_pending_entry(p)
+    pos = bot.positions.promote_to_open(84.10)
+    # Simulate one trail bump: stop_price moved beyond initial
+    pos.stop_price = 79.895
+    pos.trail_anchor = 92.51
+    pos.trail_bumps = 1
+
+    # Insert a trade row so update_trade_exit has something to UPDATE
+    bot.db.insert_trade_entry(
+        trade_id=pos.trade_id, direction="CALL", qty=pos.qty,
+        entry_price=pos.entry_price, source="manual",
+        contract_symbol=pos.contract_symbol, contract_token=pos.contract_token,
+    )
+    bot._finalize_exit(exit_price=79.85, was_stop=True)
+
+    with bot.db._cursor() as cur:
+        row = dict(zip(
+            [c[0] for c in cur.execute(
+                "SELECT exit_reason, exit_trigger, trail_bumps, final_stop_price, "
+                "initial_sl_price FROM trades WHERE trade_id=?", (pos.trade_id,),
+            ).description],
+            cur.execute(
+                "SELECT exit_reason, exit_trigger, trail_bumps, final_stop_price, "
+                "initial_sl_price FROM trades WHERE trade_id=?", (pos.trade_id,),
+            ).fetchone(),
+        ))
+    assert row["exit_reason"] == "TRAILING_STOP"
+    assert row["exit_trigger"] == "TRAILING_STOP"
+    assert row["trail_bumps"] == 1
+    assert row["final_stop_price"] == pytest.approx(79.895)
+    assert row["initial_sl_price"] == pytest.approx(71.485)
+
+
+def test_finalize_exit_keeps_stop_loss_label_when_never_bumped():
+    """Complement to the above: SL exit without any trail bump stays
+    labelled STOP_LOSS. Ensures we haven't broken the initial-SL case."""
+    from main import NiftyOptionsBot
+    bot = NiftyOptionsBot.__new__(NiftyOptionsBot)
+    bot._state_lock = __import__("threading").RLock()
+    bot.state = config.State.POSITION_OPEN
+    bot.db = SqliteLogger(tempfile.mktemp(suffix=".db"))
+    bot.positions = PositionManager()
+    bot.pnl_guard = PnlGuard(-2000)
+    bot._trades_today = 0
+    bot._consecutive_losses = 0
+    bot._cooldown_until = None
+    bot.broker = MagicMock()
+    bot.broker.cancel_order = MagicMock()
+
+    p = PendingEntry(
+        order_id="O", direction=Direction.LONG,
+        contract_symbol="X", contract_token="1",
+        expected_price=100.0, lots=1, qty=65,
+        target_price=130.0, stop_price=85.0,
+        sl_pct=0.15, tp_pct=0.30, trail_step_pct=0.10,
+    )
+    bot.positions.register_pending_entry(p)
+    pos = bot.positions.promote_to_open(100.0)
+    # trail_bumps stays 0, stop stays at initial
+    bot.db.insert_trade_entry(
+        trade_id=pos.trade_id, direction="CALL", qty=65, entry_price=100.0,
+        source="manual",
+    )
+    bot._finalize_exit(exit_price=85.0, was_stop=True)
+    with bot.db._cursor() as cur:
+        (reason, bumps) = cur.execute(
+            "SELECT exit_reason, trail_bumps FROM trades WHERE trade_id=?",
+            (pos.trade_id,),
+        ).fetchone()
+    assert reason == "STOP_LOSS"
+    assert bumps == 0
+
+
+# ─────────────────────────────────────────── v1.9 — stale-quote breaker
+def test_stale_quote_breaker_transitions_to_forced_exit(monkeypatch):
+    """v1.9 P0: if the WS hasn't ticked the open position's token for
+    > STALE_QUOTE_EXIT_SEC while the position has been held for at least
+    that long, the bot must fire a STALE_FEED forced exit rather than
+    sit unprotected."""
+    from main import NiftyOptionsBot
+    from strategy.position_manager import OpenPosition
+    from datetime import datetime, timezone, timedelta, time as _time
+
+    bot = NiftyOptionsBot.__new__(NiftyOptionsBot)
+    bot._state_lock = __import__("threading").RLock()
+    bot.state = config.State.POSITION_OPEN
+    bot.db = SqliteLogger(tempfile.mktemp(suffix=".db"))
+    bot.positions = PositionManager()
+    bot._last_option_quote = {}
+    bot._exit_reason_hint = None
+    bot._ltp_history = {}
+    bot._pending_source = None
+
+    monkeypatch.setattr(config, "STALE_QUOTE_EXIT_SEC", 20)
+    # Prevent the intraday square-off from firing during unit tests
+    monkeypatch.setattr(config, "INTRADAY_SQUARE_OFF", _time(23, 59))
+    # Position opened 60s ago; WS quote is 90s old
+    now = datetime.now(timezone.utc)
+    bot.positions._open = OpenPosition(
+        trade_id="T1", direction=Direction.LONG,
+        contract_symbol="X", contract_token="TOKX",
+        qty=65, lots=1, entry_price=100.0,
+        entry_ts=now - timedelta(seconds=60),
+        target_price=130.0, stop_price=85.0,
+    )
+    import time as _t
+    bot._last_option_quote["TOKX"] = {
+        "ltp": 100.0, "ts": _t.time() - 90, "source": "ws",
+    }
+    bot._step_position_open()
+    assert bot.state is config.State.FORCED_EXIT
+    assert bot._exit_reason_hint == "STALE_FEED"
+
+
+def test_stale_quote_breaker_skips_when_disabled(monkeypatch):
+    """STALE_QUOTE_EXIT_SEC = 0 disables the check (dev / off-hours)."""
+    from main import NiftyOptionsBot
+    from strategy.position_manager import OpenPosition
+    from datetime import datetime, timezone, timedelta, time as _time
+
+    bot = NiftyOptionsBot.__new__(NiftyOptionsBot)
+    bot._state_lock = __import__("threading").RLock()
+    bot.state = config.State.POSITION_OPEN
+    bot.db = SqliteLogger(tempfile.mktemp(suffix=".db"))
+    bot.positions = PositionManager()
+    bot._last_option_quote = {}
+    bot._exit_reason_hint = None
+    bot._ltp_history = {}
+    bot._pending_source = None
+
+    monkeypatch.setattr(config, "STALE_QUOTE_EXIT_SEC", 0)   # disabled
+    # Prevent the intraday square-off from firing during unit tests
+    monkeypatch.setattr(config, "INTRADAY_SQUARE_OFF", _time(23, 59))
+    now = datetime.now(timezone.utc)
+    bot.positions._open = OpenPosition(
+        trade_id="T1", direction=Direction.LONG,
+        contract_symbol="X", contract_token="TOKX",
+        qty=65, lots=1, entry_price=100.0,
+        entry_ts=now - timedelta(seconds=30),
+        target_price=130.0, stop_price=85.0,
+    )
+    bot._last_option_quote["TOKX"] = {"ltp": 100.0, "ts": 0.0, "source": "ws"}
+    bot._step_position_open()
+    # Must NOT flip to FORCED_EXIT
+    assert bot.state is config.State.POSITION_OPEN
+
+
+# ─────────────────────────────────────────── v1.9 — live_position snapshot
+def test_live_position_snapshot_persists_and_restores_trail_anchor():
+    """v1.9 P1: after a trail bump we snapshot trail_anchor + bumps into
+    bot_state.live_position. A subsequent restore must give us BACK the
+    same trail_anchor / bumps / stop_price."""
+    from main import NiftyOptionsBot
+    bot = NiftyOptionsBot.__new__(NiftyOptionsBot)
+    bot.db = SqliteLogger(tempfile.mktemp(suffix=".db"))
+    bot.positions = PositionManager()
+
+    p = PendingEntry(
+        order_id="O", direction=Direction.LONG,
+        contract_symbol="X", contract_token="TOKZ",
+        expected_price=100.0, lots=1, qty=65,
+        target_price=130.0, stop_price=85.0,
+        sl_pct=0.15, tp_pct=0.30, trail_step_pct=0.10,
+    )
+    bot.positions.register_pending_entry(p)
+    pos = bot.positions.promote_to_open(100.0)
+    pos.stop_price = 95.0
+    pos.trail_anchor = 110.0
+    pos.trail_bumps = 1
+    pos.highest_ltp_seen = 118.0
+
+    bot._persist_live_position_state()
+
+    row = bot.db.get_state("live_position")
+    assert row is not None
+    import json
+    snap = json.loads(row[0])
+    assert snap["trade_id"] == pos.trade_id
+    assert snap["contract_token"] == "TOKZ"
+    assert snap["stop_price"] == pytest.approx(95.0)
+    assert snap["trail_anchor"] == pytest.approx(110.0)
+    assert snap["trail_bumps"] == 1
+    assert snap["highest_ltp_seen"] == pytest.approx(118.0)
+

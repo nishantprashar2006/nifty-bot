@@ -308,6 +308,40 @@ class NiftyOptionsBot:
             stop_px = float(row["sl_price"] or entry_px * (1 - config.MANUAL_SL_PCT))
             target_px = float(row["tp_price"] or entry_px * (1 + config.MANUAL_TP_PCT))
 
+            # v1.9 P1 — if we snapshotted the live protection state before
+            # restart, restore trail_anchor / bumps / hi-lo from it. Guard
+            # by trade_id + token so a stale snapshot from a previous trade
+            # never contaminates the recovery.
+            trail_anchor = entry_px
+            trail_bumps = 0
+            initial_stop = stop_px
+            initial_target = target_px
+            hi_ltp = entry_px
+            lo_ltp = entry_px
+            trail_step_pct = config.TRAIL_STEP_PCT
+            try:
+                import json as _json
+                snap_row = self.db.get_state("live_position")
+                if snap_row:
+                    snap = _json.loads(snap_row[0])
+                    if (snap.get("trade_id") == trade_id
+                            and str(snap.get("contract_token")) == token):
+                        stop_px = float(snap.get("stop_price") or stop_px)
+                        trail_anchor = float(snap.get("trail_anchor") or entry_px)
+                        trail_bumps = int(snap.get("trail_bumps") or 0)
+                        initial_stop = float(snap.get("initial_stop_price") or stop_px)
+                        initial_target = float(snap.get("initial_target_price") or target_px)
+                        hi_ltp = float(snap.get("highest_ltp_seen") or entry_px)
+                        lo_ltp = float(snap.get("lowest_ltp_seen") or entry_px)
+                        trail_step_pct = float(snap.get("trail_step_pct") or config.TRAIL_STEP_PCT)
+                        logger.warning(
+                            "Boot recovery: restored trail state — anchor=₹%.2f "
+                            "stop=₹%.2f bumps=%d hi=₹%.2f",
+                            trail_anchor, stop_px, trail_bumps, hi_ltp,
+                        )
+            except Exception:
+                logger.exception("live_position snapshot restore failed (using defaults)")
+
             from strategy.position_manager import OpenPosition
             pos = OpenPosition(
                 trade_id=trade_id,
@@ -322,8 +356,13 @@ class NiftyOptionsBot:
                 stop_price=stop_px,
                 target_order_id=tp_id,
                 stop_order_id=sl_id,
-                trail_anchor=entry_px,
-                trail_step_pct=config.TRAIL_STEP_PCT,
+                trail_anchor=trail_anchor,
+                trail_step_pct=trail_step_pct,
+                initial_stop_price=initial_stop,
+                initial_target_price=initial_target,
+                trail_bumps=trail_bumps,
+                highest_ltp_seen=hi_ltp,
+                lowest_ltp_seen=lo_ltp,
             )
             self.positions.adopt_open_position(pos)
             self._transition(config.State.POSITION_OPEN)
@@ -714,6 +753,36 @@ class NiftyOptionsBot:
             # Diagnostics must never crash the main loop.
             pass
 
+    def _persist_live_position_state(self) -> None:
+        """v1.9 P1: snapshot the open position's mutable protection state
+        into bot_state.live_position so an unexpected restart can resume
+        trailing from the CURRENT anchor rather than resetting to entry.
+
+        Written on every trail bump (rare) — not every tick — to keep DB
+        churn low.
+        """
+        try:
+            import json as _json
+            pos = self.positions.open_position
+            if pos is None:
+                return
+            snap = {
+                "trade_id": pos.trade_id,
+                "contract_token": pos.contract_token,
+                "stop_price": pos.stop_price,
+                "trail_anchor": pos.trail_anchor,
+                "trail_bumps": pos.trail_bumps,
+                "trail_step_pct": pos.trail_step_pct,
+                "initial_stop_price": pos.initial_stop_price,
+                "initial_target_price": pos.initial_target_price,
+                "highest_ltp_seen": pos.highest_ltp_seen,
+                "lowest_ltp_seen": pos.lowest_ltp_seen,
+                "ts": time.time(),
+            }
+            self.db.set_state("live_position", _json.dumps(snap))
+        except Exception:
+            logger.exception("Failed to persist live_position state (ignored)")
+
     def _on_order(self, ev: OrderEvent) -> None:
         # Once terminal, ignore everything (prevents SHUTDOWN ↔ FORCED_EXIT loop)
         if self.state is config.State.SHUTDOWN:
@@ -1014,9 +1083,106 @@ class NiftyOptionsBot:
                 "Protective OCO armed [SL=%s]: tgt=%s sl=%s  (target ₹%.2f, stop ₹%.2f)",
                 config.SL_ORDER_TYPE, tgt_id, sl_id, target_price, stop_price,
             )
+            # v1.9 P1 — Post-place broker verification. Give SmartAPI a
+            # brief moment to accept both legs, then confirm they appear
+            # in the order book with an open/trigger_pending status. If
+            # either is missing, retry once, then flatten defensively.
+            if not self._verify_protection_legs_placed(tgt_id, sl_id):
+                logger.warning(
+                    "Protection legs not visible in order book after place; "
+                    "retrying once before forcing exit.",
+                )
+                # One targeted retry — only re-place the missing leg(s)
+                self._retry_missing_protection_legs(pos, target_price, stop_price)
+                if not self._verify_protection_legs_placed(
+                    self.positions.open_position.target_order_id if self.positions.open_position else tgt_id,
+                    self.positions.open_position.stop_order_id if self.positions.open_position else sl_id,
+                ):
+                    logger.critical(
+                        "Protection legs still missing after retry — "
+                        "flattening position defensively.",
+                    )
+                    self._exit_reason_hint = config.ExitReason.REJECTED.value
+                    self._transition(config.State.FORCED_EXIT)
         except SmartApiError as exc:
             logger.exception("Failed to arm OCO: %s", exc)
             self._transition(config.State.FORCED_EXIT)
+
+    def _verify_protection_legs_placed(
+        self, tgt_id: Optional[str], sl_id: Optional[str],
+    ) -> bool:
+        """v1.9 P1: peek at the broker order book and confirm both protective
+        legs are actually resting there. Returns True only when BOTH ids are
+        found with a non-terminal status.
+        """
+        try:
+            ob = self.broker.order_book() or []
+        except Exception:
+            # If we can't read the book, don't force a false-negative flatten.
+            # We assume the place calls that returned an id are honoured.
+            logger.exception("order_book() failed during protection verify")
+            return True
+        ok_ids = {tgt_id, sl_id} - {None}
+        found: set[str] = set()
+        for o in ob:
+            oid = str(o.get("orderid") or "")
+            if oid in ok_ids:
+                status = str(o.get("status") or o.get("orderstatus") or "").lower()
+                if status in {"open", "trigger pending", "trigger_pending", "pending"}:
+                    found.add(oid)
+        missing = ok_ids - found
+        if missing:
+            logger.warning("Protection legs missing in order book: %s", missing)
+            return False
+        return True
+
+    def _retry_missing_protection_legs(
+        self, pos, target_price: float, stop_price: float,
+    ) -> None:
+        """v1.9 P1: single-shot retry of whichever leg is missing.
+        Deliberately narrow — we do NOT re-place a leg whose id we can still
+        see in the order book, to avoid duplicate protection.
+        """
+        try:
+            ob = self.broker.order_book() or []
+        except Exception:
+            return
+        alive: set[str] = set()
+        for o in ob:
+            status = str(o.get("status") or o.get("orderstatus") or "").lower()
+            if status in {"open", "trigger pending", "trigger_pending", "pending"}:
+                alive.add(str(o.get("orderid") or ""))
+        # Re-place only the missing ones
+        if pos.target_order_id not in alive:
+            try:
+                new_tgt = self.broker.place_order({
+                    "variety": "NORMAL", "tradingsymbol": pos.contract_symbol,
+                    "symboltoken": pos.contract_token, "transactiontype": "SELL",
+                    "exchange": "NFO", "ordertype": "LIMIT",
+                    "producttype": "INTRADAY", "duration": "DAY",
+                    "price": round(target_price, 2), "quantity": pos.qty,
+                })
+                self.positions.set_protective_orders(new_tgt, pos.stop_order_id)
+            except Exception:
+                logger.exception("Retry: target leg re-place failed")
+        if pos.stop_order_id not in alive:
+            try:
+                sl_payload = {
+                    "variety": "NORMAL", "tradingsymbol": pos.contract_symbol,
+                    "symboltoken": pos.contract_token, "transactiontype": "SELL",
+                    "exchange": "NFO", "ordertype": config.SL_ORDER_TYPE,
+                    "producttype": "INTRADAY", "duration": "DAY",
+                    "price": "0" if config.SL_ORDER_TYPE == "STOPLOSS_MARKET"
+                             else round(stop_price, 2),
+                    "triggerprice": round(stop_price, 2)
+                                    if config.SL_ORDER_TYPE == "STOPLOSS_MARKET"
+                                    else round(stop_price * 1.001, 2),
+                    "quantity": pos.qty,
+                }
+                new_sl = self.broker.place_order(sl_payload)
+                self.positions.set_protective_orders(pos.target_order_id, new_sl)
+            except Exception:
+                logger.exception("Retry: SL leg re-place failed")
 
     def _finalize_exit(
         self, exit_price: float, was_stop: bool,
@@ -1034,22 +1200,37 @@ class NiftyOptionsBot:
                 pass
 
         pnl = (exit_price - pos.entry_price) * pos.qty
-        # Prefer an explicit reason if the caller supplied one — that lets
-        # MAX_HOLD, SQUARE_OFF, MANUAL, and HEARTBEAT paths label themselves
-        # correctly instead of everything being flattened to STOP_LOSS/TARGET.
+        # v1.9 — distinguish INITIAL_SL from TRAILING_STOP. If the current
+        # stop is above the initial stop (any bump ever happened) and the
+        # exit was on the stop side, it's a trailing stop, not a raw SL.
         if reason:
             resolved = reason
         elif was_stop:
-            resolved = config.ExitReason.STOP_LOSS.value
+            if pos.trail_bumps > 0 and pos.stop_price > pos.initial_stop_price:
+                resolved = config.ExitReason.TRAILING_STOP.value
+            else:
+                resolved = config.ExitReason.STOP_LOSS.value
         else:
             resolved = config.ExitReason.TARGET.value
-        self.db.update_trade_exit(pos.trade_id, exit_price, pnl, resolved)
+        self.db.update_trade_exit(
+            pos.trade_id, exit_price, pnl, resolved,
+            final_stop_price=pos.stop_price,
+            trail_bumps=pos.trail_bumps,
+            highest_ltp=pos.highest_ltp_seen or None,
+            lowest_ltp=pos.lowest_ltp_seen or None,
+            exit_trigger=resolved,
+            initial_sl_price=pos.initial_stop_price or None,
+            initial_tp_price=pos.initial_target_price or None,
+        )
         self.pnl_guard.add_realized(pnl)
         self._trades_today += 1
         self._consecutive_losses = self._consecutive_losses + 1 if pnl < 0 else 0
         logger.info(
-            "Trade closed %s pnl=₹%.2f trades_today=%d consec_loss=%d",
-            resolved, pnl, self._trades_today, self._consecutive_losses,
+            "Trade closed %s pnl=₹%.2f trail_bumps=%d hi=%.2f lo=%.2f "
+            "final_stop=%.2f (initial=%.2f) trades_today=%d consec_loss=%d",
+            resolved, pnl, pos.trail_bumps, pos.highest_ltp_seen,
+            pos.lowest_ltp_seen, pos.stop_price, pos.initial_stop_price,
+            self._trades_today, self._consecutive_losses,
         )
         self._enter_cooldown()
 
@@ -1422,6 +1603,27 @@ class NiftyOptionsBot:
 
         q = self._last_option_quote.get(pos.contract_token, {})
         raw_ltp = q.get("ltp")
+        quote_ts = float(q.get("ts") or 0.0)
+
+        # v1.9 P0 — Stale-quote circuit breaker
+        # If we have an open position but the WS hasn't ticked this token
+        # for STALE_QUOTE_EXIT_SEC seconds AND we've held it for at least
+        # that long (avoid firing during the seed-only first second), force
+        # a MARKET exit rather than sit unprotected. The synthetic SL/TP
+        # comparators below can't fire without a live LTP — this is the
+        # only path that catches a truly frozen feed. Skipped if the CB is
+        # disabled (STALE_QUOTE_EXIT_SEC = 0).
+        if config.STALE_QUOTE_EXIT_SEC > 0 and pos.age_seconds() >= config.STALE_QUOTE_EXIT_SEC:
+            age = (time.time() - quote_ts) if quote_ts > 0 else float("inf")
+            if age > config.STALE_QUOTE_EXIT_SEC:
+                logger.warning(
+                    "Stale-quote breaker: %s no ticks for %.1fs (threshold %ds) "
+                    "→ firing STALE_FEED exit to preserve capital.",
+                    pos.contract_symbol, age, config.STALE_QUOTE_EXIT_SEC,
+                )
+                self._exit_reason_hint = config.ExitReason.STALE_FEED.value
+                self._transition(config.State.FORCED_EXIT)
+                return
 
         # 3-tick median smoothing on the LTP used for synthetic SL/TP and
         # trailing-SL evaluation. Same source quote as before; only the value
@@ -1437,6 +1639,14 @@ class NiftyOptionsBot:
             hist.append(raw_ltp)
             ordered = sorted(hist)
             ltp = ordered[len(ordered) // 2]   # median of last ≤3 ticks
+
+            # v1.9 telemetry — record extremes on the smoothed LTP so single
+            # spike ticks don't skew the audit numbers. Updated in place on
+            # the OpenPosition dataclass; persisted at close.
+            if pos.highest_ltp_seen == 0.0 or ltp > pos.highest_ltp_seen:
+                pos.highest_ltp_seen = ltp
+            if pos.lowest_ltp_seen == 0.0 or ltp < pos.lowest_ltp_seen:
+                pos.lowest_ltp_seen = ltp
 
         # ── Synthetic SL/TP enforcement (PRIMARY in SIM, SAFETY-NET in LIVE)
         # The protective legs we placed on the broker may not fire on time:
@@ -1464,6 +1674,12 @@ class NiftyOptionsBot:
         # trail stop using latest premium (same smoothed LTP)
         if ltp:
             new_stop = self.positions.maybe_trail_stop(ltp)
+            if new_stop is not None:
+                # v1.9 P1 — persist the live position state on every trail
+                # bump so a mid-trade restart resumes from the CURRENT
+                # anchor, not from `entry_price`. Cheap: single INSERT OR
+                # REPLACE into bot_state.
+                self._persist_live_position_state()
             if new_stop is not None and pos.stop_order_id:
                 # PART 3 §15 — cancel-replace SL atomically. If the cancel
                 # succeeds but the replace fails, the position has NO active
