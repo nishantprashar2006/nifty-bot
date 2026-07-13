@@ -65,6 +65,9 @@ class Event:
     # safety
     STALE_FEED        = "STALE_FEED"
     FORCED_EXIT       = "FORCED_EXIT"
+    # v1.12 — ORDER_PENDING timeout reconciliation
+    ORDER_PENDING_RECONCILE_ORDERBOOK = "ORDER_PENDING_RECONCILE_ORDERBOOK"
+    ORDER_PENDING_RECONCILE_POSITION  = "ORDER_PENDING_RECONCILE_POSITION"
     # informational
     NOTE              = "NOTE"
 

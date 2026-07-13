@@ -1706,6 +1706,27 @@ class NiftyOptionsBot:
             self._transition(config.State.IDLE)
             return
         if p.age_seconds() >= config.ORDER_TIMEOUT_SEC:
+            # v1.12 — Fix A + Fix B (execution-recovery reconciliation).
+            #
+            # Before firing the legacy cancel-and-go-IDLE branch, verify with
+            # the broker whether the order actually filled. The WebSocket
+            # `on_order(status="complete")` event is the primary source of
+            # truth, but it can be missed by the SDK (reconnect straddle,
+            # swallowed exception, unrecognised status string, or plain
+            # delivery latency > ORDER_TIMEOUT_SEC). When that happens the
+            # legacy code left an unprotected live position on the broker.
+            #
+            # Recovery priority (first successful source wins, others
+            # become no-ops via the `pending is None` guard inside
+            # `_handle_fill`):
+            #    1. WebSocket fill  (fired before this branch runs)
+            #    2. order_book()    — Fix A below
+            #    3. positions()     — Fix B below
+            # If NEITHER confirms a fill, we fall through to the original
+            # cancel + IDLE behaviour so today's timeout semantics are
+            # preserved.
+            if self._reconcile_order_pending_timeout(p):
+                return
             logger.warning("Entry order %s unfilled in %ds — cancelling.",
                            p.order_id, config.ORDER_TIMEOUT_SEC)
             if p.order_id and p.order_id not in (None, "None", ""):
@@ -1715,6 +1736,164 @@ class NiftyOptionsBot:
                     logger.exception("cancel_order failed (continuing)")
             self.positions.clear_pending()
             self._transition(config.State.IDLE)
+
+    def _reconcile_order_pending_timeout(self, p: PendingEntry) -> bool:
+        """v1.12 — attempt to recover a missed-WS-fill by asking the broker.
+
+        Returns True if we successfully routed a synthetic fill through the
+        existing `_handle_fill(...)` pipeline (which promotes to
+        POSITION_OPEN, inserts the trade row, places SL/TP, and logs the
+        timeline). Returns False when both broker sources are unable to
+        prove a fill — the caller then executes the legacy cancel branch.
+
+        Idempotency: `_handle_fill` already contains the guard
+            `if pending and ev.order_id == pending.order_id:`
+        so if the WebSocket fill fired between our poll and this method,
+        `self.positions.pending_entry` is None and the synthesized event
+        becomes a no-op. No duplicate promote, no duplicate protection, no
+        duplicate trade row, no duplicate timeline events under trade_id.
+        """
+        # Fast idempotency guard: if the WS fill already promoted this
+        # pending, there is nothing to reconcile.
+        if self.positions.pending_entry is None or self.positions.has_open_position:
+            return False
+
+        session = getattr(self, "_timeline_session", None)
+
+        # ─── Fix A: order_book() reconciliation ────────────────────────
+        try:
+            book = self.broker.order_book() or []
+        except Exception:
+            logger.warning(
+                "reconcile: order_book() raised for %s — falling back to positions()",
+                p.order_id, exc_info=True,
+            )
+            book = None
+
+        if book is not None:
+            matched = None
+            for row in book:
+                try:
+                    if str(row.get("orderid", "")) == str(p.order_id):
+                        matched = row
+                        break
+                except Exception:
+                    continue
+            if matched is not None:
+                status = str(matched.get("status", "")).lower()
+                if status == "complete":
+                    fill_px = (
+                        float(matched.get("averageprice") or 0.0)
+                        or float(matched.get("avg_price") or 0.0)
+                        or float(matched.get("fill_price") or 0.0)
+                        or float(matched.get("price") or 0.0)
+                    )
+                    if fill_px > 0:
+                        logger.warning(
+                            "reconcile: order_book shows %s COMPLETE avg=%.2f — "
+                            "recovering via _handle_fill.",
+                            p.order_id, fill_px,
+                        )
+                        if session:
+                            from execution_timeline import Event
+                            self._tl(
+                                session, Event.ORDER_PENDING_RECONCILE_ORDERBOOK,
+                                f"order_book confirms COMPLETE avg=₹{fill_px:.2f}",
+                                {"order_id": p.order_id,
+                                 "broker_status": status,
+                                 "avg_price": fill_px,
+                                 "trigger_reason": "order_pending_timeout"},
+                            )
+                        ev = OrderEvent(
+                            order_id=str(p.order_id),
+                            status="complete",
+                            fill_price=fill_px,
+                            avg_price=fill_px,
+                            text="reconciled from order_book at ORDER_PENDING timeout",
+                            ts=time.time(),
+                        )
+                        self._handle_fill(ev)
+                        # If _handle_fill promoted the position, we're done.
+                        # (If it aborted via FORCED_EXIT — e.g. slippage guard —
+                        # that is the correct behaviour and matches WS-fill
+                        # semantics; still counts as reconciled.)
+                        return self.positions.pending_entry is None
+
+        # ─── Fix B: positions() reconciliation ────────────────────────
+        try:
+            broker_positions = self.broker.positions() or []
+        except Exception:
+            logger.warning(
+                "reconcile: positions() raised for %s — falling through to cancel/IDLE.",
+                p.order_id, exc_info=True,
+            )
+            return False
+
+        # Locate an NFO position matching our pending: same token OR symbol,
+        # non-zero net qty in the direction we submitted.
+        expected_side = 1 if p.direction is config.Direction.LONG else -1
+        matched_pos = None
+        for bp in broker_positions:
+            try:
+                if str(bp.get("exchange", "")).upper() != "NFO":
+                    continue
+                token_ok = str(bp.get("symboltoken", "")) == str(p.contract_token)
+                sym_ok = str(bp.get("tradingsymbol", "")).upper() == p.contract_symbol.upper()
+                if not (token_ok or sym_ok):
+                    continue
+                net = int(float(bp.get("netqty") or 0))
+                if net == 0:
+                    continue
+                # For options-BUY, the broker net qty is positive on LONG legs.
+                if (expected_side > 0 and net > 0) or (expected_side < 0 and net < 0):
+                    matched_pos = bp
+                    break
+            except Exception:
+                continue
+
+        if matched_pos is None:
+            return False
+
+        fill_px = (
+            float(matched_pos.get("avgnetprice") or 0.0)
+            or float(matched_pos.get("buyavgprice") or 0.0)
+            or float(matched_pos.get("averageprice") or 0.0)
+        )
+        if fill_px <= 0:
+            logger.warning(
+                "reconcile: positions() matched %s but no usable avg price "
+                "(%s) — falling through to cancel/IDLE.",
+                p.contract_symbol, matched_pos,
+            )
+            return False
+
+        logger.warning(
+            "reconcile: positions() shows %s open netqty=%s avg=%.2f — "
+            "recovering via _handle_fill.",
+            p.contract_symbol,
+            matched_pos.get("netqty"), fill_px,
+        )
+        if session:
+            from execution_timeline import Event
+            self._tl(
+                session, Event.ORDER_PENDING_RECONCILE_POSITION,
+                f"positions() confirms open netqty={matched_pos.get('netqty')} avg=₹{fill_px:.2f}",
+                {"symbol": p.contract_symbol,
+                 "token": p.contract_token,
+                 "quantity": matched_pos.get("netqty"),
+                 "avg_price": fill_px,
+                 "trigger_reason": "order_pending_timeout"},
+            )
+        ev = OrderEvent(
+            order_id=str(p.order_id),
+            status="complete",
+            fill_price=fill_px,
+            avg_price=fill_px,
+            text="reconciled from positions() at ORDER_PENDING timeout",
+            ts=time.time(),
+        )
+        self._handle_fill(ev)
+        return self.positions.pending_entry is None
 
     def _step_position_open(self) -> None:
         pos = self.positions.open_position
