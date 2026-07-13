@@ -131,6 +131,28 @@ class NiftyOptionsBot:
         # trade_id on fill via `timeline.rekey_session`).
         self._timeline_session: Optional[str] = None
 
+        # Explicit exit-reason hint for the next FORCED_EXIT / synthetic exit.
+        # Whoever triggers the exit sets this so `_finalize_exit` records the
+        # true cause (TIME_STOP / SQUARE_OFF / MANUAL / HEARTBEAT) instead
+        # of flattening everything to STOP_LOSS.
+        self._exit_reason_hint: Optional[str] = None
+
+        # Rolling per-leg spread history for the liquidity penalty. Storing
+        # the last 3 spread_pct readings per option token lets the penalty
+        # calculation use the median instead of a single tick, so one stale
+        # WebSocket quote can't zero the setup score on its own. Same
+        # formula, same 50-point ceiling — only the input is smoothed.
+        from collections import deque
+        self._spread_history: dict[str, deque] = {}
+        # Rolling per-token LTP history for the SMC synthetic SL/TP and
+        # trailing-SL price reads (shared smoothing primitive with the
+        # spread penalty). Same 3-tick median, same helper.
+        self._ltp_history: dict[str, deque] = {}
+
+        # Telegram notifier — advisory only; never touches trading logic.
+        # Reads env config at construction and swallows any downstream error.
+        self.telegram = TelegramNotifier()
+
     def _tl(self, trade_id: str, event_type: str, message: str, payload: Optional[dict] = None) -> None:
         """v1.10 — SAFE timeline logging shim.
 
@@ -158,28 +180,6 @@ class NiftyOptionsBot:
             tl.rekey_session(session_id, trade_id)
         except Exception:
             pass
-
-        # Explicit exit-reason hint for the next FORCED_EXIT / synthetic exit.
-        # Whoever triggers the exit sets this so `_finalize_exit` records the
-        # true cause (TIME_STOP / SQUARE_OFF / MANUAL / HEARTBEAT) instead
-        # of flattening everything to STOP_LOSS.
-        self._exit_reason_hint: Optional[str] = None
-
-        # Rolling per-leg spread history for the liquidity penalty. Storing
-        # the last 3 spread_pct readings per option token lets the penalty
-        # calculation use the median instead of a single tick, so one stale
-        # WebSocket quote can't zero the setup score on its own. Same
-        # formula, same 50-point ceiling — only the input is smoothed.
-        from collections import deque
-        self._spread_history: dict[str, deque] = {}
-        # Rolling per-token LTP history for the SMC synthetic SL/TP and
-        # trailing-SL price reads (shared smoothing primitive with the
-        # spread penalty). Same 3-tick median, same helper.
-        self._ltp_history: dict[str, deque] = {}
-
-        # Telegram notifier — advisory only; never touches trading logic.
-        # Reads env config at construction and swallows any downstream error.
-        self.telegram = TelegramNotifier()
 
     # ────────────────────────────────────────────────────────── lifecycle
     def start(self) -> None:
@@ -237,7 +237,9 @@ class NiftyOptionsBot:
         # One-off Telegram startup ping — proves the bot is alive and the
         # credentials are configured. No-op if TELEGRAM_ENABLED=false.
         try:
-            self.telegram.send_startup()
+            tg = getattr(self, "telegram", None)
+            if tg is not None:
+                tg.send_startup()
         except Exception:
             logger.exception("Telegram startup ping raised (ignored)")
 
@@ -1645,7 +1647,9 @@ class NiftyOptionsBot:
             self.db.set_state("smc_score", json.dumps(payload))
             # Advisory notification — swallows all Telegram errors internally.
             try:
-                self.telegram.maybe_notify_smc(payload)
+                tg = getattr(self, "telegram", None)
+                if tg is not None:
+                    tg.maybe_notify_smc(payload)
             except Exception:
                 logger.exception("Telegram maybe_notify_smc raised (ignored)")
         except Exception:
