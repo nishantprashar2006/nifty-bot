@@ -548,3 +548,27 @@ position sizing, Telegram alerts, existing API behavior.
 - **Full suite:** 148/148 passing (139 pre-existing + 9 new). Testing agent iteration_6 → PASS. Frontend smoke screenshot confirmed dashboard still renders.
 - **Explicitly deferred per user:** automatic lot reduction, automatic margin optimization, automatic retries, dashboard redesign, background reconciliation thread, new FSM states.
 
+
+## 2026-02-06 — P0/P1: Live Execution Hardening (v1.14)
+Reported issues fixed: (1) protection SELL orders rejected with "Please set your order price in multiples of 5 paise"; (2) broker rejection reasons not visible in UI; (3) 20-30s ORDER_PENDING → OPEN_POSITION delay; (4) P&L latency observability.
+
+**Phase 2 tick-size (root cause of Issues 1 & 2):** New module-level `_tick_round(price, tick=0.05)` in `main.py`. Replaced 11 `round(price, 2)` sites (entry LIMIT, initial TP/SL, retry TP/SL, trailing SL_MARKET/SL_LIMIT) so every broker-bound price snaps to the 5-paise NFO grid.
+
+**Phase 3 + 5 rejection surfacing:** `_place_protective_legs` rewritten with per-leg try/except. New timeline events emit the FULL broker message: `TP_REJECTED`, `SL_REJECTED`, `TRAIL_REJECTED`. Trailing SL replacement failure now emits `TRAIL_REJECTED` before FORCED_EXIT.
+
+**Phase 6 early reconcile:** new `PENDING_EARLY_RECONCILE_SEC = 5`. `_step_order_pending` fires `_reconcile_order_pending_timeout` at age≥5s (guarded once per pending). Cuts recovery from 20-30s to ~5s. Timeline `BROKER_DELAY` event on early recovery.
+
+**Phase 7 latency measurement:** `/api/bot/status.live_quotes` now includes `option_ltp_age_ms` and `spot_age_ms` for UI-side P&L staleness display. Pure observability, no behaviour change.
+
+**Phase 8 protection health:** post-place verification emits `PROTECTION_HEALTH_OK` when both legs are visible in the order book, or `PROTECTION_HEALTH_FAIL` + FORCED_EXIT when incomplete.
+
+**Phase X (Addition 1) timeout safety attestation:** `_step_order_pending` writes a structured `PENDING_TIMEOUT` timeline event capturing the whole safety chain `{order_id, age_seconds, reconcile_recovered, cancel_requested, cancel_ok, cancel_error, final_state, broker_audit_tail}`. New `_broker_still_has_position(p)` safety belt — refuses IDLE transition while broker still shows a matching NFO net position; FSM stays ORDER_PENDING instead of abandoning a live position.
+
+**Phase Y (Addition 2) broker API audit:** new `/app/backend/broker_audit.py` with `BrokerAudit` class and transparent `AuditedBroker` proxy. Only the 5 audited methods (place_order, modify_order, cancel_order, order_book, positions) are instrumented — everything else passes through unchanged. Records `{method, request_ts, response_ts, latency_ms, ok, error_code, error_message, broker_order_id, exchange_order_id, request_summary, response_summary}` to (a) in-memory ring bounded to 100 and (b) new `broker_audit_log` SQLite table (schema + 2 indexes added). New endpoint `GET /api/bot/broker_audit?limit=50&method=?` for UI + diagnostics.
+
+**Untouched (per user directive):** SMC engine, indicator engine, HTF, confidence, BOS/CHoCH/FVG/OB/sweeps/premium-discount, signal generation, entry rules, exit rules, SL%/TP%/Trailing SL%, risk management, position sizing, dashboard strategy logic, Telegram, existing timeline events (all new events additive).
+
+**Regression tests:** 19 new in `/app/backend/tests/test_execution_hardening_v14.py` covering: tick-round correctness, protection tick-size snapping, TP/SL rejection surfacing, protection health OK/FAIL, early reconcile at 5s, once-per-pending guard, PENDING_TIMEOUT attestation on cancel and on recovery, broker-still-has-position refusal, broker audit transparency, exception recording, ring bounding, persistence sink.
+
+**Full suite:** 167/167 passing (148 pre-existing + 19 new). Testing agent iteration_7 → PASS. No regressions in iterations 3-6.
+
