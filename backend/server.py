@@ -316,7 +316,7 @@ def _broker_status() -> Optional[str]:
 
 def _live_quotes() -> dict[str, Any]:
     """Latest broker ticks the bot has cached (spot / VIX / option LTP / ts)."""
-    import json
+    import json, time as _time
     try:
         with _conn() as c:
             row = c.execute(
@@ -331,6 +331,19 @@ def _live_quotes() -> dict[str, Any]:
     except Exception:
         return {}
     data["updated"] = row["updated"]
+    # v1.14 — Phase 7 measurement: age-of-latest-tick so the UI can render
+    # "P&L latency" and operators can quantify staleness rather than guess.
+    now_ts = _time.time()
+    try:
+        if data.get("option_ltp_ts"):
+            data["option_ltp_age_ms"] = int(max(0.0, (now_ts - float(data["option_ltp_ts"])) * 1000))
+    except Exception:
+        pass
+    try:
+        if data.get("spot_ts"):
+            data["spot_age_ms"] = int(max(0.0, (now_ts - float(data["spot_ts"])) * 1000))
+    except Exception:
+        pass
     return data
 
 
@@ -696,6 +709,38 @@ def refresh_atm() -> dict[str, Any]:
             (datetime.now(timezone.utc).isoformat(), json.dumps({})),
         )
         return {"queued": True, "cmd_id": cur.lastrowid}
+
+
+@api.get("/bot/broker_audit")
+def broker_audit(limit: int = 50, method: Optional[str] = None) -> dict[str, Any]:
+    """v1.14 — Phase Y broker API response audit.
+
+    Read-only diagnostic feed of the last `limit` broker interactions
+    (placeOrder / modifyOrder / cancelOrder / order_book / positions).
+    Never influences trading behaviour — the daemon records rows via
+    a transparent wrapper and this endpoint simply reads them back.
+    """
+    limit = max(1, min(int(limit or 50), 500))
+    sql = (
+        "SELECT id, method, request_ts, response_ts, latency_ms, ok, "
+        "error_code, error_message, broker_order_id, exchange_order_id, "
+        "request_summary, response_summary FROM broker_audit_log"
+    )
+    params: tuple = ()
+    if method:
+        sql += " WHERE method = ?"
+        params = (method,)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params = (*params, limit)
+    try:
+        with _conn() as c:
+            rows = c.execute(sql, params).fetchall()
+    except sqlite3.OperationalError:
+        return {"entries": [], "count": 0}
+    entries = [dict(r) for r in rows]
+    for e in entries:
+        e["ok"] = bool(e.get("ok"))
+    return {"entries": entries, "count": len(entries)}
 
 
 @api.get("/bot/trade/{trade_id}/timeline")

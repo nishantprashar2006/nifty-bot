@@ -66,6 +66,12 @@ INTRADAY_SQUARE_OFF = time(15, 10)
 # 5. Order / position lifecycle
 # ────────────────────────────────────────────────────────────────────
 ORDER_TIMEOUT_SEC = 20
+# v1.14 — Early reconciliation window inside ORDER_PENDING. If the WebSocket
+# fill event hasn't arrived by this age, poll broker.order_book() once and
+# adopt if COMPLETE. Cuts the observed 20-30s "still ORDER_PENDING" delay
+# down to ~5s. Never triggers a cancel by itself; runs at most once per
+# pending; falls back cleanly to the 20s ORDER_TIMEOUT_SEC branch.
+PENDING_EARLY_RECONCILE_SEC = 5
 MAX_HOLD_TIME_MIN = 30
 REENTRY_BLOCK_MIN = 15           # directional cooldown on stop-out side
 COOLDOWN_AFTER_EXIT_MIN = 10     # post-exit system rest

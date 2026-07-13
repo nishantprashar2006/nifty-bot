@@ -94,6 +94,29 @@ class SqliteLogger:
             updated  TEXT NOT NULL
         )
         """,
+        # v1.14 — Phase Y broker API audit log. Every call to the five
+        # audited methods (place_order / modify_order / cancel_order /
+        # order_book / positions) writes a row here for diagnostic
+        # visibility. Never read by any trading logic — read-only from
+        # the /api/bot/broker_audit endpoint.
+        """
+        CREATE TABLE IF NOT EXISTS broker_audit_log (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            method            TEXT NOT NULL,
+            request_ts        REAL NOT NULL,
+            response_ts       REAL NOT NULL,
+            latency_ms        INTEGER NOT NULL,
+            ok                INTEGER NOT NULL,
+            error_code        TEXT,
+            error_message     TEXT,
+            broker_order_id   TEXT,
+            exchange_order_id TEXT,
+            request_summary   TEXT,
+            response_summary  TEXT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_broker_audit_method ON broker_audit_log(method)",
+        "CREATE INDEX IF NOT EXISTS idx_broker_audit_req_ts ON broker_audit_log(request_ts)",
     ]
 
     def __init__(self, db_path: str) -> None:
@@ -390,6 +413,35 @@ class SqliteLogger:
                 "SELECT value, updated FROM bot_state WHERE key = ?", (key,)
             ).fetchone()
         return row if row else None
+
+    # ─── v1.14 Phase Y — broker API audit persistence ────────────────
+    def record_broker_audit(self, entry: dict) -> None:
+        """Persist one broker call for cross-process (/api/bot/broker_audit)
+        visibility. Called by BrokerAudit's sink; never raises."""
+        try:
+            with self._cursor() as cur:
+                cur.execute(
+                    "INSERT INTO broker_audit_log("
+                    "method, request_ts, response_ts, latency_ms, ok, "
+                    "error_code, error_message, broker_order_id, "
+                    "exchange_order_id, request_summary, response_summary"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        entry.get("method"),
+                        float(entry.get("request_ts") or 0.0),
+                        float(entry.get("response_ts") or 0.0),
+                        int(entry.get("latency_ms") or 0),
+                        1 if entry.get("ok") else 0,
+                        entry.get("error_code"),
+                        entry.get("error_message"),
+                        entry.get("broker_order_id"),
+                        entry.get("exchange_order_id"),
+                        entry.get("request_summary"),
+                        entry.get("response_summary"),
+                    ),
+                )
+        except Exception:
+            pass  # audit must never impact trading
 
 
 _singleton: Optional[SqliteLogger] = None

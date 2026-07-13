@@ -65,6 +65,26 @@ def _smc_grade(confidence: int) -> str:
 
 
 # ────────────────────────────────────────────────────────────────────
+# v1.14 — Broker-safe tick rounding.
+#
+# NFO options exchange tick size is ₹0.05 (5 paise). Angel One rejects
+# any order (or trigger) price not on a 5-paise grid with:
+#   "Please set your order price in multiples of 5 paise and place order again."
+# All broker-bound prices in this module MUST go through this helper.
+# Round-half-away-from-zero on the tick grid, snapped to 2 decimals
+# to eliminate float noise.
+# ────────────────────────────────────────────────────────────────────
+def _tick_round(price: float, tick: float = 0.05) -> float:
+    if price is None:
+        return price
+    p = float(price)
+    if tick <= 0:
+        return round(p, 2)
+    n = round(p / tick)
+    return round(n * tick, 2)
+
+
+# ────────────────────────────────────────────────────────────────────
 # FSM driver
 # ────────────────────────────────────────────────────────────────────
 class NiftyOptionsBot:
@@ -199,6 +219,16 @@ class NiftyOptionsBot:
         signal.signal(signal.SIGTERM, self._on_signal)
 
         self.broker = build_client()
+        # v1.14 — Phase Y: transparent audit wrapper. Records every
+        # placeOrder / modifyOrder / cancelOrder / order_book / positions
+        # call into an in-memory ring AND a SQLite table for cross-process
+        # (server) visibility. Trading behaviour unchanged — observer only.
+        from broker_audit import BrokerAudit
+        self.broker_audit = BrokerAudit(
+            capacity=100,
+            sink=lambda e: self.db.record_broker_audit(e),
+        )
+        self.broker = self.broker_audit.wrap(self.broker)
 
         # Morning init: drawdown-aware sizing
         capital = self.broker.get_net_available_cash()
@@ -1063,7 +1093,7 @@ class NiftyOptionsBot:
                 "ordertype": "LIMIT",
                 "producttype": "INTRADAY",
                 "duration": "DAY",
-                "price": round(limit_px, 2),
+                "price": _tick_round(limit_px),
                 "quantity": qty,
             }
 
@@ -1227,6 +1257,10 @@ class NiftyOptionsBot:
         pos = self.positions.open_position
         if pos is None:
             return
+        # v1.14 — SL/TP prices MUST be snapped to the exchange tick (5 paise).
+        # Angel One rejects any protection order not on the tick grid.
+        target_price = _tick_round(target_price)
+        stop_price = _tick_round(stop_price)
         # Target = LIMIT SELL  (user wants target ALWAYS as limit — locks in
         # the planned reward, no slippage on the upside).
         tgt = {
@@ -1238,7 +1272,7 @@ class NiftyOptionsBot:
             "ordertype": "LIMIT",
             "producttype": "INTRADAY",
             "duration": "DAY",
-            "price": round(target_price, 2),
+            "price": target_price,
             "quantity": pos.qty,
         }
         # SL leg — STOPLOSS_MARKET (default) protects against gap-throughs.
@@ -1255,63 +1289,125 @@ class NiftyOptionsBot:
                 "producttype": "INTRADAY",
                 "duration": "DAY",
                 "price": "0",
-                "triggerprice": round(stop_price, 2),
+                "triggerprice": stop_price,
                 "quantity": pos.qty,
             }
         else:
             sl = {
                 **tgt,
                 "ordertype": "STOPLOSS_LIMIT",
-                "price": round(stop_price, 2),
-                "triggerprice": round(stop_price * 1.001, 2),
+                "price": stop_price,
+                "triggerprice": _tick_round(stop_price * 1.001),
             }
+        # v1.14 — place each leg in its own try/except so a rejection on one
+        # doesn't hide the other. Emit dedicated timeline events carrying the
+        # FULL broker message so the UI can display exactly what Angel said.
+        tgt_id: Optional[str] = None
+        sl_id: Optional[str] = None
+        tgt_err: Optional[str] = None
+        sl_err: Optional[str] = None
         try:
             tgt_id = self.broker.place_order(tgt)
+        except SmartApiError as exc:
+            tgt_err = str(exc) or "broker rejected TP"
+            logger.warning("TP_REJECTED: %s (price=₹%.2f)", tgt_err, target_price)
+        try:
             sl_id = self.broker.place_order(sl)
+        except SmartApiError as exc:
+            sl_err = str(exc) or "broker rejected SL"
+            logger.warning("SL_REJECTED: %s (trigger=₹%.2f)", sl_err, stop_price)
+
+        # Record whichever ids we got so the FSM can still track/cancel.
+        if tgt_id or sl_id:
             self.positions.set_protective_orders(tgt_id, sl_id)
-            logger.info(
-                "Protective OCO armed [SL=%s]: tgt=%s sl=%s  (target ₹%.2f, stop ₹%.2f)",
-                config.SL_ORDER_TYPE, tgt_id, sl_id, target_price, stop_price,
-            )
-            # v1.10 timeline
-            from execution_timeline import Event
-            pos_for_log = self.positions.open_position
-            if pos_for_log:
+
+        from execution_timeline import Event
+        pos_for_log = self.positions.open_position
+        if pos_for_log:
+            if tgt_id:
                 self._tl(
                     pos_for_log.trade_id, Event.TP_PLACED,
                     f"Initial Target placed ₹{target_price:.2f}",
                     {"order_id": tgt_id, "price": target_price},
                 )
+            else:
+                self._tl(
+                    pos_for_log.trade_id, Event.TP_REJECTED,
+                    f"Broker rejected TP: {tgt_err}",
+                    {"broker": "AngelOne", "reason": tgt_err,
+                     "price": target_price, "leg": "TP"},
+                )
+            if sl_id:
                 self._tl(
                     pos_for_log.trade_id, Event.SL_PLACED,
                     f"Initial Stop placed ₹{stop_price:.2f}",
                     {"order_id": sl_id, "price": stop_price,
                      "order_type": config.SL_ORDER_TYPE},
                 )
-            # v1.9 P1 — Post-place broker verification. Give SmartAPI a
-            # brief moment to accept both legs, then confirm they appear
-            # in the order book with an open/trigger_pending status. If
-            # either is missing, retry once, then flatten defensively.
-            if not self._verify_protection_legs_placed(tgt_id, sl_id):
-                logger.warning(
-                    "Protection legs not visible in order book after place; "
-                    "retrying once before forcing exit.",
+            else:
+                self._tl(
+                    pos_for_log.trade_id, Event.SL_REJECTED,
+                    f"Broker rejected SL: {sl_err}",
+                    {"broker": "AngelOne", "reason": sl_err,
+                     "price": stop_price, "leg": "SL",
+                     "order_type": config.SL_ORDER_TYPE},
                 )
-                # One targeted retry — only re-place the missing leg(s)
-                self._retry_missing_protection_legs(pos, target_price, stop_price)
-                if not self._verify_protection_legs_placed(
-                    self.positions.open_position.target_order_id if self.positions.open_position else tgt_id,
-                    self.positions.open_position.stop_order_id if self.positions.open_position else sl_id,
-                ):
-                    logger.critical(
-                        "Protection legs still missing after retry — "
-                        "flattening position defensively.",
-                    )
-                    self._exit_reason_hint = config.ExitReason.REJECTED.value
-                    self._transition(config.State.FORCED_EXIT)
-        except SmartApiError as exc:
-            logger.exception("Failed to arm OCO: %s", exc)
+
+        if not (tgt_id and sl_id):
+            # At least one leg is missing at the broker. Log a failure health
+            # event and route to FORCED_EXIT so the position never lives
+            # unprotected — same safety envelope as before.
+            if pos_for_log:
+                self._tl(
+                    pos_for_log.trade_id, Event.PROTECTION_HEALTH_FAIL,
+                    "Protection incomplete after initial place — flattening",
+                    {"tp_id": tgt_id, "sl_id": sl_id,
+                     "tp_reason": tgt_err, "sl_reason": sl_err},
+                )
+            logger.critical(
+                "Protection incomplete (tp=%s sl=%s) — flattening position.",
+                tgt_id, sl_id,
+            )
+            self._exit_reason_hint = config.ExitReason.REJECTED.value
             self._transition(config.State.FORCED_EXIT)
+            return
+
+        logger.info(
+            "Protective OCO armed [SL=%s]: tgt=%s sl=%s  (target ₹%.2f, stop ₹%.2f)",
+            config.SL_ORDER_TYPE, tgt_id, sl_id, target_price, stop_price,
+        )
+        # v1.9 P1 — Post-place broker verification.
+        if not self._verify_protection_legs_placed(tgt_id, sl_id):
+            logger.warning(
+                "Protection legs not visible in order book after place; "
+                "retrying once before forcing exit.",
+            )
+            self._retry_missing_protection_legs(pos, target_price, stop_price)
+            if not self._verify_protection_legs_placed(
+                self.positions.open_position.target_order_id if self.positions.open_position else tgt_id,
+                self.positions.open_position.stop_order_id if self.positions.open_position else sl_id,
+            ):
+                if pos_for_log:
+                    self._tl(
+                        pos_for_log.trade_id, Event.PROTECTION_HEALTH_FAIL,
+                        "Protection legs missing in order book after retry — flattening",
+                        {"tp_id": tgt_id, "sl_id": sl_id},
+                    )
+                logger.critical(
+                    "Protection legs still missing after retry — "
+                    "flattening position defensively.",
+                )
+                self._exit_reason_hint = config.ExitReason.REJECTED.value
+                self._transition(config.State.FORCED_EXIT)
+                return
+        # All legs armed AND visible in the order book → health OK.
+        if pos_for_log:
+            self._tl(
+                pos_for_log.trade_id, Event.PROTECTION_HEALTH_OK,
+                "Protection health verified — both legs live at broker",
+                {"tp_id": tgt_id, "sl_id": sl_id,
+                 "target_price": target_price, "stop_price": stop_price},
+            )
 
     def _verify_protection_legs_placed(
         self, tgt_id: Optional[str], sl_id: Optional[str],
@@ -1365,7 +1461,7 @@ class NiftyOptionsBot:
                     "symboltoken": pos.contract_token, "transactiontype": "SELL",
                     "exchange": "NFO", "ordertype": "LIMIT",
                     "producttype": "INTRADAY", "duration": "DAY",
-                    "price": round(target_price, 2), "quantity": pos.qty,
+                    "price": _tick_round(target_price), "quantity": pos.qty,
                 })
                 self.positions.set_protective_orders(new_tgt, pos.stop_order_id)
             except Exception:
@@ -1378,10 +1474,10 @@ class NiftyOptionsBot:
                     "exchange": "NFO", "ordertype": config.SL_ORDER_TYPE,
                     "producttype": "INTRADAY", "duration": "DAY",
                     "price": "0" if config.SL_ORDER_TYPE == "STOPLOSS_MARKET"
-                             else round(stop_price, 2),
-                    "triggerprice": round(stop_price, 2)
+                             else _tick_round(stop_price),
+                    "triggerprice": _tick_round(stop_price)
                                     if config.SL_ORDER_TYPE == "STOPLOSS_MARKET"
-                                    else round(stop_price * 1.001, 2),
+                                    else _tick_round(stop_price * 1.001),
                     "quantity": pos.qty,
                 }
                 new_sl = self.broker.place_order(sl_payload)
@@ -1789,7 +1885,44 @@ class NiftyOptionsBot:
         if p is None:
             self._transition(config.State.IDLE)
             return
-        if p.age_seconds() >= config.ORDER_TIMEOUT_SEC:
+        age = p.age_seconds()
+        # v1.14 — early reconciliation. The v1.12 timeout branch fires only
+        # at ORDER_TIMEOUT_SEC (20s), which was the exact 20-30s "still
+        # ORDER_PENDING" delay reported by the user. Add an intermediate
+        # attempt at ≥5s so a missed WS fill is recovered ~4× faster.
+        # Runs at most once per pending (guard flag `_early_reconciled`) so
+        # order_book isn't hammered every 500ms tick.
+        if (
+            age >= config.PENDING_EARLY_RECONCILE_SEC
+            and age < config.ORDER_TIMEOUT_SEC
+            and not getattr(p, "_early_reconciled", False)
+        ):
+            try:
+                p._early_reconciled = True  # attribute stored on the dataclass instance
+            except Exception:
+                pass
+            try:
+                if self._reconcile_order_pending_timeout(p):
+                    # Timeline note so operators can see the fast path fired.
+                    try:
+                        session = getattr(self, "_timeline_session", None)
+                        pos = self.positions.open_position
+                        anchor = pos.trade_id if pos and pos.trade_id else session
+                        if anchor:
+                            from execution_timeline import Event as _Ev
+                            self._tl(
+                                anchor, _Ev.BROKER_DELAY,
+                                f"Recovered via early reconcile @ {age:.1f}s "
+                                f"(WS fill missed)",
+                                {"age_seconds": round(age, 2),
+                                 "trigger": "early_reconcile"},
+                            )
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                logger.exception("Early reconcile raised (continuing)")
+        if age >= config.ORDER_TIMEOUT_SEC:
             # v1.12 — Fix A + Fix B (execution-recovery reconciliation).
             #
             # Before firing the legacy cancel-and-go-IDLE branch, verify with
@@ -1809,17 +1942,124 @@ class NiftyOptionsBot:
             # If NEITHER confirms a fill, we fall through to the original
             # cancel + IDLE behaviour so today's timeout semantics are
             # preserved.
-            if self._reconcile_order_pending_timeout(p):
+            #
+            # v1.14 — Phase X: structured attestation. The whole safety
+            # chain outcome is recorded as one PENDING_TIMEOUT timeline
+            # event so operators can prove per-instance that all three
+            # sources were consulted before cancelling.
+            attest: dict = {
+                "order_id": p.order_id,
+                "age_seconds": round(age, 2),
+                "ws_fill_seen": False,
+                "reconcile_recovered": False,
+                "cancel_requested": False,
+                "cancel_ok": None,
+                "cancel_error": None,
+                "final_state": None,
+            }
+            reconciled = False
+            try:
+                reconciled = self._reconcile_order_pending_timeout(p)
+            except Exception as _rec_exc:
+                attest["reconcile_error"] = str(_rec_exc)
+                logger.exception("Reconcile raised at timeout (continuing to cancel)")
+            attest["reconcile_recovered"] = bool(reconciled)
+            if reconciled:
+                attest["final_state"] = "POSITION_OPEN"
+                self._emit_pending_timeout_attestation(p, attest)
+                return
+            # v1.14 — Phase X hard-safety: even if reconciliation returned
+            # False, ask the broker one more time whether an open NFO
+            # position matching our token exists. Never allow IDLE while
+            # the broker still holds a live position.
+            if self._broker_still_has_position(p):
+                attest["broker_position_present"] = True
+                attest["reconcile_recovered"] = True
+                attest["final_state"] = "POSITION_OPEN (defensive adopt)"
+                logger.critical(
+                    "PENDING_TIMEOUT: broker still holds position for %s "
+                    "after reconcile — attempting one more adoption before "
+                    "refusing to go IDLE.",
+                    p.contract_symbol,
+                )
+                # Best-effort second reconcile attempt.
+                try:
+                    self._reconcile_order_pending_timeout(p)
+                except Exception:
+                    logger.exception("Second reconcile attempt raised")
+                if self.positions.pending_entry is None:
+                    self._emit_pending_timeout_attestation(p, attest)
+                    return
+                # If we still couldn't adopt, DO NOT go IDLE — stay
+                # ORDER_PENDING so a subsequent tick retries. This is
+                # deliberately conservative: refusing to lose a position.
+                attest["final_state"] = "ORDER_PENDING (refused IDLE)"
+                self._emit_pending_timeout_attestation(p, attest)
                 return
             logger.warning("Entry order %s unfilled in %ds — cancelling.",
                            p.order_id, config.ORDER_TIMEOUT_SEC)
+            attest["cancel_requested"] = True
             if p.order_id and p.order_id not in (None, "None", ""):
                 try:
                     self.broker.cancel_order(p.order_id)
-                except Exception:
+                    attest["cancel_ok"] = True
+                except Exception as _c_exc:
+                    attest["cancel_ok"] = False
+                    attest["cancel_error"] = str(_c_exc)
                     logger.exception("cancel_order failed (continuing)")
             self.positions.clear_pending()
+            attest["final_state"] = "IDLE"
+            self._emit_pending_timeout_attestation(p, attest)
             self._transition(config.State.IDLE)
+
+    def _broker_still_has_position(self, p: "PendingEntry") -> bool:
+        """Phase X safety belt: refuse to go IDLE while broker has a
+        matching NFO open position. Uses positions() only; failures fall
+        back to False (preserves today's behaviour)."""
+        try:
+            for bp in (self.broker.positions() or []):
+                try:
+                    if str(bp.get("exchange", "")).upper() != "NFO":
+                        continue
+                    if str(bp.get("symboltoken", "")) != str(p.contract_token):
+                        if str(bp.get("tradingsymbol", "")).upper() != p.contract_symbol.upper():
+                            continue
+                    if int(float(bp.get("netqty") or 0)) != 0:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            logger.warning("_broker_still_has_position: positions() raised", exc_info=True)
+        return False
+
+    def _emit_pending_timeout_attestation(self, p: "PendingEntry", attest: dict) -> None:
+        """Phase X — write the safety-chain summary as one PENDING_TIMEOUT
+        timeline event under whichever anchor makes sense (trade_id if a
+        position was adopted, else the pre-fill session id)."""
+        try:
+            from execution_timeline import Event as _Ev
+            pos = self.positions.open_position
+            anchor = (pos.trade_id if pos and getattr(pos, "trade_id", None)
+                      else getattr(self, "_timeline_session", None))
+            if anchor is None:
+                return
+            # Include the last few audited broker calls (order_book / positions
+                # / cancel_order) so the timeline shows the raw evidence.
+            recent = []
+            try:
+                recent = self.broker_audit.recent_by_method("order_book", 2) \
+                       + self.broker_audit.recent_by_method("positions", 2) \
+                       + self.broker_audit.recent_by_method("cancel_order", 1)
+            except Exception:
+                pass
+            attest["broker_audit_tail"] = recent
+            msg = (
+                f"Timeout {attest['age_seconds']}s · reconciled={attest['reconcile_recovered']} · "
+                f"final={attest['final_state']}"
+            )
+            self._tl(anchor, _Ev.PENDING_TIMEOUT, msg, attest)
+        except Exception:
+            logger.exception("emit_pending_timeout_attestation failed (ignored)")
 
     def _reconcile_order_pending_timeout(self, p: PendingEntry) -> bool:
         """v1.12 — attempt to recover a missed-WS-fill by asking the broker.
@@ -2117,7 +2357,7 @@ class NiftyOptionsBot:
                         "producttype": "INTRADAY",
                         "duration": "DAY",
                         "price": "0",
-                        "triggerprice": round(new_stop, 2),
+                        "triggerprice": _tick_round(new_stop),
                         "quantity": pos.qty,
                     }
                 else:
@@ -2130,8 +2370,8 @@ class NiftyOptionsBot:
                         "ordertype": "STOPLOSS_LIMIT",
                         "producttype": "INTRADAY",
                         "duration": "DAY",
-                        "price": round(new_stop, 2),
-                        "triggerprice": round(new_stop * 1.001, 2),
+                        "price": _tick_round(new_stop),
+                        "triggerprice": _tick_round(new_stop * 1.001),
                         "quantity": pos.qty,
                     }
                 try:
@@ -2141,11 +2381,27 @@ class NiftyOptionsBot:
                         "Stop trailed → ₹%.2f (%s order=%s)",
                         new_stop, config.SL_ORDER_TYPE, new_id,
                     )
-                except Exception:
+                except Exception as _trail_exc:
+                    # v1.14 — surface the FULL broker rejection reason via a
+                    # dedicated timeline event before flattening.
+                    reason = str(_trail_exc) or "broker rejected trail replace"
                     logger.critical(
                         "Trail SL re-place FAILED at ₹%.2f — position unprotected, "
-                        "routing to FORCED_EXIT to flatten.", new_stop,
+                        "routing to FORCED_EXIT to flatten. Reason: %s",
+                        new_stop, reason,
                     )
+                    try:
+                        from execution_timeline import Event as _Ev
+                        self._tl(
+                            pos.trade_id, _Ev.TRAIL_REJECTED,
+                            f"Broker rejected trail replace: {reason}",
+                            {"broker": "AngelOne", "reason": reason,
+                             "new_stop": new_stop,
+                             "order_type": config.SL_ORDER_TYPE,
+                             "leg": "TRAIL_SL"},
+                        )
+                    except Exception:
+                        pass
                     self._transition(config.State.FORCED_EXIT)
 
     def _synthetic_exit(self, exit_price: float, was_stop: bool) -> None:

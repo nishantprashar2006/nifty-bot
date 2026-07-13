@@ -71,6 +71,15 @@ class Event:
     # v1.13 — pre-flight margin check + broker rejection surfacing
     PRECHECK_FAILED   = "PRECHECK_FAILED"
     ORDER_REJECTED    = "ORDER_REJECTED"
+    # v1.14 — protection-order rejection surfacing + broker delay
+    TP_REJECTED       = "TP_REJECTED"
+    SL_REJECTED       = "SL_REJECTED"
+    TRAIL_REJECTED    = "TRAIL_REJECTED"
+    PROTECTION_HEALTH_OK   = "PROTECTION_HEALTH_OK"
+    PROTECTION_HEALTH_FAIL = "PROTECTION_HEALTH_FAIL"
+    BROKER_DELAY      = "BROKER_DELAY"
+    # v1.14 — Phase Y broker API audit + Phase X pending-timeout attestation
+    PENDING_TIMEOUT   = "PENDING_TIMEOUT"
     # informational
     NOTE              = "NOTE"
 
