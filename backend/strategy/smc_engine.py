@@ -187,44 +187,71 @@ def detect_htf_trend(bars_15m: list[Bar]) -> Direction:
     return detect_structure(swings)
 
 
+def _bps_diff(a: float, b: float) -> float:
+    """Basis-points distance between two prices relative to their midpoint.
+
+    Used only by `detect_structure` to detect "equal" endpoints on either
+    the highs or lows series. Mirrors the tolerance concept already used
+    elsewhere in this module for Equal Highs / Equal Lows (EQH/EQL).
+    """
+    m = (abs(a) + abs(b)) / 2.0
+    if m <= 0:
+        return 0.0
+    return abs(a - b) / m * 10000.0
+
+
 def detect_structure(swings: list[Swing]) -> Direction:
-    """Structure-based bias.
+    """Structure-based bias with SMC-native EQ tolerance (v1.11 — R1).
 
-    Prefers the **last 3 confirmed swings on each side** using endpoint
-    comparison — `highs[-1]` vs `highs[-3]` and `lows[-1]` vs `lows[-3]`.
-    Endpoint comparison ignores a single anomalous middle swing (e.g. a
-    noisy pullback low) that used to force NEUTRAL under the strict
-    last-2 rule.
+    Uses the same 3-swing endpoint comparison introduced earlier
+    (`highs[-1]` vs `highs[-3]`, `lows[-1]` vs `lows[-3]`), with a
+    warm-up fallback to the strict last-2 rule when only 2 swings per
+    side exist.
 
-    Falls back to the original strict last-2 comparison when only 2
-    confirmed swings exist (early session warm-up), so no early-session
-    behaviour is lost.
+    The R1 refinement: an endpoint pair within `EQ_TOLERANCE_BPS`
+    (5 bps = 0.05%) is treated as "flat on that side" — neither
+    bullish nor bearish. This mirrors how the SMC engine already
+    classifies equal highs/lows as liquidity levels rather than
+    trend flips.
 
-    Fully deterministic — no tolerances, EMAs, ATR, or new primitives.
-    HH+HL → CALL ·  LH+LL → PUT ·  otherwise NEUTRAL.
+    Decision:
+      • CALL  — at least one side strictly bullish AND neither side bearish
+      • PUT   — at least one side strictly bearish AND neither side bullish
+      • NEUTRAL otherwise (this includes genuine ranges where BOTH
+        sides land inside the equality band, and broadening patterns
+        where the sides contradict each other).
+
+    Fully deterministic. No indicators, no EMAs, no ATR — purely
+    structural. `SWING_WINDOW` is unchanged.
     """
     highs = [s for s in swings if s.side == "HIGH"]
     lows = [s for s in swings if s.side == "LOW"]
 
     if len(highs) >= 3 and len(lows) >= 3:
-        # Endpoint check across the last 3 confirmed swings per side —
-        # one anomalous middle swing no longer flips the verdict.
-        hh = highs[-1].price > highs[-3].price
-        hl = lows[-1].price > lows[-3].price
-        lh = highs[-1].price < highs[-3].price
-        ll = lows[-1].price < lows[-3].price
+        h_ref, h_cur = highs[-3].price, highs[-1].price
+        l_ref, l_cur = lows[-3].price, lows[-1].price
     elif len(highs) >= 2 and len(lows) >= 2:
-        # Warm-up fallback — original strict last-2 rule.
-        hh = highs[-1].price > highs[-2].price
-        hl = lows[-1].price > lows[-2].price
-        lh = highs[-1].price < highs[-2].price
-        ll = lows[-1].price < lows[-2].price
+        # Warm-up fallback — strict last-2 pair (preserves early-session behaviour).
+        h_ref, h_cur = highs[-2].price, highs[-1].price
+        l_ref, l_cur = lows[-2].price, lows[-1].price
     else:
         return "NEUTRAL"
 
-    if hh and hl:
+    # EQ tolerance — an endpoint pair within EQ_TOLERANCE_BPS is
+    # treated as "flat on that side", not as a directional break.
+    h_eq = _bps_diff(h_cur, h_ref) <= EQ_TOLERANCE_BPS
+    l_eq = _bps_diff(l_cur, l_ref) <= EQ_TOLERANCE_BPS
+
+    h_up = (not h_eq) and h_cur > h_ref
+    l_up = (not l_eq) and l_cur > l_ref
+    h_dn = (not h_eq) and h_cur < h_ref
+    l_dn = (not l_eq) and l_cur < l_ref
+
+    # CALL: at least one side strictly bullish AND neither side bearish.
+    if (h_up or l_up) and not (h_dn or l_dn):
         return "CALL"
-    if lh and ll:
+    # PUT: at least one side strictly bearish AND neither side bullish.
+    if (h_dn or l_dn) and not (h_up or l_up):
         return "PUT"
     return "NEUTRAL"
 
