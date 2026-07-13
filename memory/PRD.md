@@ -516,3 +516,21 @@ position sizing, Telegram alerts, existing API behavior.
 - **Full pytest suite:** 127/127 passing.
 - **Known limitation carried forward:** Cause #4 (post-BOS consolidation reads NEUTRAL) not addressed by R1 — deferred to R2 (BOS memory into HTF) pending live measurement of R1.
 
+
+## 2026-02-06 — P0: ORDER_PENDING → IDLE despite live broker fill (Fix A + Fix B)
+- **Reported symptom:** Manual BUY at Angel; broker executed order; SmartWebSocket `on_order(status="complete")` not delivered in ≤20s; FSM cancelled in-memory pending and went IDLE while an unprotected live position existed at the broker.
+- **Root cause (proven by code lines + 8 matching log fingerprints in `/var/log/supervisor/nifty_bot.err.log`):** `_step_order_pending` (main.py) treated the WebSocket fill event as the sole source of truth. At `ORDER_TIMEOUT_SEC=20s` it unconditionally called `broker.cancel_order` (which raised `SmartApiError` for the already-COMPLETE order, silently swallowed by broad `except`) then cleared pending and transitioned to IDLE. `_recover_orphan_trade` only ran at boot, not during runtime.
+- **Fix scope (surgical):** ONLY `_step_order_pending` modified + new private helper `_reconcile_order_pending_timeout(p)` added right after it (+~150 lines). Two new observability event constants added to `execution_timeline.Event`: `ORDER_PENDING_RECONCILE_ORDERBOOK`, `ORDER_PENDING_RECONCILE_POSITION`. Nothing else touched — verified by testing agent.
+- **Behaviour:** At the 20s timeout boundary, before firing legacy cancel/IDLE:
+  1. Poll `broker.order_book()`. If the pending `order_id` shows `status=complete` with a usable averageprice → synthesize an `OrderEvent(status="complete", ...)` and route through the **unchanged** `_handle_fill(ev)` pipeline (promote_to_open → protective legs → DB insert → POSITION_OPEN → timeline).
+  2. If order_book cannot prove completion, poll `broker.positions()`. If an NFO position with matching token/symbol and expected direction has non-zero net qty → same synthetic OrderEvent route through `_handle_fill`.
+  3. Only if BOTH sources fail → execute the legacy cancel + IDLE branch (behaviour preserved).
+- **Idempotency guarantees:**
+  - Early guard: `if self.positions.pending_entry is None or self.positions.has_open_position: return False` — reconciliation is a no-op if WS fill already fired.
+  - Existing `_handle_fill` guard: `if pending and ev.order_id == pending.order_id` — second layer of defence against double-promote.
+  - Recovery priority: WebSocket wins by firing first (clears pending); order_book wins if WS missed; positions() wins if order_book stale.
+- **Untouched (per user directive, verified by testing agent):** SMC engine, indicator engine, HTF, confidence, BOS, CHoCH, FVG, OB, sweeps, premium/discount, risk management, position sizing, telegram, dashboard, timeline UI, database schema, FSM architecture, broker wrapper APIs, order placement logic, `_handle_fill`, `_place_protective_legs`.
+- **New tests:** `/app/backend/tests/test_order_pending_reconcile.py` (12 tests covering all 7 mandated scenarios plus 5 robustness cases: order_book raise fallback, both-raise legacy preservation, zero avg-price fall-through, unrelated position no-adopt, back-to-back idempotency).
+- **Full suite:** 139/139 passing (127 pre-existing + 12 new). Testing agent iteration_5 → PASS.
+- **Explicitly deferred per user:** periodic watchdog, background reconciliation thread, new FSM states.
+
