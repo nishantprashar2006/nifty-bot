@@ -641,7 +641,31 @@ def list_commands(limit: int = 10) -> list[dict[str, Any]]:
             "SELECT id, timestamp, action, payload, status, result FROM commands "
             "ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
-    return [dict(r) for r in rows]
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        item = dict(r)
+        # v1.13 — decode structured rejection payload written by
+        # _handle_manual_entry so the UI can surface the broker's
+        # real reason (RMS message, insufficient funds figures, etc.)
+        result = item.get("result") or ""
+        item["broker_status"] = None
+        item["broker_reason"] = None
+        item["user_message"] = result if item.get("status") in (None, "", "ok", "fail") else result
+        for tag in ("PRECHECK_FAILED", "BROKER_REJECTED"):
+            prefix = f"{tag}: "
+            if isinstance(result, str) and result.startswith(prefix):
+                import json as _json
+                try:
+                    ctx = _json.loads(result[len(prefix):])
+                    item["broker_status"] = ctx.get("broker_status")
+                    item["broker_reason"] = ctx.get("broker_reason")
+                    item["user_message"] = ctx.get("user_message") or result
+                    item["rejection"] = {"tag": tag, **ctx}
+                except Exception:
+                    pass
+                break
+        out.append(item)
+    return out
 
 
 @api.post("/bot/panic_exit")

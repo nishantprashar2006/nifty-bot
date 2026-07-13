@@ -68,6 +68,9 @@ class Event:
     # v1.12 — ORDER_PENDING timeout reconciliation
     ORDER_PENDING_RECONCILE_ORDERBOOK = "ORDER_PENDING_RECONCILE_ORDERBOOK"
     ORDER_PENDING_RECONCILE_POSITION  = "ORDER_PENDING_RECONCILE_POSITION"
+    # v1.13 — pre-flight margin check + broker rejection surfacing
+    PRECHECK_FAILED   = "PRECHECK_FAILED"
+    ORDER_REJECTED    = "ORDER_REJECTED"
     # informational
     NOTE              = "NOTE"
 

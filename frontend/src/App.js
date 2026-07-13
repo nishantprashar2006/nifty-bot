@@ -308,6 +308,33 @@ function App() {
       // Once submitted, the auto-default resumes for the next signal
       setLotsEdited(false);
       await fetchAll();
+      // v1.13 — poll the command result so a broker-side rejection (RMS,
+      // insufficient funds, exchange reject, invalid symbol, market closed)
+      // never leaves a phantom "Queued" toast. The daemon completes the
+      // command within a few hundred ms; we poll for up to ~6 s to cover
+      // slow broker roundtrips.
+      const pollCmdId = data.cmd_id;
+      let done = false;
+      for (let i = 0; i < 6 && !done; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        try {
+          const { data: cmds } = await axios.get(`${API}/bot/commands?limit=10`);
+          const cmd = (cmds || []).find((x) => x.id === pollCmdId);
+          if (!cmd || cmd.status === "pending" || cmd.status === null) continue;
+          done = true;
+          if (cmd.broker_status === "rejected" || cmd.broker_status === "not_submitted") {
+            const tag = cmd.rejection?.tag === "PRECHECK_FAILED" ? "Order Not Submitted" : "Order Rejected";
+            const desc = cmd.user_message || cmd.result || "Broker rejection";
+            toast.error(tag, {
+              description: `${desc}${cmd.broker_reason ? ` · Reason: ${cmd.broker_reason}` : ""}`,
+              duration: 8000,
+            });
+            await fetchAll();
+          }
+        } catch (e) {
+          // best-effort — keep silent, the fetchAll below refreshes state
+        }
+      }
     } catch (err) {
       toast.error(`Manual entry failed`, {
         description: err?.response?.data?.detail || err.message,

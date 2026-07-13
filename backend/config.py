@@ -74,6 +74,10 @@ LIMIT_SLIP_BUFFER_PCT = 0.005    # 0.5% protective slip (only used in LIMIT mode
 FILL_TOLERANCE_PCT = 0.01        # reject LIMIT fills > 1% above expected
 MARKET_FILL_TOLERANCE_PCT = 0.03 # MARKET orders tolerate up to 3% slippage
 
+# v1.13 — Pre-flight margin buffer over the raw premium × qty cost.
+# Covers slippage + broker fees; purely advisory (broker remains authority).
+PREFLIGHT_MARGIN_BUFFER_PCT = 0.05
+
 # ────────────────────────────────────────────────────────────────────
 # 6. Liquidity
 # ────────────────────────────────────────────────────────────────────

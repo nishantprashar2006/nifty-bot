@@ -153,6 +153,12 @@ class NiftyOptionsBot:
         # Reads env config at construction and swallows any downstream error.
         self.telegram = TelegramNotifier()
 
+        # v1.13 — structured rejection context for the last failed entry
+        # attempt (pre-flight or broker). Cleared on every new entry click;
+        # consumed by _handle_manual_entry so the UI can surface the real
+        # reason (available/required funds, broker message, error code).
+        self._last_reject_context: Optional[dict] = None
+
     def _tl(self, trade_id: str, event_type: str, message: str, payload: Optional[dict] = None) -> None:
         """v1.10 — SAFE timeline logging shim.
 
@@ -553,6 +559,9 @@ class NiftyOptionsBot:
         breach = self._trip_circuit_breakers()
         if breach:
             return False, f"circuit breaker: {breach}"
+        # v1.13 — clear any stale rejection context from a previous click
+        # so the UI never shows a rejection banner for an unrelated attempt.
+        self._last_reject_context = None
         # v1.10 — start a new timeline session for this click. All events
         # before we know the real trade_id are recorded under this session
         # key, then rewritten to the real trade_id inside _handle_fill.
@@ -615,6 +624,13 @@ class NiftyOptionsBot:
                 f"SL={config.MANUAL_SL_PCT*100:.0f}%  TP={config.MANUAL_TP_PCT*100:.0f}%  "
                 f"trail={config.TRAIL_STEP_PCT*100:.0f}%",
             )
+        # v1.13 — surface the structured rejection reason if one was captured
+        # by `_place_entry` (pre-flight failure OR broker SmartApiError).
+        ctx = self._last_reject_context
+        if ctx:
+            import json as _json
+            tag = "PRECHECK_FAILED" if ctx.get("phase") == "preflight" else "BROKER_REJECTED"
+            return False, f"{tag}: {_json.dumps(ctx, separators=(',', ':'))}"
         return False, "broker rejected the entry"
 
     def _drain_command_queue(self) -> None:
@@ -1060,11 +1076,79 @@ class NiftyOptionsBot:
         else:
             target_px = premium + tp_pts
             stop_px = max(0.05, premium - sl_pts)
+        # v1.13 — pre-flight margin check (advisory).
+        # Estimates required capital ≈ qty × premium × (1 + buffer) and
+        # compares against `broker.get_net_available_cash()`. If the RMS
+        # call fails for any reason, we DO NOT block trading — the broker
+        # remains the authoritative gate. Only obvious insufficient-funds
+        # cases short-circuit here so the user never sees a phantom
+        # "Queued" for an order that will be rejected in a few hundred ms.
+        required_capital = qty * limit_px * (1.0 + config.PREFLIGHT_MARGIN_BUFFER_PCT)
+        try:
+            available_cash = float(self.broker.get_net_available_cash())
+        except Exception:
+            logger.warning("preflight: RMS lookup failed — deferring to broker.", exc_info=True)
+            available_cash = None
+        if available_cash is not None and required_capital > available_cash:
+            reason = (
+                f"Insufficient funds — Available ₹{available_cash:,.2f}, "
+                f"Required ≈ ₹{required_capital:,.2f}"
+            )
+            logger.warning("PRECHECK_FAILED: %s (%s qty=%d @ ₹%.2f)",
+                           reason, contract.symbol, qty, limit_px)
+            self._last_reject_context = {
+                "phase": "preflight",
+                "broker_status": "not_submitted",
+                "broker_reason": "insufficient_funds",
+                "user_message": reason,
+                "available": round(available_cash, 2),
+                "required": round(required_capital, 2),
+                "symbol": contract.symbol,
+                "qty": qty,
+            }
+            if getattr(self, "_timeline_session", None):
+                from execution_timeline import Event
+                self._tl(
+                    self._timeline_session, Event.PRECHECK_FAILED,
+                    reason,
+                    {"available": round(available_cash, 2),
+                     "required": round(required_capital, 2),
+                     "symbol": contract.symbol,
+                     "qty": qty,
+                     "ref_price": round(limit_px, 2)},
+                )
+            return False
+
         try:
             order_id = self.broker.place_order(payload)
         except SmartApiError as exc:
             self._api_reject_count += 1
-            logger.warning("Broker rejected entry: %s", exc)
+            # v1.13 — capture the FULL broker rejection reason so the UI
+            # can display it verbatim ("RMS: Margin Exceeds", exchange
+            # rejection text, "Insufficient funds", etc.) instead of a
+            # generic "broker rejected the entry".
+            broker_message = str(exc) if str(exc) else "broker rejected order (no message)"
+            logger.warning("Broker rejected entry: %s", broker_message)
+            self._last_reject_context = {
+                "phase": "broker",
+                "broker_status": "rejected",
+                "broker_reason": broker_message,
+                "user_message": f"Broker rejected the order — {broker_message}",
+                "symbol": contract.symbol,
+                "qty": qty,
+                "ref_price": round(limit_px, 2),
+            }
+            if getattr(self, "_timeline_session", None):
+                from execution_timeline import Event
+                self._tl(
+                    self._timeline_session, Event.ORDER_REJECTED,
+                    f"Broker rejected: {broker_message}",
+                    {"broker": "AngelOne",
+                     "reason": broker_message,
+                     "symbol": contract.symbol,
+                     "qty": qty,
+                     "ref_price": round(limit_px, 2)},
+                )
             return False
 
         self.positions.register_pending_entry(
