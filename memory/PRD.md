@@ -503,3 +503,16 @@ position sizing, Telegram alerts, existing API behavior.
 - **Regression test:** `/app/backend/tests/test_bot_init_attributes.py` — 3 tests locking in that `telegram`, `_exit_reason_hint`, `_spread_history`, `_ltp_history`, `timeline`, `_timeline_session` all exist immediately after `NiftyOptionsBot()` construction.
 - **Verification:** Full suite 111/111 passing (108 pre-existing + 3 new). Testing agent iteration_3 confirmed 100% backend pass, no regressions.
 - **Untouched (per user directive):** Trading logic, SMC scoring, risk management, execution pipeline, UI.
+
+## 2026-02-06 — P1: HTF Trend Detector Refinement (R1 — EQ tolerance)
+- **Problem:** HTF was returning NEUTRAL almost all the time; contributing ~0 confidence and capping SMC score at ~50%.
+- **Phase 1 audit outcome:** Two dominant causes — (1) strict `>`/`<` in `detect_structure` kills the verdict on equal endpoints, (2) `SWING_WINDOW=5` on 15m makes swings sparse. R2/R3/R4 alternatives evaluated; user approved R1 only.
+- **Change (single file):** `/app/backend/strategy/smc_engine.py::detect_structure` — added `_bps_diff` helper and rewrote decision matrix: equal endpoints on one side (within `EQ_TOLERANCE_BPS=5 bps`) treated as "flat on that side"; the OTHER side must still be strictly directional. CALL requires at least one strict-up side AND no strict-down side (mirror for PUT). Uses the existing SMC-native EQH/EQL tolerance — no new constants, no new primitives.
+- **Untouched (per user directive):** `SWING_WINDOW`, BOS, CHoCH, OB, FVG, sweeps, premium/discount, confidence weights, indicator engine, execution, risk, UI. Verified by testing agent.
+- **New tests:** `/app/backend/tests/test_htf_structure_r1.py` (16 regression tests). `/app/backend/tests/benchmark_htf_r1.py` (before/after A/B harness across 1200 synthetic 15m sessions).
+- **Benchmark results (seed=7, n=200/scenario, testing_agent verified):**
+  - Trending scenarios (n=800): false-NEUTRAL 38.0% → 25.0% (**34.2% relative reduction**). Correct-direction 62.0% → 75.0%.
+  - Sideways / choppy (n=400): directional flips 27.0% → 21.2% (**did not increase** — actually improved because the tolerance is stricter for genuine ranges where BOTH sides land flat).
+- **Full pytest suite:** 127/127 passing.
+- **Known limitation carried forward:** Cause #4 (post-BOS consolidation reads NEUTRAL) not addressed by R1 — deferred to R2 (BOS memory into HTF) pending live measurement of R1.
+
