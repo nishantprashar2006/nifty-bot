@@ -534,3 +534,17 @@ position sizing, Telegram alerts, existing API behavior.
 - **Full suite:** 139/139 passing (127 pre-existing + 12 new). Testing agent iteration_5 → PASS.
 - **Explicitly deferred per user:** periodic watchdog, background reconciliation thread, new FSM states.
 
+
+## 2026-02-06 — P1: Pre-flight margin check + broker rejection surfacing (v1.13)
+- **Problem:** Manual BUY was rejected by Angel One (insufficient funds) but the UI still showed "Order Queued". User could not tell whether the order was actually pending. Bot never displayed the broker rejection reason.
+- **Fix Part A — Pre-flight margin check (advisory, non-blocking):** In `_place_entry`, before calling `broker.place_order`, compute `required = qty × premium × (1 + PREFLIGHT_MARGIN_BUFFER_PCT=5%)` and compare against `broker.get_net_available_cash()`. If insufficient → return False, populate `self._last_reject_context` with structured payload, emit `Event.PRECHECK_FAILED`, NO broker submission, NO ORDER_PENDING transition. If RMS lookup fails → log and continue to broker (broker remains authority, never block).
+- **Fix Part B — Broker rejection handling:** Enhanced `SmartApiError` catch in `_place_entry` to capture the FULL exception message, populate `self._last_reject_context` with `{phase:'broker', broker_status:'rejected', broker_reason:<verbatim>, user_message, symbol, qty, ref_price}`, emit `Event.ORDER_REJECTED` timeline event. Zero PendingEntry / zero trade row / zero protection / zero ORDER_PENDING transition. `_handle_manual_entry` returns `(False, 'PRECHECK_FAILED: <json>' | 'BROKER_REJECTED: <json>')` written into `commands.result`.
+- **API:** `GET /api/bot/commands` now parses the structured result and adds `broker_status`, `broker_reason`, `user_message`, `rejection.tag` fields. Success rows carry nulls for these.
+- **UI:** `App.js::placeManual` polls `/bot/commands` for up to 6 s after clicking Buy Call/Put. If the daemon's completed command has `broker_status ∈ {'rejected','not_submitted'}`, shows a red `toast.error("Order Rejected"|"Order Not Submitted", user_message + broker_reason)` and refreshes state.
+- **New config:** `PREFLIGHT_MARGIN_BUFFER_PCT = 0.05` in config.py.
+- **New timeline events:** `Event.PRECHECK_FAILED`, `Event.ORDER_REJECTED`.
+- **Untouched (per user directive, verified by testing agent):** SMC engine, indicator engine, HTF, BOS/CHoCH/FVG/OB/sweeps/premium-discount, risk management, position sizer, `_handle_fill`, `_place_protective_legs`, v1.12 order-pending reconciliation, DB schema, timeline schema, WebSocket layer, FSM architecture, broker wrapper APIs, order placement algorithm.
+- **New tests:** `/app/backend/tests/test_preflight_and_rejection.py` (9 tests: enough balance normal path; insufficient balance blocks broker call; preflight-pass-broker-rejects; RMS/exchange rejection message preserved verbatim; RMS lookup failure does NOT block; PRECHECK/REJECTED timeline events exactly once; `list_commands` structured decoding; `_handle_manual_entry` returns structured PRECHECK JSON).
+- **Full suite:** 148/148 passing (139 pre-existing + 9 new). Testing agent iteration_6 → PASS. Frontend smoke screenshot confirmed dashboard still renders.
+- **Explicitly deferred per user:** automatic lot reduction, automatic margin optimization, automatic retries, dashboard redesign, background reconciliation thread, new FSM states.
+
