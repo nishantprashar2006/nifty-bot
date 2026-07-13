@@ -492,3 +492,14 @@ multipliers, SWING_WINDOW, RECENT_EVENT_BARS, WebSocket logic, quote
 pipeline, broker integration, FSM transitions, risk management,
 position sizing, Telegram alerts, existing API behavior.
 
+
+
+## 2026-02-06 — P0 Fix: Telegram AttributeError on VPS boot
+- **Root cause:** A prior edit accidentally captured the tail of `NiftyOptionsBot.__init__` (including `self.telegram = TelegramNotifier()`, `_exit_reason_hint`, `_spread_history`, `_ltp_history`) inside the body of `_tl_rekey()`. Because `_tl_rekey` was never called during boot, `self.telegram` was never assigned, so `self.telegram.send_startup()` crashed with `AttributeError`.
+- **Fix (main.py):**
+  - Restored all misplaced attributes to `__init__` tail (lines ~134-154).
+  - Reduced `_tl_rekey()` to a minimal 9-line guarded shim identical in shape to `_tl()`.
+  - Added `getattr(self, "telegram", None)` belt-and-suspenders guards at both call sites (`start()` startup ping line ~240, SMC notify tick line ~1650).
+- **Regression test:** `/app/backend/tests/test_bot_init_attributes.py` — 3 tests locking in that `telegram`, `_exit_reason_hint`, `_spread_history`, `_ltp_history`, `timeline`, `_timeline_session` all exist immediately after `NiftyOptionsBot()` construction.
+- **Verification:** Full suite 111/111 passing (108 pre-existing + 3 new). Testing agent iteration_3 confirmed 100% backend pass, no regressions.
+- **Untouched (per user directive):** Trading logic, SMC scoring, risk management, execution pipeline, UI.
