@@ -572,3 +572,32 @@ Reported issues fixed: (1) protection SELL orders rejected with "Please set your
 
 **Full suite:** 167/167 passing (148 pre-existing + 19 new). Testing agent iteration_7 → PASS. No regressions in iterations 3-6.
 
+
+## 2026-02-06 — v1.15: SIM Auto Trading with Dashboard Controls
+Enables the bot to fire the SAME manual-entry pipeline automatically when SMC confidence ≥ threshold. No strategy touch.
+
+**Backend:**
+- `_maybe_auto_entry(smc_payload)` new hook at end of `_update_smc_score`. Fires only when ALL gates pass: AUTO enabled in DB, `_auto_suspended_reason` empty, no open/pending position, FSM=IDLE, direction∈{CALL,PUT}, confidence ≥ `config.SMC_AUTO_TRADE_THRESHOLD` (default 40), circuit breakers clear. Delegates to unchanged `_handle_manual_entry(direction, lots_override=<db_default>, engine="smc", ...)`.
+- `_suspend_auto(reason)` new helper. Sets in-memory flag, persists to `bot_state.auto_suspended_reason`, emits `Event.AUTO_SUSPENDED` timeline event, notifies Telegram. Idempotent.
+- `_place_protective_legs` now calls `_suspend_auto` on protection-incomplete branch (before FORCED_EXIT).
+- Daemon syncs `_auto_suspended_reason` from DB on every SMC tick — dashboard Resume clears it.
+- 3 new timeline events: `AUTO_MODE_CHANGE`, `AUTO_ENTRY`, `AUTO_SUSPENDED`.
+- 3 new Telegram helpers: `send_mode_change`, `send_auto_entry`, `send_auto_suspended`.
+
+**API (server.py):**
+- `POST /api/bot/auto_mode {enabled: bool}` — toggles trading mode. Clears any lingering suspension when enabling.
+- `POST /api/bot/default_lots {lots: int>0}` — persists default lot count for AUTO entries.
+- `POST /api/bot/auto_resume` — clears suspension reason after operator investigates.
+- `GET /api/bot/status` extended: `trading_execution_mode` ('AUTO'|'MANUAL'), `auto_trade_enabled`, `auto_suspended_reason`, `default_lots`, `smc_auto_trade_threshold`.
+
+**Frontend (App.js):**
+- New Trading Execution Mode card with MANUAL/AUTO segmented control + mode badge + description "AUTO fires SMC entries automatically when confidence ≥ N%".
+- Suspended-state banner with Resume button.
+- Lots input persists on blur via `POST /api/bot/default_lots` — survives restart.
+
+**Untouched (per user directive):** SMC engine, HTF, BOS/CHoCH/FVG/OB/sweeps, confidence weights, entry conditions, risk model, indicator engine, `_handle_fill`, `_place_protective_legs` core logic (only added `_suspend_auto` call), v1.12 reconciliation, v1.13 rejection surfacing, v1.14 tick-round/protection-health/broker-audit.
+
+**Regression:** 13 new tests in `/app/backend/tests/test_auto_trade_v15.py`. Full suite 180/180. Testing agent iteration_8 → 100% PASS.
+
+**Deferred (explicit user scope):** EOD summary Telegram, complex circuit breakers (consecutive-loss limits, max-trades/day, cool-down timers), dashboard redesign — all backlog.
+
