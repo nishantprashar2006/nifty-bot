@@ -601,3 +601,30 @@ Enables the bot to fire the SAME manual-entry pipeline automatically when SMC co
 
 **Deferred (explicit user scope):** EOD summary Telegram, complex circuit breakers (consecutive-loss limits, max-trades/day, cool-down timers), dashboard redesign — all backlog.
 
+
+## 2026-02-06 — v2.0: Auto Risk-Based Position Sizing + Lots-persistence bug fix
+Combined bug fix + feature. Only lot-count arithmetic changes; SMC/execution/FSM/risk model/entry-exit rules untouched.
+
+**Bug fix — lots reset to 1 after restart:** `GET /api/bot/manual_lots` previously ALWAYS recomputed from capital, ignoring the operator's saved value. Fixed: now prefers `bot_state.default_lots` when present (source='user_saved') and only falls back to the legacy auto calc for fresh installs (source='auto'). Restart-persistence proven via curl.
+
+**Feature — Auto Risk sizing:**
+- New helper `_compute_auto_risk_lots(entry_ref_price)` in main.py. Formula: `risk_amount = capital × risk_pct/100; loss_per_lot = entry × MANUAL_SL_PCT × LOT_SIZE_NIFTY; calculated = floor(risk_amount/loss_per_lot); final = max(1, min(max_lots, calculated))`.
+- SIM path uses `bot_state.sim_capital` — **never** calls broker.
+- LIVE path calls `broker.get_net_available_cash()`; on failure returns error and blocks trade (no silent fallback).
+- `_maybe_auto_entry` selects sizing_mode: `manual` (reads default_lots — unchanged) or `auto_risk` (calls helper, emits `Event.AUTO_SIZING`; on error emits `Event.AUTO_ENTRY_CANCELLED` + `telegram.send_auto_cancelled`, no entry).
+- 2 new timeline events: `AUTO_SIZING`, `AUTO_ENTRY_CANCELLED`.
+- 1 new Telegram helper: `send_auto_cancelled(reason, calc)`.
+
+**API:**
+- `POST /api/bot/sizing_config` — writes sizing_mode / risk_pct / max_lots / sim_capital / default_lots (all optional per call). Validates: risk_pct in (0,10], max_lots≥1, sim_capital>0, default_lots≥1, sizing_mode∈{'manual','auto_risk'}. HTTP 400 on invalid.
+- `GET /api/bot/sizing_config` — round-trip.
+- `/api/bot/status` extended with `sizing_mode`, `risk_pct`, `max_lots`, `sim_capital`.
+
+**UI (App.js):** New "Position Sizing" card with MANUAL/AUTO RISK segmented toggle. When AUTO RISK: editable Sim Capital (hidden in LIVE), Risk %, Max Lots inputs with onBlur persistence + live Risk Amount preview.
+
+**Untouched (per user directive):** SMC engine, HTF, BOS/CHoCH/FVG/OB/sweeps/premium-discount, confidence weights, entry rules, exit rules, SL/TP/Trailing, FSM, `_handle_fill`, `_place_protective_legs`, broker order placement, execution reconciliation, existing timeline sequencing, Telegram behaviour outside the new helper.
+
+**Regression:** 12 new tests in `/app/backend/tests/test_position_sizing_v2.py`. Full suite 192/192. Testing agent iteration_9 → 100% PASS. Restart persistence proven via curl.
+
+**Deferred:** Position sizing preview in the entry-timeline UI panel, LIVE available-funds live display in the sizing card, historical sizing-decision audit table.
+
