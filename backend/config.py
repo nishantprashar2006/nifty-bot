@@ -229,5 +229,9 @@ TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 try:
     SMC_ALERT_THRESHOLD: int = int(os.getenv("SMC_ALERT_THRESHOLD", "40"))
+    # v1.15 — Auto trading uses the same signal threshold as advisory alerts.
+    # Runtime toggle lives in `bot_state.auto_trade_enabled` (dashboard driven).
+    SMC_AUTO_TRADE_THRESHOLD: int = int(os.getenv("SMC_AUTO_TRADE_THRESHOLD", str(SMC_ALERT_THRESHOLD)))
 except ValueError:
     SMC_ALERT_THRESHOLD = 40
+    SMC_AUTO_TRADE_THRESHOLD = 40

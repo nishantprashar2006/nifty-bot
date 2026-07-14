@@ -179,6 +179,12 @@ class NiftyOptionsBot:
         # reason (available/required funds, broker message, error code).
         self._last_reject_context: Optional[dict] = None
 
+        # v1.15 — auto-trade safety flag. Set to a non-empty string when a
+        # protection failure / broker outage occurs. While set, the auto
+        # entry gate refuses to fire even if AUTO mode is on. Cleared only
+        # by an explicit dashboard "resume" action.
+        self._auto_suspended_reason: Optional[str] = None
+
     def _tl(self, trade_id: str, event_type: str, message: str, payload: Optional[dict] = None) -> None:
         """v1.10 — SAFE timeline logging shim.
 
@@ -1368,6 +1374,8 @@ class NiftyOptionsBot:
                 "Protection incomplete (tp=%s sl=%s) — flattening position.",
                 tgt_id, sl_id,
             )
+            # v1.15 — protection failure ⇒ suspend AUTO trading until operator resumes.
+            self._suspend_auto(f"Protection incomplete: TP={tgt_err} · SL={sl_err}")
             self._exit_reason_hint = config.ExitReason.REJECTED.value
             self._transition(config.State.FORCED_EXIT)
             return
@@ -1832,8 +1840,115 @@ class NiftyOptionsBot:
                     tg.maybe_notify_smc(payload)
             except Exception:
                 logger.exception("Telegram maybe_notify_smc raised (ignored)")
+            # v1.15 — Auto-trade gate. Fires the EXISTING manual-entry
+            # pipeline when AUTO mode is on and threshold is met. No new
+            # execution logic; just a conditional call.
+            try:
+                self._maybe_auto_entry(payload)
+            except Exception:
+                logger.exception("auto_entry gate raised (ignored)")
         except Exception:
             logger.debug("SMC scoring tick failed (continuing)", exc_info=True)
+
+    # ─────────────────────────────────────────────── v1.15 auto trade
+    def _maybe_auto_entry(self, smc_payload: dict) -> None:
+        """Fire an auto-entry only when ALL gates pass. Reuses the manual
+        entry code path (`_handle_manual_entry`) unchanged."""
+        # 0. Sync suspension reason from the DB — the dashboard's Resume
+        # button clears the DB value; the daemon picks it up here.
+        try:
+            row = self.db.get_state("auto_suspended_reason")
+            db_reason = (row[0] if row else "") or ""
+            if db_reason != (self._auto_suspended_reason or ""):
+                self._auto_suspended_reason = db_reason if db_reason else None
+        except Exception:
+            pass
+        # 1. AUTO mode must be enabled from the dashboard.
+        row = self.db.get_state("auto_trade_enabled")
+        if not row or str(row[0]).lower() not in ("1", "true", "yes"):
+            return
+        # 2. Safety-suspended → refuse until operator resumes.
+        if self._auto_suspended_reason:
+            return
+        # 3. No existing position or pending order.
+        if self.positions.has_open_position or self.positions.has_pending_entry:
+            return
+        # 4. FSM must be IDLE (never fire from FORCED_EXIT / SHUTDOWN).
+        if self.state is not config.State.IDLE:
+            return
+        # 5. SMC signal must be actionable.
+        direction_str = smc_payload.get("direction")
+        confidence = int(smc_payload.get("confidence") or 0)
+        if direction_str not in ("CALL", "PUT"):
+            return
+        if confidence < config.SMC_AUTO_TRADE_THRESHOLD:
+            return
+        # 6. Circuit breakers (single-position lock already handled above;
+        # let _trip_circuit_breakers cover trade cap + ws health + PnL guard).
+        breach = self._trip_circuit_breakers()
+        if breach:
+            return
+        # 7. Optional lot override from dashboard.
+        lots_override = None
+        try:
+            lots_row = self.db.get_state("default_lots")
+            if lots_row and int(lots_row[0]) > 0:
+                lots_override = int(lots_row[0])
+        except Exception:
+            pass
+        direction = (config.Direction.LONG if direction_str == "CALL"
+                     else config.Direction.SHORT)
+        reasons = list(smc_payload.get("reasons") or [])
+        logger.info("AUTO ENTRY firing: %s conf=%d%% reasons=%s",
+                    direction_str, confidence, reasons[:3])
+        try:
+            from execution_timeline import Event as _Ev
+            session = getattr(self, "_timeline_session", None) or "AUTO"
+            self._tl(session, _Ev.AUTO_ENTRY,
+                     f"AUTO {direction_str} @ {confidence}%",
+                     {"direction": direction_str, "confidence": confidence,
+                      "reasons": reasons[:5], "lots": lots_override})
+        except Exception:
+            pass
+        ok, msg = self._handle_manual_entry(
+            direction, lots_override=lots_override,
+            engine="smc", confidence=confidence, reasons=reasons,
+        )
+        # Telegram — reuse the notifier.
+        try:
+            tg = getattr(self, "telegram", None)
+            if tg is not None and hasattr(tg, "send_auto_entry"):
+                tg.send_auto_entry(direction_str, confidence, reasons, ok, msg)
+        except Exception:
+            logger.exception("Telegram auto-entry notify failed (ignored)")
+
+    def _suspend_auto(self, reason: str) -> None:
+        """Called from execution safety paths (protection failure, broker
+        outage) to disable AUTO entries until the operator explicitly
+        resumes from the dashboard."""
+        if getattr(self, "_auto_suspended_reason", None) == reason:
+            return
+        self._auto_suspended_reason = reason
+        try:
+            self.db.set_state("auto_suspended_reason", reason)
+        except Exception:
+            pass
+        logger.critical("AUTO SUSPENDED: %s", reason)
+        try:
+            from execution_timeline import Event as _Ev
+            pos = self.positions.open_position
+            anchor = (pos.trade_id if pos else getattr(self, "_timeline_session", None) or "AUTO")
+            self._tl(anchor, _Ev.AUTO_SUSPENDED,
+                     f"Auto trading suspended — {reason}",
+                     {"reason": reason})
+        except Exception:
+            pass
+        try:
+            tg = getattr(self, "telegram", None)
+            if tg is not None and hasattr(tg, "send_auto_suspended"):
+                tg.send_auto_suspended(reason)
+        except Exception:
+            logger.exception("Telegram auto-suspend notify failed (ignored)")
 
     def _step_wait_confirmation(self) -> None:
         sig = self._pending_signal

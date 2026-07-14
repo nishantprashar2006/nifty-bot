@@ -80,6 +80,10 @@ class Event:
     BROKER_DELAY      = "BROKER_DELAY"
     # v1.14 — Phase Y broker API audit + Phase X pending-timeout attestation
     PENDING_TIMEOUT   = "PENDING_TIMEOUT"
+    # v1.15 — Auto-trade mode + safety suspension
+    AUTO_MODE_CHANGE  = "AUTO_MODE_CHANGE"
+    AUTO_ENTRY        = "AUTO_ENTRY"
+    AUTO_SUSPENDED    = "AUTO_SUSPENDED"
     # informational
     NOTE              = "NOTE"
 

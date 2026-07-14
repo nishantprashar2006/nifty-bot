@@ -881,6 +881,14 @@ function App() {
                       setLots(v);
                       setLotsEdited(true);
                     }}
+                    onBlur={(e) => {
+                      // v1.15 — persist the operator's lot size so AUTO
+                      // entries after a restart use the same value.
+                      const v = e.target.value === "" ? null : Math.max(1, parseInt(e.target.value, 10) || 1);
+                      if (v && v > 0) {
+                        axios.post(`${API}/bot/default_lots`, { lots: v }).catch(() => {});
+                      }
+                    }}
                     disabled={busy || !canTrade}
                     className="w-20 bg-zinc-900 border border-zinc-800 px-2 py-1 font-mono text-sm text-zinc-100 text-right disabled:opacity-40 focus:outline-none focus:border-amber-500"
                   />
@@ -953,6 +961,73 @@ function App() {
                   </button>
                 );
               })}
+            </div>
+          </div>
+        </Card>
+
+        {/* v1.15 — AUTO / MANUAL execution mode toggle */}
+        <Card data-testid="mode-toggle-card" className="border-zinc-800 bg-zinc-950/70 p-4 rounded-none">
+          <div className="flex items-center justify-between flex-wrap gap-3">
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono">Trading Execution Mode</div>
+              <div className="text-[10px] font-mono text-zinc-600 mt-1">
+                AUTO fires SMC entries automatically when confidence ≥ {status?.smc_auto_trade_threshold ?? 40}%. MANUAL requires Buy Call / Buy Put click.
+              </div>
+              {status?.auto_suspended_reason && (
+                <div data-testid="auto-suspended-banner" className="mt-2 text-[11px] text-red-300 border border-red-800 bg-red-950/20 px-2 py-1">
+                  🛑 AUTO SUSPENDED — {status.auto_suspended_reason}{" "}
+                  <button
+                    data-testid="auto-resume-btn"
+                    className="ml-2 underline text-red-200 hover:text-red-100"
+                    onClick={async () => {
+                      try {
+                        await axios.post(`${API}/bot/auto_resume`);
+                        toast.success("Auto trading resumed");
+                        await fetchAll();
+                      } catch (e) {
+                        toast.error(`Resume failed: ${e?.response?.data?.detail || e.message}`);
+                      }
+                    }}
+                  >
+                    Resume
+                  </button>
+                </div>
+              )}
+            </div>
+            <div className="flex items-center gap-3">
+              <div className="text-[10px] font-mono text-zinc-500 uppercase tracking-wider">
+                Mode: <span className={`ml-1 ${status?.auto_trade_enabled ? "text-emerald-400" : "text-zinc-300"}`} data-testid="mode-badge">
+                  {status?.trading_execution_mode ?? "MANUAL"}
+                </span>
+              </div>
+              <div className="flex border border-zinc-800 divide-x divide-zinc-800">
+                {[
+                  { id: false, label: "MANUAL" },
+                  { id: true, label: "AUTO" },
+                ].map((opt) => {
+                  const active = !!status?.auto_trade_enabled === opt.id;
+                  return (
+                    <button
+                      key={String(opt.id)}
+                      data-testid={`mode-${opt.label.toLowerCase()}`}
+                      onClick={async () => {
+                        try {
+                          await axios.post(`${API}/bot/auto_mode`, { enabled: opt.id });
+                          toast.success(`Switched to ${opt.label}`);
+                          await fetchAll();
+                        } catch (e) {
+                          toast.error(`Mode change failed: ${e?.response?.data?.detail || e.message}`);
+                        }
+                      }}
+                      className={`px-3 py-1.5 text-xs font-mono font-semibold tracking-wider transition-colors ${
+                        active ? "bg-emerald-500/80 text-zinc-950" : "text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60"
+                      }`}
+                    >
+                      {active && <span className="mr-1.5">●</span>}{opt.label}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </div>
         </Card>

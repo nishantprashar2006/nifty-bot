@@ -178,3 +178,51 @@ class TelegramNotifier:
             f"<b>Reasons:</b>\n{reasons_block}\n\n"
             f"<i>Time: {ts} IST</i>"
         )
+
+
+    # ─── v1.15 auto-trade notifications ─────────────────────────────
+    def send_mode_change(self, new_mode: str, lots: int, threshold: int) -> None:
+        if not self.enabled:
+            return
+        icon = "🟢" if new_mode.upper() == "AUTO" else "⚪"
+        text = (
+            f"{icon} <b>{new_mode.upper()} MODE</b>\n\n"
+            f"<b>Threshold:</b> {threshold}%\n"
+            f"<b>Lots:</b> {lots}"
+        )
+        try:
+            self._send(text)
+        except Exception:
+            pass
+
+    def send_auto_entry(self, direction: str, confidence: int, reasons: list,
+                        ok: bool, msg: str) -> None:
+        if not self.enabled:
+            return
+        icon = "🚀" if ok else "⚠️"
+        head = "AUTO BUY " + ("CALL" if direction == "CALL" else "PUT")
+        reasons_block = "\n".join(f"• {r}" for r in reasons[:4]) if reasons else "—"
+        status = "" if ok else f"\n<b>Result:</b> {msg}"
+        text = (
+            f"{icon} <b>{head}</b>\n\n"
+            f"<b>Confidence:</b> {confidence}%\n"
+            f"<b>Reasons:</b>\n{reasons_block}"
+            f"{status}"
+        )
+        try:
+            self._send(text)
+        except Exception:
+            pass
+
+    def send_auto_suspended(self, reason: str) -> None:
+        if not self.enabled:
+            return
+        text = (
+            "🛑 <b>AUTO SUSPENDED</b>\n\n"
+            f"<b>Reason:</b> {reason}\n\n"
+            "Auto entries paused. Resume from dashboard when safe."
+        )
+        try:
+            self._send(text)
+        except Exception:
+            pass

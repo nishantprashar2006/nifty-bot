@@ -1,0 +1,16 @@
+{
+  "summary": "v1.15 SIM Auto Trading backend verified. Full pytest suite 180/180 passing (13 new v15 tests + 167 pre-existing, zero regressions). New endpoints /api/bot/auto_mode, /api/bot/default_lots, /api/bot/auto_resume all return correct payloads. /api/bot/status extended with trading_execution_mode, auto_trade_enabled, auto_suspended_reason, default_lots, smc_auto_trade_threshold. Invalid lots (0) correctly returns HTTP 400.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": ["/app/backend/tests/test_auto_trade_v15.py", "/app/test_reports/pytest/iter8.xml"],
+  "action_items": [],
+  "critical_code_review_comments": [],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "not tested (skipped per request)"},
+  "test_credentials": "n/a",
+  "seed_data_creation": "none",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "v1.15 backend complete. Endpoint verification via curl on preview URL confirmed: auto_mode toggle flips trading_execution_mode AUTO/MANUAL, default_lots persists, auto_resume clears suspension. Frontend testing skipped per review_request.",
+  "rca of the issue": "n/a - no issues found"
+}

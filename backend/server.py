@@ -146,6 +146,30 @@ def _update_env_value(key: str, value: str) -> None:
     ENV_FILE.write_text("\n".join(lines) + "\n")
 
 
+def _read_bot_state(key: str, default: str = "") -> str:
+    """v1.15 — read a value from the daemon's bot_state key/value store."""
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT value FROM bot_state WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else default
+    except Exception:
+        return default
+
+
+def _write_bot_state(key: str, value: str) -> None:
+    from datetime import datetime, timezone
+    try:
+        with _conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO bot_state(key, value, updated) VALUES (?, ?, ?)",
+                (key, value, datetime.now(timezone.utc).isoformat()),
+            )
+    except Exception:
+        pass
+
+
 # ──────────────────────────────────────────────────── Routes
 @api.get("/")
 def root() -> dict[str, Any]:
@@ -286,6 +310,12 @@ def bot_status() -> dict[str, Any]:
             _read_env_value("TELEGRAM_ENABLED") or "false"
         ).lower() == "true",
         "smc_alert_threshold": int(_read_env_value("SMC_ALERT_THRESHOLD") or config.SMC_ALERT_THRESHOLD),
+        # v1.15 — auto-trade dashboard state
+        "smc_auto_trade_threshold": int(_read_env_value("SMC_AUTO_TRADE_THRESHOLD") or config.SMC_AUTO_TRADE_THRESHOLD),
+        "trading_execution_mode": _read_bot_state("auto_trade_enabled", "false").lower() == "true" and "AUTO" or "MANUAL",
+        "auto_trade_enabled": _read_bot_state("auto_trade_enabled", "false").lower() == "true",
+        "auto_suspended_reason": _read_bot_state("auto_suspended_reason", "") or None,
+        "default_lots": int(_read_bot_state("default_lots", "1") or 1),
     }
 
 
@@ -679,6 +709,44 @@ def list_commands(limit: int = 10) -> list[dict[str, Any]]:
                 break
         out.append(item)
     return out
+
+
+# ─── v1.15 auto-trade dashboard endpoints ───────────────────────────
+class AutoModeRequest(BaseModel):
+    enabled: bool
+
+
+@api.post("/bot/auto_mode")
+def set_auto_mode(req: AutoModeRequest) -> dict[str, Any]:
+    """Toggle AUTO / MANUAL execution mode. No restart required."""
+    _write_bot_state("auto_trade_enabled", "true" if req.enabled else "false")
+    # Clear any lingering suspension when the operator explicitly opts in.
+    if req.enabled:
+        _write_bot_state("auto_suspended_reason", "")
+    return {
+        "auto_trade_enabled": req.enabled,
+        "mode": "AUTO" if req.enabled else "MANUAL",
+    }
+
+
+class DefaultLotsRequest(BaseModel):
+    lots: int
+
+
+@api.post("/bot/default_lots")
+def set_default_lots(req: DefaultLotsRequest) -> dict[str, Any]:
+    """Persist the default lot size for the next AUTO entry."""
+    if req.lots <= 0:
+        raise HTTPException(status_code=400, detail="lots must be a positive integer")
+    _write_bot_state("default_lots", str(int(req.lots)))
+    return {"default_lots": int(req.lots)}
+
+
+@api.post("/bot/auto_resume")
+def auto_resume() -> dict[str, Any]:
+    """Clear an AUTO_SUSPENDED reason after the operator has investigated."""
+    _write_bot_state("auto_suspended_reason", "")
+    return {"auto_suspended_reason": None}
 
 
 @api.post("/bot/panic_exit")
