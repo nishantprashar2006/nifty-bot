@@ -316,6 +316,11 @@ def bot_status() -> dict[str, Any]:
         "auto_trade_enabled": _read_bot_state("auto_trade_enabled", "false").lower() == "true",
         "auto_suspended_reason": _read_bot_state("auto_suspended_reason", "") or None,
         "default_lots": int(_read_bot_state("default_lots", "1") or 1),
+        # v2.0 — auto risk sizing
+        "sizing_mode": _read_bot_state("sizing_mode", "manual"),
+        "risk_pct": float(_read_bot_state("risk_pct", "1.0") or 1.0),
+        "max_lots": int(_read_bot_state("max_lots", "5") or 5),
+        "sim_capital": float(_read_bot_state("sim_capital", "200000") or 200000),
     }
 
 
@@ -580,13 +585,30 @@ def force_close_orphan() -> dict[str, Any]:
 
 @api.get("/bot/manual_lots")
 def manual_lots_default() -> dict[str, Any]:
-    """Auto-calculated lot count using the existing drawdown-aware sizer
-    (PART 3 §5). Mirrors what the bot would size internally on an entry —
-    the UI uses this as the default value in the editable lot-size box,
-    then locks in whatever the user submits."""
+    """Return the operator's persisted manual lot count.
+
+    Prefers the value the user last saved via `POST /bot/default_lots`
+    (persisted in `bot_state.default_lots`). Falls back to the legacy
+    drawdown-aware auto-size only when the operator has never set a
+    preference — this preserves backward compatibility for a fresh
+    install but honours user intent for every established deployment.
+    """
     import math
+    saved = _read_bot_state("default_lots", "")
+    if saved:
+        try:
+            v = int(saved)
+            if v >= 1:
+                return {
+                    "default_lots": v,
+                    "current_equity": _current_paper_capital(),
+                    "drawdown_pct": 0.0,
+                    "trading_mode": _current_trading_mode(),
+                    "source": "user_saved",
+                }
+        except Exception:
+            pass
     capital = _current_paper_capital()
-    # Pull latest equity row so the drawdown scale is honoured
     with _conn() as c:
         eq = c.execute(
             "SELECT current_equity, peak_equity, drawdown_pct, effective_lots "
@@ -599,7 +621,6 @@ def manual_lots_default() -> dict[str, Any]:
         eff_eq = float(eq["current_equity"])
         dd = float(eq["drawdown_pct"])
     else:
-        # cold start — base lots from capital alone
         try:
             from config import CAPITAL_PER_LOT, MIN_LOTS, MAX_LOTS_DYNAMIC
         except Exception:
@@ -611,6 +632,7 @@ def manual_lots_default() -> dict[str, Any]:
         "current_equity": eff_eq,
         "drawdown_pct": dd,
         "trading_mode": _current_trading_mode(),
+        "source": "auto",
     }
 
 
@@ -747,6 +769,53 @@ def auto_resume() -> dict[str, Any]:
     """Clear an AUTO_SUSPENDED reason after the operator has investigated."""
     _write_bot_state("auto_suspended_reason", "")
     return {"auto_suspended_reason": None}
+
+
+# ─── v2.0 sizing endpoints ──────────────────────────────────────────
+class SizingConfigRequest(BaseModel):
+    sizing_mode: Optional[str] = None          # "manual" | "auto_risk"
+    risk_pct: Optional[float] = None           # 0 < x <= 10
+    max_lots: Optional[int] = None             # >= 1
+    sim_capital: Optional[float] = None        # > 0
+    default_lots: Optional[int] = None         # >= 1 (manual mode)
+
+
+@api.post("/bot/sizing_config")
+def set_sizing_config(req: SizingConfigRequest) -> dict[str, Any]:
+    """v2.0 — persist auto-risk position-sizing settings. All fields
+    optional; only supplied ones are written. Rejects out-of-range values."""
+    if req.sizing_mode is not None:
+        if req.sizing_mode not in ("manual", "auto_risk"):
+            raise HTTPException(status_code=400, detail="sizing_mode must be 'manual' or 'auto_risk'")
+        _write_bot_state("sizing_mode", req.sizing_mode)
+    if req.risk_pct is not None:
+        if req.risk_pct <= 0 or req.risk_pct > 10:
+            raise HTTPException(status_code=400, detail="risk_pct must be >0 and <=10")
+        _write_bot_state("risk_pct", str(float(req.risk_pct)))
+    if req.max_lots is not None:
+        if req.max_lots < 1:
+            raise HTTPException(status_code=400, detail="max_lots must be >=1")
+        _write_bot_state("max_lots", str(int(req.max_lots)))
+    if req.sim_capital is not None:
+        if req.sim_capital <= 0:
+            raise HTTPException(status_code=400, detail="sim_capital must be >0")
+        _write_bot_state("sim_capital", str(float(req.sim_capital)))
+    if req.default_lots is not None:
+        if req.default_lots < 1:
+            raise HTTPException(status_code=400, detail="default_lots must be >=1")
+        _write_bot_state("default_lots", str(int(req.default_lots)))
+    return get_sizing_config()
+
+
+@api.get("/bot/sizing_config")
+def get_sizing_config() -> dict[str, Any]:
+    return {
+        "sizing_mode": _read_bot_state("sizing_mode", "manual"),
+        "risk_pct": float(_read_bot_state("risk_pct", "1.0") or 1.0),
+        "max_lots": int(_read_bot_state("max_lots", "5") or 5),
+        "sim_capital": float(_read_bot_state("sim_capital", "200000") or 200000),
+        "default_lots": int(_read_bot_state("default_lots", "1") or 1),
+    }
 
 
 @api.post("/bot/panic_exit")

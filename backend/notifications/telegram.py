@@ -226,3 +226,19 @@ class TelegramNotifier:
             self._send(text)
         except Exception:
             pass
+
+    def send_auto_cancelled(self, reason: str, calc: dict) -> None:
+        if not self.enabled:
+            return
+        text = (
+            "⚠️ <b>AUTO ENTRY CANCELLED</b>\n\n"
+            f"<b>Reason:</b> {reason}\n"
+            f"<b>Capital:</b> ₹{calc.get('capital', 0):,.0f}\n"
+            f"<b>Calculated Lots:</b> {calc.get('calculated_lots', '—')}\n"
+            f"<b>Max Lots:</b> {calc.get('max_lots', '—')}"
+        )
+        try:
+            self._send(text)
+        except Exception:
+            pass
+

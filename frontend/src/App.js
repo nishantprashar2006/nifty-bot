@@ -1032,6 +1032,107 @@ function App() {
           </div>
         </Card>
 
+        {/* v2.0 — Position Sizing card */}
+        <Card data-testid="sizing-card" className="border-zinc-800 bg-zinc-950/70 p-4 rounded-none">
+          <div className="flex flex-wrap items-start gap-4">
+            <div className="flex-1 min-w-[220px]">
+              <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono mb-2">Position Sizing</div>
+              <div className="flex border border-zinc-800 divide-x divide-zinc-800">
+                {[
+                  { id: "manual", label: "MANUAL" },
+                  { id: "auto_risk", label: "AUTO RISK" },
+                ].map((opt) => {
+                  const active = (status?.sizing_mode || "manual") === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      data-testid={`sizing-mode-${opt.id}`}
+                      onClick={async () => {
+                        try {
+                          await axios.post(`${API}/bot/sizing_config`, { sizing_mode: opt.id });
+                          toast.success(`Sizing → ${opt.label}`);
+                          await fetchAll();
+                        } catch (e) {
+                          toast.error(`Save failed: ${e?.response?.data?.detail || e.message}`);
+                        }
+                      }}
+                      className={`px-3 py-1.5 text-xs font-mono font-semibold tracking-wider transition-colors ${
+                        active ? "bg-sky-500/80 text-zinc-950" : "text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/60"
+                      }`}
+                    >
+                      {active && <span className="mr-1.5">●</span>}{opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <div className="text-[10px] font-mono text-zinc-600 mt-2">
+                MANUAL — the user&apos;s saved lot count is used unchanged. AUTO RISK — lots are computed each entry from capital × risk % ÷ per-lot loss, clamped to max lots.
+              </div>
+            </div>
+
+            {(status?.sizing_mode || "manual") === "auto_risk" && (
+              <div className="flex flex-wrap gap-3 text-xs font-mono">
+                {status?.trading_mode !== "live" && (
+                  <label className="flex flex-col text-zinc-500">
+                    <span className="text-[9px] uppercase tracking-widest mb-1">Sim Capital ₹</span>
+                    <input
+                      data-testid="sim-capital-input"
+                      type="number" min="1" step="1000"
+                      defaultValue={status?.sim_capital ?? 200000}
+                      className="w-32 bg-zinc-900 border border-zinc-800 px-2 py-1 text-amber-200"
+                      onBlur={async (e) => {
+                        const v = parseFloat(e.target.value);
+                        if (v > 0) {
+                          try { await axios.post(`${API}/bot/sizing_config`, { sim_capital: v }); await fetchAll(); }
+                          catch (err) { toast.error(err?.response?.data?.detail || err.message); }
+                        }
+                      }}
+                    />
+                  </label>
+                )}
+                <label className="flex flex-col text-zinc-500">
+                  <span className="text-[9px] uppercase tracking-widest mb-1">Risk %</span>
+                  <input
+                    data-testid="risk-pct-input"
+                    type="number" min="0.1" max="10" step="0.1"
+                    defaultValue={status?.risk_pct ?? 1.0}
+                    className="w-20 bg-zinc-900 border border-zinc-800 px-2 py-1 text-amber-200"
+                    onBlur={async (e) => {
+                      const v = parseFloat(e.target.value);
+                      if (v > 0 && v <= 10) {
+                        try { await axios.post(`${API}/bot/sizing_config`, { risk_pct: v }); await fetchAll(); }
+                        catch (err) { toast.error(err?.response?.data?.detail || err.message); }
+                      }
+                    }}
+                  />
+                </label>
+                <label className="flex flex-col text-zinc-500">
+                  <span className="text-[9px] uppercase tracking-widest mb-1">Max Lots</span>
+                  <input
+                    data-testid="max-lots-input"
+                    type="number" min="1" step="1"
+                    defaultValue={status?.max_lots ?? 5}
+                    className="w-20 bg-zinc-900 border border-zinc-800 px-2 py-1 text-amber-200"
+                    onBlur={async (e) => {
+                      const v = parseInt(e.target.value, 10);
+                      if (v >= 1) {
+                        try { await axios.post(`${API}/bot/sizing_config`, { max_lots: v }); await fetchAll(); }
+                        catch (err) { toast.error(err?.response?.data?.detail || err.message); }
+                      }
+                    }}
+                  />
+                </label>
+                <div className="flex flex-col text-zinc-500 justify-end">
+                  <span className="text-[9px] uppercase tracking-widest mb-1">Risk Amount</span>
+                  <div className="text-amber-200">
+                    ≈ ₹{Math.round(((status?.sim_capital || 200000) * (status?.risk_pct || 1)) / 100).toLocaleString("en-IN")}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </Card>
+
         {/* Twin advisory cards — Indicator (left) and SMC (right), side by side */}
         <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Setup advisory — weighted Call/Put scores (Task 1) */}

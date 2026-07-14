@@ -1,0 +1,22 @@
+{
+  "summary": "Backend-only regression + v2.0 Auto Risk-Based Position Sizing verification. Full pytest suite (192/192) passes with the 12 new tests in test_position_sizing_v2.py. All curl-verified end-to-end flows work: default_lots persistence across backend restart (source='user_saved'), sizing_config GET/POST round-trip, /bot/status extension with sizing_mode/risk_pct/max_lots/sim_capital/default_lots, and HTTP 400 validation on all invalid inputs (risk_pct out of (0,10], max_lots<1, sim_capital<=0, default_lots<1, sizing_mode not in {'manual','auto_risk'}). SIM vs LIVE isolation confirmed via unit tests (broker.get_net_available_cash not called in SIM; LIVE fetch-failure returns error + final_lots=0 blocking trade).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_position_sizing_v2.py",
+    "/app/test_reports/pytest/pytest_iter9.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py + main.py + telegram.py touched cleanly; strategy/FSM/broker paths untouched as required.",
+    "Restart-persistence proven via live curl (backend restarted; default_lots=7 preserved).",
+    "Validation errors return concise descriptive HTTP 400 messages — good UX for frontend."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "not tested (skipped per request)"},
+  "test_credentials": "N/A - no auth required for these endpoints",
+  "seed_data_creation": "None. Test sets default_lots=7 and sizing_config via curl for verification, matches examples in review request.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Iteration 9 complete: 192/192 pytest, all v2.0 sizing endpoints verified via curl including HTTP 400 for all 6 invalid-input paths and backend-restart persistence. Frontend skipped per review_request (backend-only). Current bot_state after test: default_lots=7, sizing_mode='auto_risk', risk_pct=1.5, max_lots=8, sim_capital=300000."
+}

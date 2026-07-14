@@ -84,6 +84,9 @@ class Event:
     AUTO_MODE_CHANGE  = "AUTO_MODE_CHANGE"
     AUTO_ENTRY        = "AUTO_ENTRY"
     AUTO_SUSPENDED    = "AUTO_SUSPENDED"
+    # v2.0 — Auto risk-based position sizing observability
+    AUTO_SIZING       = "AUTO_SIZING"
+    AUTO_ENTRY_CANCELLED = "AUTO_ENTRY_CANCELLED"
     # informational
     NOTE              = "NOTE"
 
