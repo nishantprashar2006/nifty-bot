@@ -1,0 +1,25 @@
+{
+  "summary": "Backend-only regression testing for Production Bug Fix Sprint v2.0.1. Ran full pytest suite: 199/199 tests passing (192 pre-existing + 7 new bugfix tests). All four production bugs fixed and verified.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_bugfix_v201.py",
+    "/app/backend/tests/test_preflight_and_rejection.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "N/A (skipped per request)"},
+  "seed_data_creation": "None",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "v2.0.1 bugfix sprint: SIM/LIVE preflight gating, AUTO dedup, auto-suspend on preflight failure, human-readable Telegram formatter all verified. 199/199 pytest pass in ~2s. Frozen surfaces (SMC/FSM/execution) untouched.",
+  "verified_bugs": {
+    "bug1_sim_no_broker_funds_call": "PASS (test_sim_never_calls_broker_get_net_available_cash, test_live_still_calls_broker_get_net_available_cash)",
+    "bug2_auto_retry_dedup": "PASS (test_auto_entry_dedup_skips_repeated_same_signal, test_auto_entry_dedup_clears_on_direction_change)",
+    "bug3_auto_suspend_on_preflight_failure": "PASS (test_auto_preflight_failure_triggers_suspend_auto)",
+    "bug4_telegram_human_readable": "PASS (test_telegram_send_auto_preflight_failed_formats_human_readable, test_telegram_send_auto_preflight_failed_noop_when_disabled)",
+    "backward_compat_v1_13_preflight": "PASS (all 9 preflight tests pass with _force_live_preflight fixture)"
+  }
+}

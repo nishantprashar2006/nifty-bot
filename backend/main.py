@@ -185,6 +185,12 @@ class NiftyOptionsBot:
         # by an explicit dashboard "resume" action.
         self._auto_suspended_reason: Optional[str] = None
 
+        # v2.0.1 — de-dup key for a failed auto signal so `_maybe_auto_entry`
+        # doesn't retry the same (direction, confidence-bucket, ts) every
+        # 5m SMC tick. Cleared on any meaningful state change (new signal,
+        # direction flip, user resume, mode toggle).
+        self._last_auto_failure_key: Optional[tuple] = None
+
     def _tl(self, trade_id: str, event_type: str, message: str, payload: Optional[dict] = None) -> None:
         """v1.10 — SAFE timeline logging shim.
 
@@ -1113,18 +1119,25 @@ class NiftyOptionsBot:
             target_px = premium + tp_pts
             stop_px = max(0.05, premium - sl_pts)
         # v1.13 — pre-flight margin check (advisory).
-        # Estimates required capital ≈ qty × premium × (1 + buffer) and
-        # compares against `broker.get_net_available_cash()`. If the RMS
-        # call fails for any reason, we DO NOT block trading — the broker
-        # remains the authoritative gate. Only obvious insufficient-funds
-        # cases short-circuit here so the user never sees a phantom
-        # "Queued" for an order that will be rejected in a few hundred ms.
-        required_capital = qty * limit_px * (1.0 + config.PREFLIGHT_MARGIN_BUFFER_PCT)
-        try:
-            available_cash = float(self.broker.get_net_available_cash())
-        except Exception:
-            logger.warning("preflight: RMS lookup failed — deferring to broker.", exc_info=True)
+        # v2.0.1 — SIM MUST NEVER call live broker funds. Only run the
+        # pre-flight when TRADING_MODE is live (execution against the real
+        # exchange). SIM/paper uses fabricated capital via the sizer.
+        if config.SIMULATE_ORDERS:
+            required_capital = qty * limit_px * (1.0 + config.PREFLIGHT_MARGIN_BUFFER_PCT)
             available_cash = None
+        else:
+            # Estimates required capital ≈ qty × premium × (1 + buffer) and
+            # compares against `broker.get_net_available_cash()`. If the RMS
+            # call fails for any reason, we DO NOT block trading — the broker
+            # remains the authoritative gate. Only obvious insufficient-funds
+            # cases short-circuit here so the user never sees a phantom
+            # "Queued" for an order that will be rejected in a few hundred ms.
+            required_capital = qty * limit_px * (1.0 + config.PREFLIGHT_MARGIN_BUFFER_PCT)
+            try:
+                available_cash = float(self.broker.get_net_available_cash())
+            except Exception:
+                logger.warning("preflight: RMS lookup failed — deferring to broker.", exc_info=True)
+                available_cash = None
         if available_cash is not None and required_capital > available_cash:
             reason = (
                 f"Insufficient funds — Available ₹{available_cash:,.2f}, "
@@ -1861,6 +1874,10 @@ class NiftyOptionsBot:
             db_reason = (row[0] if row else "") or ""
             if db_reason != (self._auto_suspended_reason or ""):
                 self._auto_suspended_reason = db_reason if db_reason else None
+                # v2.0.1 — clear the dedup key when the user resumes so
+                # the next SMC signal is re-evaluated cleanly.
+                if not db_reason:
+                    self._last_auto_failure_key = None
         except Exception:
             pass
         # 1. AUTO mode must be enabled from the dashboard.
@@ -1953,6 +1970,16 @@ class NiftyOptionsBot:
         direction = (config.Direction.LONG if direction_str == "CALL"
                      else config.Direction.SHORT)
         reasons = list(smc_payload.get("reasons") or [])
+        # v2.0.1 (Bug 2) — dedup key. Skip if we've already tried this exact
+        # signal signature since the last failure. Any of these changes
+        # clears the key: direction flip, confidence-bucket change (5%),
+        # or a new signal timestamp. `_suspend_auto` (Bug 3) also acts as
+        # a hard stop until the user Resumes.
+        conf_bucket = int(confidence // 5) * 5
+        sig_ts = str(smc_payload.get("timestamp") or "")
+        signal_key = (direction_str, conf_bucket, sig_ts)
+        if getattr(self, "_last_auto_failure_key", None) == signal_key:
+            return
         logger.info("AUTO ENTRY firing: %s conf=%d%% reasons=%s",
                     direction_str, confidence, reasons[:3])
         try:
@@ -1968,7 +1995,33 @@ class NiftyOptionsBot:
             direction, lots_override=lots_override,
             engine="smc", confidence=confidence, reasons=reasons,
         )
-        # Telegram — reuse the notifier.
+        # v2.0.1 Bug 2/3 — on failure, record the signal signature so we
+        # don't retry every tick, AND suspend AUTO so the operator sees a
+        # dashboard banner + Telegram alert instead of endless retries.
+        if not ok:
+            self._last_auto_failure_key = signal_key
+            ctx = self._last_reject_context or {}
+            # Build a compact human-readable reason for suspension + Telegram.
+            reason_text = ctx.get("user_message") or ctx.get("broker_reason") or msg or "auto entry failed"
+            self._suspend_auto(reason_text)
+            # v2.0.1 Bug 4 — human-readable Telegram formatter.
+            try:
+                tg = getattr(self, "telegram", None)
+                if tg is not None and hasattr(tg, "send_auto_preflight_failed"):
+                    tg.send_auto_preflight_failed(
+                        direction_str, confidence, reasons,
+                        ctx, contract_symbol=getattr(self, "_ce", None) and
+                            (self._ce.symbol if direction_str == "CALL" and self._ce
+                             else (self._pe.symbol if self._pe else "")) or "",
+                        lots=lots_override or 1,
+                    )
+                elif tg is not None and hasattr(tg, "send_auto_entry"):
+                    tg.send_auto_entry(direction_str, confidence, reasons, ok, msg)
+            except Exception:
+                logger.exception("Telegram auto pre-flight notify failed (ignored)")
+            return
+        # Success path — clear dedup so future failures/retries are fresh.
+        self._last_auto_failure_key = None
         try:
             tg = getattr(self, "telegram", None)
             if tg is not None and hasattr(tg, "send_auto_entry"):

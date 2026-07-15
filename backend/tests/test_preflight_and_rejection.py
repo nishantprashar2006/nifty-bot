@@ -111,6 +111,16 @@ def _make_contract():
     )
 
 
+@pytest.fixture(autouse=True)
+def _force_live_preflight():
+    """v2.0.1 — the pre-flight is now LIVE-only. Force LIVE mode for all
+    v1.13 tests so the funds check actually runs."""
+    original = config.SIMULATE_ORDERS
+    config.SIMULATE_ORDERS = False
+    yield
+    config.SIMULATE_ORDERS = original
+
+
 # ─────────────────────────────────────────────── Test 1 — Enough balance
 def test_enough_balance_order_submitted():
     bot, transitions = _make_bot(available_cash=1_000_000.0, place_result="ORD-A")

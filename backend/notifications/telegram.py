@@ -242,3 +242,48 @@ class TelegramNotifier:
         except Exception:
             pass
 
+    def send_auto_preflight_failed(
+        self,
+        direction: str,
+        confidence: int,
+        reasons: list,
+        ctx: dict,
+        contract_symbol: str = "",
+        lots: int = 1,
+    ) -> None:
+        """v2.0.1 Bug 4 — clean human-readable pre-flight failure alert.
+
+        `ctx` is `NiftyOptionsBot._last_reject_context` populated by
+        `_place_entry`. Never dump raw JSON to Telegram — that stays in the
+        DEBUG logs. The alert is one screen-ful of glanceable text.
+        """
+        if not self.enabled:
+            return
+        icon = "⚠️"
+        head = f"AUTO BUY {'CALL' if direction == 'CALL' else 'PUT'}"
+        broker_reason = (ctx or {}).get("broker_reason") or "insufficient_funds"
+        user_msg = (ctx or {}).get("user_message") or ""
+        # Try to pretty-print pre-flight numbers if present.
+        avail = (ctx or {}).get("available")
+        req = (ctx or {}).get("required")
+        detail_lines = [f"<b>Reason:</b> {broker_reason.replace('_', ' ').title()}"]
+        if avail is not None:
+            detail_lines.append(f"<b>Available:</b> ₹{avail:,.2f}")
+        if req is not None:
+            detail_lines.append(f"<b>Required:</b> ₹{req:,.2f}")
+        if contract_symbol:
+            detail_lines.append(f"<b>Contract:</b> {contract_symbol}")
+        detail_lines.append(f"<b>Lots:</b> {lots}")
+        text = (
+            f"{icon} <b>{head}</b>\n"
+            f"<b>Confidence:</b> {confidence}%\n\n"
+            f"<b>Pre-flight Failed</b>\n"
+            + "\n".join(detail_lines)
+            + "\n\nOrder NOT submitted. Auto trading suspended."
+        )
+        try:
+            self._send(text)
+        except Exception:
+            pass
+
+
