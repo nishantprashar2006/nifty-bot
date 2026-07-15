@@ -628,3 +628,18 @@ Combined bug fix + feature. Only lot-count arithmetic changes; SMC/execution/FSM
 
 **Deferred:** Position sizing preview in the entry-timeline UI panel, LIVE available-funds live display in the sizing card, historical sizing-decision audit table.
 
+
+## 2026-02-06 — v2.0.1 Production Bug Fix Sprint (4 bugs from today's live session)
+
+**Bug 1 — SIM performs LIVE funds check.** Root cause: v1.13 pre-flight in `_place_entry` called `broker.get_net_available_cash()` unconditionally; in hybrid mode this hits the LIVE Angel account. Fix: gate the pre-flight on `not config.SIMULATE_ORDERS`. SIM branch skips the funds compare entirely.
+
+**Bug 2 — AUTO retries same failed signal.** Root cause: `_maybe_auto_entry` had no dedup — every SMC tick refired. Fix: dedup key `(direction, confidence_bucket_5pct, signal_timestamp)`. Same key already-failed ⇒ no-op. Key clears on direction flip, confidence bucket change, new timestamp, or user Resume.
+
+**Bug 3 — AUTO doesn't suspend on pre-flight failure.** Root cause: `_suspend_auto` mechanism existed (v1.15) but wasn't wired into AUTO pre-flight failure branch. Fix: on any AUTO `_handle_manual_entry` failure, call `_suspend_auto(reason_from_last_reject_context)`. Reuses existing dashboard banner + Telegram alert + Resume flow. No new suspension system.
+
+**Bug 4 — Telegram dumps raw JSON on pre-flight failure.** Root cause: only generic `send_auto_entry` existed. Fix: new `TelegramNotifier.send_auto_preflight_failed(direction, confidence, reasons, ctx, contract_symbol, lots)` producing human-readable "⚠️ AUTO BUY CALL / Confidence 40% / Pre-flight Failed / Reason / Available ₹ / Required ₹ / Contract / Lots / Order NOT submitted. Auto trading suspended."
+
+**Untouched (per user directive):** SMC engine, HTF, BOS/CHoCH/FVG/OB/sweeps, confidence weights, entry rules, exit rules, SL/TP/Trailing, position sizing formulas, order placement pipeline, FSM, execution reconciliation, `_handle_fill`, `_place_protective_legs`. Verified via git diff scope.
+
+**Regression:** 7 new tests in `/app/backend/tests/test_bugfix_v201.py`. v1.13 pre-flight tests updated with `_force_live_preflight` autouse fixture. Full suite 199/199. Testing agent iteration_10 → **100% PASS** (all 4 bugs individually verified).
+
