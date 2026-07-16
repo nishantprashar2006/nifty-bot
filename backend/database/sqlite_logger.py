@@ -162,6 +162,8 @@ class SqliteLogger:
                 "ALTER TABLE trades ADD COLUMN highest_ltp REAL",
                 "ALTER TABLE trades ADD COLUMN lowest_ltp REAL",
                 "ALTER TABLE trades ADD COLUMN exit_trigger TEXT",
+                # v2.4 — trigger attribution (MANUAL / CONFIDENCE_THRESHOLD / BOS_STRUCTURE)
+                "ALTER TABLE trades ADD COLUMN trigger_reason TEXT",
             ):
                 try:
                     cur.execute(ddl)
@@ -224,20 +226,23 @@ class SqliteLogger:
         expiry: Optional[str] = None,
         option_type: Optional[str] = None,
         lot_size: Optional[int] = None,
+        trigger_reason: Optional[str] = None,
     ) -> None:
         import json as _json
         with self._cursor() as cur:
             cur.execute(
                 "INSERT INTO trades(trade_id, entry_time, direction, qty, "
                 "entry_price, source, engine, confidence, reasons, sl_price, tp_price, "
-                "contract_symbol, contract_token, strike, expiry, option_type, lot_size) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "contract_symbol, contract_token, strike, expiry, option_type, lot_size, "
+                "trigger_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     trade_id, entry_time or _utc_iso(), direction, qty, entry_price,
                     source, engine, confidence,
                     _json.dumps(reasons) if reasons else None,
                     sl_price, tp_price,
                     contract_symbol, contract_token, strike, expiry, option_type, lot_size,
+                    trigger_reason,
                 ),
             )
 
@@ -442,6 +447,63 @@ class SqliteLogger:
                 )
         except Exception:
             pass  # audit must never impact trading
+
+    # ─── v2.4 — daily P&L + trigger stats ────────────────────────────
+    def realized_pnl_today(self, ist_today_iso: str) -> float:
+        """v2.4 — sum of `pnl` for trades that CLOSED today (IST date).
+        Only realized/closed trades count — open/floating PnL is excluded.
+        `ist_today_iso` is a YYYY-MM-DD string (IST date)."""
+        try:
+            with self._cursor() as cur:
+                # exit_time is stored as UTC ISO; convert on the fly to IST
+                # date via SQLite's datetime() and compare the substring.
+                row = cur.execute(
+                    "SELECT COALESCE(SUM(pnl), 0.0) FROM trades "
+                    "WHERE exit_time IS NOT NULL "
+                    "AND substr(datetime(exit_time, '+330 minutes'), 1, 10) = ?",
+                    (ist_today_iso,),
+                ).fetchone()
+            return float(row[0] or 0.0)
+        except Exception:
+            return 0.0
+
+    def trigger_stats(self, ist_today_iso: Optional[str] = None) -> list[dict]:
+        """v2.4 — group closed trades by `trigger_reason` returning
+        {trigger, trades, wins, losses, win_rate_pct, net_pnl}.
+        If `ist_today_iso` is provided, restrict to that IST date."""
+        sql = (
+            "SELECT COALESCE(trigger_reason, 'UNKNOWN') AS trig, "
+            "COUNT(*) AS n, "
+            "SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins, "
+            "SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) AS losses, "
+            "COALESCE(SUM(pnl), 0.0) AS net "
+            "FROM trades WHERE exit_time IS NOT NULL"
+        )
+        params: tuple = ()
+        if ist_today_iso:
+            sql += (
+                " AND substr(datetime(exit_time, '+330 minutes'), 1, 10) = ?"
+            )
+            params = (ist_today_iso,)
+        sql += " GROUP BY trig ORDER BY trig"
+        try:
+            with self._cursor() as cur:
+                rows = cur.execute(sql, params).fetchall()
+        except Exception:
+            return []
+        out: list[dict] = []
+        for r in rows:
+            trig = r[0] or "UNKNOWN"
+            n = int(r[1] or 0)
+            wins = int(r[2] or 0)
+            losses = int(r[3] or 0)
+            net = float(r[4] or 0.0)
+            win_rate = round((wins / n) * 100.0, 1) if n else 0.0
+            out.append({
+                "trigger": trig, "trades": n, "wins": wins, "losses": losses,
+                "win_rate_pct": win_rate, "net_pnl": round(net, 2),
+            })
+        return out
 
 
 _singleton: Optional[SqliteLogger] = None

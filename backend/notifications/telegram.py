@@ -216,6 +216,71 @@ class TelegramNotifier:
             pass
 
 
+    # ─── v2.4 — Daily Loss + EOD Summary ────────────────────────────
+    def send_daily_loss_hit(self, payload: dict) -> None:
+        """Suspension alert — realized daily loss ≥ configured cap."""
+        if not self.enabled:
+            return
+        cap_rs = float(payload.get("capital") or 0.0)
+        risk = float(payload.get("risk_pct") or 0.0)
+        max_loss = float(payload.get("max_loss") or 0.0)
+        realized = float(payload.get("realized_pnl") or 0.0)
+        text = (
+            "🛑 <b>AUTO SUSPENDED</b>\n\n"
+            "<b>Daily Loss Limit Reached</b>\n\n"
+            f"<b>Capital:</b> ₹{cap_rs:,.0f}\n"
+            f"<b>Risk:</b> {risk:.2f}%\n"
+            f"<b>Maximum Loss:</b> ₹{max_loss:,.0f}\n"
+            f"<b>Today's Loss:</b> ₹{realized:,.0f}\n\n"
+            "<i>Trading resumes tomorrow, or press Resume.</i>"
+        )
+        try:
+            self._send(text)
+        except Exception:
+            pass
+
+    def send_eod_summary(self, summary: dict) -> None:
+        """One-shot end-of-day recap sent after 15:10 IST square-off."""
+        if not self.enabled:
+            return
+        date = summary.get("date") or ""
+        trades = int(summary.get("trades") or 0)
+        wins = int(summary.get("wins") or 0)
+        losses = int(summary.get("losses") or 0)
+        win_rate = float(summary.get("win_rate_pct") or 0.0)
+        pnl = float(summary.get("realized_pnl") or 0.0)
+        auto_sus = "Yes" if summary.get("auto_suspended") else "No"
+        max_hit = "Yes" if summary.get("max_daily_loss_hit") else "No"
+
+        lines = [
+            "📊 <b>Daily Trading Summary</b>\n",
+            f"<b>Date:</b> {date}\n",
+            f"<b>Trades:</b> {trades}",
+            f"<b>Wins:</b> {wins}",
+            f"<b>Losses:</b> {losses}",
+            f"<b>Win Rate:</b> {win_rate:.1f}%",
+            f"<b>Realized PnL:</b> ₹{pnl:,.0f}\n",
+        ]
+        if summary.get("per_trigger"):
+            lines.append("<b>Trigger Breakdown</b>")
+            for t in summary["per_trigger"]:
+                label = {
+                    "CONFIDENCE_THRESHOLD": "CONFIDENCE",
+                    "BOS_STRUCTURE": "BOS+STRUCTURE",
+                    "MANUAL": "MANUAL",
+                }.get(t.get("trigger"), t.get("trigger") or "UNKNOWN")
+                lines.append(
+                    f"• <b>{label}</b> — Trades: {t['trades']} · "
+                    f"PnL: ₹{t['net_pnl']:,.0f}"
+                )
+            lines.append("")
+        lines.append(f"<b>AUTO Suspended:</b> {auto_sus}")
+        lines.append(f"<b>Maximum Daily Loss Hit:</b> {max_hit}")
+        try:
+            self._send("\n".join(lines))
+        except Exception:
+            pass
+
     # ─── v1.15 auto-trade notifications ─────────────────────────────
     def send_mode_change(self, new_mode: str, lots: int, threshold: int) -> None:
         if not self.enabled:

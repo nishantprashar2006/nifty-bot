@@ -249,3 +249,14 @@ BOS_STRUCTURE_AUTO_ENABLED: bool = os.getenv("BOS_STRUCTURE_AUTO_ENABLED", "true
 # flag — it is purely informational.
 BOS_STRUCTURE_ALERT_ENABLED: bool = os.getenv("BOS_STRUCTURE_ALERT_ENABLED", "true").lower() == "true"
 
+# ────────────────────────────────────────────────────────────────────
+# 16. v2.4 — Daily Loss Protection (Risk % repurposed)
+# ────────────────────────────────────────────────────────────────────
+# Risk % NO LONGER affects position sizing (fixed slabs are the only
+# sizer). It's used purely to derive the daily loss cap:
+#   Max Daily Loss = capital × RISK_PCT_DEFAULT / 100
+# Realized losses only (closed trades). When breached: AUTO suspended
+# with reason "MAX_DAILY_LOSS", Telegram alert, dashboard banner.
+# Auto-resumes at the next IST calendar-day rollover.
+RISK_PCT_DEFAULT: float = float(os.getenv("RISK_PCT_DEFAULT", "2.5"))
+

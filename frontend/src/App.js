@@ -114,6 +114,9 @@ function App() {
   const [equity, setEquity] = useState([]);
   const [transitions, setTransitions] = useState([]);
   const [diag, setDiag] = useState(null);
+  // v2.4 — trigger analytics + daily loss protection
+  const [triggerStats, setTriggerStats] = useState(null);
+  const [dailyLoss, setDailyLoss] = useState(null);
   const [busy, setBusy] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
 
@@ -178,13 +181,15 @@ function App() {
 
   const fetchAll = useCallback(async () => {
     try {
-      const [s, st, t, e, tr, dg] = await Promise.all([
+      const [s, st, t, e, tr, dg, ts, dls] = await Promise.all([
         axios.get(`${API}/bot/status`),
         axios.get(`${API}/bot/stats`),
         axios.get(`${API}/bot/trades?limit=50`),
         axios.get(`${API}/bot/equity?limit=200`),
         axios.get(`${API}/bot/transitions?limit=30`),
         axios.get(`${API}/bot/signal_diagnostic`),
+        axios.get(`${API}/bot/trigger_stats?scope=today`),
+        axios.get(`${API}/bot/daily_loss_status`),
       ]);
       setStatus(s.data);
       setStats(st.data);
@@ -192,6 +197,8 @@ function App() {
       setEquity(e.data);
       setTransitions(tr.data);
       setDiag(dg.data);
+      setTriggerStats(ts.data);
+      setDailyLoss(dls.data);
       setLastUpdate(new Date());
     } catch (err) {
       console.error("dashboard fetch failed", err);
@@ -1072,6 +1079,158 @@ function App() {
           </div>
         </Card>
 
+        {/* v2.4 — Daily Loss Protection banner (only when suspended) */}
+        {dailyLoss?.breached && (
+          <Card
+            data-testid="daily-loss-banner"
+            className="border-red-800 bg-red-950/40 p-4 rounded-none"
+          >
+            <div className="flex items-start gap-3">
+              <div className="text-red-400 font-mono text-xs uppercase tracking-widest">🛑 AUTO SUSPENDED</div>
+              <div className="flex-1 font-mono text-xs text-zinc-300">
+                <div className="text-red-200 font-semibold mb-1">Reason: Maximum Daily Loss Reached</div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2">
+                  <div>
+                    <div className="text-[9px] text-zinc-500 uppercase">Capital</div>
+                    <div className="text-zinc-200">₹{Math.round(dailyLoss.capital || 0).toLocaleString("en-IN")}</div>
+                  </div>
+                  <div>
+                    <div className="text-[9px] text-zinc-500 uppercase">Risk %</div>
+                    <div className="text-zinc-200">{dailyLoss.risk_pct?.toFixed(2)}%</div>
+                  </div>
+                  <div>
+                    <div className="text-[9px] text-zinc-500 uppercase">Maximum Loss</div>
+                    <div className="text-zinc-200">₹{Math.round(dailyLoss.max_daily_loss || 0).toLocaleString("en-IN")}</div>
+                  </div>
+                  <div>
+                    <div className="text-[9px] text-zinc-500 uppercase">Today&apos;s Loss</div>
+                    <div className="text-red-300">₹{Math.round(dailyLoss.realized_pnl_today || 0).toLocaleString("en-IN")}</div>
+                  </div>
+                </div>
+                <div className="mt-2 text-[10px] text-zinc-500">Resumes automatically on the next trading day, or press <em>Auto Resume</em>.</div>
+              </div>
+            </div>
+          </Card>
+        )}
+
+        {/* v2.4 — Daily Loss Protection settings + status (always shown) */}
+        {dailyLoss && !dailyLoss.breached && (
+          <Card
+            data-testid="daily-loss-card"
+            className="border-zinc-800 bg-zinc-950/70 p-4 rounded-none"
+          >
+            <div className="flex flex-wrap items-center gap-6">
+              <div className="flex-1 min-w-[220px]">
+                <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono mb-1">Daily Loss Protection</div>
+                <div className="text-[10px] font-mono text-zinc-600">
+                  Realized daily loss ≥ Max Daily Loss → AUTO suspended, alert sent, resume next trading day.
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-3 text-xs font-mono items-end">
+                <label className="flex flex-col text-zinc-500">
+                  <span className="text-[9px] uppercase tracking-widest mb-1">Risk %</span>
+                  <input
+                    data-testid="risk-pct-input"
+                    type="number"
+                    min="0.1"
+                    max="100"
+                    step="0.1"
+                    defaultValue={dailyLoss.risk_pct?.toFixed(2)}
+                    onBlur={async (e) => {
+                      const v = parseFloat(e.target.value);
+                      if (!(v > 0)) return;
+                      try {
+                        await axios.post(`${API}/bot/sizing_config`, { risk_pct: v });
+                        toast.success(`Risk % saved: ${v.toFixed(2)}%`);
+                        await fetchAll();
+                      } catch (err) {
+                        toast.error(err?.response?.data?.detail || err.message);
+                      }
+                    }}
+                    className="w-24 bg-zinc-900 border border-zinc-800 px-2 py-1 text-amber-200"
+                  />
+                </label>
+                <div className="flex flex-col text-zinc-500">
+                  <span className="text-[9px] uppercase tracking-widest mb-1">Max Daily Loss</span>
+                  <div data-testid="max-daily-loss" className="text-red-200 text-sm">
+                    ₹{Math.round(dailyLoss.max_daily_loss || 0).toLocaleString("en-IN")}
+                  </div>
+                </div>
+                <div className="flex flex-col text-zinc-500">
+                  <span className="text-[9px] uppercase tracking-widest mb-1">Today&apos;s Realized</span>
+                  <div
+                    className={
+                      (dailyLoss.realized_pnl_today || 0) >= 0
+                        ? "text-emerald-300 text-sm"
+                        : "text-red-300 text-sm"
+                    }
+                    data-testid="realized-today"
+                  >
+                    ₹{Math.round(dailyLoss.realized_pnl_today || 0).toLocaleString("en-IN")}
+                  </div>
+                </div>
+                <div className="flex flex-col text-zinc-500">
+                  <span className="text-[9px] uppercase tracking-widest mb-1">Remaining</span>
+                  <div className="text-zinc-300 text-sm">
+                    ₹{Math.round(dailyLoss.loss_remaining || 0).toLocaleString("en-IN")}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </Card>
+        )}
+
+        {/* v2.4 — Trigger analytics (per-trigger totals; today only) */}
+        {triggerStats && (
+          <Card
+            data-testid="trigger-stats-card"
+            className="border-zinc-800 bg-zinc-950/70 p-4 rounded-none"
+          >
+            <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+              <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono">Trigger Statistics (Today · IST)</div>
+              <div className="text-[10px] font-mono text-zinc-600">
+                Total: {triggerStats.total?.trades || 0} trades · Win {triggerStats.total?.win_rate_pct?.toFixed(1)}% ·{" "}
+                <span className={((triggerStats.total?.net_pnl || 0) >= 0) ? "text-emerald-300" : "text-red-300"}>
+                  ₹{Math.round(triggerStats.total?.net_pnl || 0).toLocaleString("en-IN")}
+                </span>
+              </div>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              {triggerStats.per_trigger?.map((row) => {
+                const label = {
+                  CONFIDENCE_THRESHOLD: "CONFIDENCE",
+                  BOS_STRUCTURE: "BOS+STRUCTURE",
+                  MANUAL: "MANUAL",
+                }[row.trigger] || row.trigger;
+                const accent = {
+                  CONFIDENCE_THRESHOLD: "border-emerald-800 text-emerald-300",
+                  BOS_STRUCTURE: "border-purple-800 text-purple-300",
+                  MANUAL: "border-amber-800 text-amber-300",
+                }[row.trigger] || "border-zinc-800 text-zinc-400";
+                return (
+                  <div
+                    key={row.trigger}
+                    data-testid={`trigger-stats-${row.trigger}`}
+                    className={`border ${accent.split(" ")[0]} bg-zinc-900/40 p-3 font-mono text-xs`}
+                  >
+                    <div className={`text-[10px] uppercase tracking-widest mb-2 ${accent.split(" ")[1]}`}>{label}</div>
+                    <div className="grid grid-cols-2 gap-1">
+                      <div className="text-zinc-500">Trades:</div><div className="text-zinc-200">{row.trades}</div>
+                      <div className="text-zinc-500">Wins:</div><div className="text-emerald-300">{row.wins}</div>
+                      <div className="text-zinc-500">Losses:</div><div className="text-red-300">{row.losses}</div>
+                      <div className="text-zinc-500">Win Rate:</div><div className="text-zinc-200">{row.win_rate_pct?.toFixed(1)}%</div>
+                      <div className="text-zinc-500">Net PnL:</div>
+                      <div className={row.net_pnl >= 0 ? "text-emerald-300" : "text-red-300"}>
+                        ₹{Math.round(row.net_pnl || 0).toLocaleString("en-IN")}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+        )}
+
         {/* Twin advisory cards — Indicator (left) and SMC (right), side by side */}
         <section className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {/* Setup advisory — weighted Call/Put scores (Task 1) */}
@@ -1458,6 +1617,8 @@ function App() {
                       <TableRow className="border-zinc-800 hover:bg-transparent">
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Trade ID</TableHead>
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Src</TableHead>
+                        <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Trigger</TableHead>
+                        <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Conf</TableHead>
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Dir</TableHead>
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Lots</TableHead>
                         <TableHead className="font-mono text-[10px] uppercase tracking-wider text-zinc-500">Qty</TableHead>
@@ -1486,6 +1647,29 @@ function App() {
                             }`}>
                               {(t.source || "auto").toUpperCase()}
                             </span>
+                          </TableCell>
+                          <TableCell>
+                            <span
+                              data-testid={`trade-trigger-${t.trade_id}`}
+                              className={`px-1.5 py-0.5 text-[10px] border ${
+                                t.trigger_reason === "BOS_STRUCTURE"
+                                  ? "border-purple-700 text-purple-300"
+                                  : t.trigger_reason === "CONFIDENCE_THRESHOLD"
+                                    ? "border-emerald-700 text-emerald-300"
+                                    : t.trigger_reason === "MANUAL"
+                                      ? "border-amber-700 text-amber-300"
+                                      : "border-zinc-700 text-zinc-500"
+                              }`}
+                            >
+                              {({
+                                CONFIDENCE_THRESHOLD: "CONFIDENCE",
+                                BOS_STRUCTURE: "BOS+STRUCT",
+                                MANUAL: "MANUAL",
+                              })[t.trigger_reason] || "—"}
+                            </span>
+                          </TableCell>
+                          <TableCell className="text-zinc-400 text-xs" data-testid={`trade-conf-${t.trade_id}`}>
+                            {t.confidence != null ? `${t.confidence}%` : "—"}
                           </TableCell>
                           <TableCell>
                             <span className={t.direction === "CALL" ? "text-emerald-300" : "text-red-300"}>

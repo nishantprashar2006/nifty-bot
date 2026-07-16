@@ -738,3 +738,49 @@ Combined bug fix + feature. Only lot-count arithmetic changes; SMC/execution/FSM
 - `BOS_STRUCTURE_AUTO_ENABLED` (default `true`) — off to disable BOS+Structure AUTO path.
 - `BOS_STRUCTURE_ALERT_ENABLED` (default `true`) — off to mute the informational Telegram alert.
 
+
+## v2.4 — Account Protection & Trigger Analytics (2026-02-16)
+
+**Scope:** observability + account protection only — SMC engine, HTF, confidence, SL/TP, slabs, BOS+Structure logic all untouched.
+
+### Part 1 — Daily Loss Protection
+- `risk_pct` bot_state key **repurposed** — no longer touches lot sizing (still fixed slabs). Purely drives `Max Daily Loss = capital × risk% / 100`.
+- New `_check_daily_loss_limit()` on the main-loop tick: reads today's realized PnL (closed trades only) via `db.realized_pnl_today(ist_date)`, suspends AUTO with `MAX_DAILY_LOSS` when realized ≤ –cap.
+- Persists a rich `daily_loss_hit` payload to bot_state so the UI banner + resume path know what the cap was.
+- Fires `telegram.send_daily_loss_hit(...)` once (idempotent — second call is a no-op).
+- `_daily_rollover_if_needed` auto-clears the suspension on the next IST calendar day.
+- Frontend: red `daily-loss-banner` (Capital · Risk% · Max Loss · Today's Loss) shown when breached; otherwise green `daily-loss-card` shows Risk% editable input + Max Daily Loss + Today's Realized + Remaining.
+
+### Part 2 — Trigger Persistence
+- New column `trades.trigger_reason` (values: `MANUAL` / `CONFIDENCE_THRESHOLD` / `BOS_STRUCTURE`).
+- Populated at execution time via new `_pending_trigger` state in the bot, propagated through `_handle_manual_entry(trigger=…)`.
+- All three callers wired: manual `manual_entry` command → `MANUAL`; `_maybe_auto_entry` → `CONFIDENCE_THRESHOLD`; `_maybe_bos_structure_signal` → `BOS_STRUCTURE`.
+- Label is normalised on entry — unknown values fall back to `MANUAL`.
+
+### Part 3 — Trade History UI
+- Added `Trigger` and `Conf` columns to the Trade History table.
+- Colour-coded pills: BOS+STRUCT (purple) / CONFIDENCE (emerald) / MANUAL (amber) / — (grey).
+- For MANUAL trades, `confidence` is captured from `_smc_signal.confidence` at click-time if the frontend didn't supply one.
+
+### Part 4 — Dashboard Trigger Statistics
+- New endpoint `GET /api/bot/trigger_stats?scope=today` returns per-trigger `{trades, wins, losses, win_rate_pct, net_pnl}` plus a total row. Canonical triggers always appear (zero-filled if no trades yet).
+- New Card `data-testid="trigger-stats-card"` renders three side-by-side tiles below the Daily Loss card.
+
+### Part 5 — End-of-Day Telegram Summary
+- `_maybe_send_eod_summary()` on the main loop: fires ONCE per IST date after 15:10 IST. Uses `bot_state.eod_summary_date` for idempotency.
+- Payload: totals + per-trigger breakdown + `auto_suspended` + `max_daily_loss_hit` flag.
+- `telegram.send_eod_summary(summary)` formats a single Telegram message with the breakdown lines.
+
+### Regression
+- Added `tests/test_v24_protection_and_analytics.py` (12 tests): DB helpers, daily-loss triggering, idempotency, rollover clears, trigger normalisation, EOD summary once-per-day, per-trigger breakdown.
+- **Full suite: 245/245 passing** (up from 233 before this release).
+
+### API surface added
+- `GET /api/bot/trigger_stats?scope=today|all`
+- `GET /api/bot/daily_loss_status`
+- Existing `POST /api/bot/sizing_config` now accepts risk_pct up to 100 (was 10).
+- `GET /api/bot/trades` returns new `trigger_reason` + `confidence` columns (via `SELECT *`).
+
+### Env flags
+- `RISK_PCT_DEFAULT` (default `2.5`) — bootstrap value if `bot_state.risk_pct` isn't set yet.
+

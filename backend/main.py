@@ -173,6 +173,11 @@ class NiftyOptionsBot:
         self._pending_engine: Optional[str] = None
         self._pending_confidence: Optional[int] = None
         self._pending_reasons: list[str] = []
+        # v2.4 — trigger attribution stored at click time.
+        # Values: MANUAL / CONFIDENCE_THRESHOLD / BOS_STRUCTURE.
+        # Persisted with the trade row in _handle_fill so the trigger
+        # can never be inferred later.
+        self._pending_trigger: Optional[str] = None
 
         # SMC signal freshness tracker — independent of indicator FSM.
         # Holds {'direction', 'confidence', 'grade', 'generated_at'} for the
@@ -634,6 +639,7 @@ class NiftyOptionsBot:
         engine: str = "indicator",
         confidence: Optional[int] = None,
         reasons: Optional[list[str]] = None,
+        trigger: str = "MANUAL",
     ) -> tuple[bool, str]:
         """Fire a discretionary entry. PART 3 §6-8: manual SL = 15 % of fill,
         TP = 30 %, trailing step = 10 %. Same single-position lock, sizing
@@ -707,6 +713,12 @@ class NiftyOptionsBot:
         self._pending_engine = engine
         self._pending_confidence = confidence
         self._pending_reasons = reasons or []
+        # v2.4 — normalise trigger label. Enforce the three allowed
+        # values so downstream stats/telegram can rely on it.
+        _trig = (trigger or "MANUAL").upper()
+        if _trig not in ("MANUAL", "CONFIDENCE_THRESHOLD", "BOS_STRUCTURE"):
+            _trig = "MANUAL"
+        self._pending_trigger = _trig
         ok = self._place_entry(
             direction, contract,
             sl_pts=0.0, tp_pts=0.0,                     # unused for manual
@@ -759,6 +771,15 @@ class NiftyOptionsBot:
                         lots_override = None
                 engine = (data.get("engine") or "indicator").lower()
                 confidence = data.get("confidence")
+                # v2.4 — for MANUAL trades, capture the SMC confidence
+                # that existed at click time so Trade History can show
+                # what the strategy said at entry, even if the operator
+                # ignored it. Fall back to the current cached signal.
+                if confidence in (None, ""):
+                    try:
+                        confidence = int((self._smc_signal or {}).get("confidence") or 0)
+                    except Exception:
+                        confidence = 0
                 reasons = data.get("reasons") or []
                 ok, msg = self._handle_manual_entry(
                     direction,
@@ -766,6 +787,7 @@ class NiftyOptionsBot:
                     engine=engine,
                     confidence=confidence,
                     reasons=reasons,
+                    trigger="MANUAL",
                 )
                 self.db.complete_command(cmd_id, ok, msg)
                 logger.info("Manual command #%d → %s (%s)", cmd_id, "OK" if ok else "FAIL", msg)
@@ -1063,6 +1085,132 @@ class NiftyOptionsBot:
         except Exception:
             logger.exception("EOD clear raised (ignored)")
 
+    # ─────────────────────────── v2.4 — Daily Loss Protection
+    def _current_capital(self) -> float:
+        """Single-shot capital lookup used by daily-loss math. SIM →
+        sim_capital, LIVE → broker RMS (0.0 on RMS failure). Kept local
+        so we never accidentally hit the broker outside `_place_entry`
+        or the 30s throttled broker_capital publisher."""
+        try:
+            if config.SIMULATE_ORDERS:
+                r = self.db.get_state("sim_capital")
+                return float(r[0]) if r else 0.0
+            return float(self.broker.get_net_available_cash())
+        except Exception:
+            return 0.0
+
+    def _daily_risk_pct(self) -> float:
+        """v2.4 — read persisted risk%. Repurposed from position sizing
+        (now fixed slabs) to daily-loss cap only. Never affects lots."""
+        try:
+            r = self.db.get_state("risk_pct")
+            v = float(r[0]) if r else float(config.RISK_PCT_DEFAULT)
+        except Exception:
+            v = float(getattr(config, "RISK_PCT_DEFAULT", 2.5))
+        # sane bounds
+        if v <= 0:
+            v = 2.5
+        if v > 100:
+            v = 100.0
+        return v
+
+    def _max_daily_loss(self) -> float:
+        """Absolute rupee cap. Positive number — realized loss ≥ this
+        triggers suspension. capital × risk% / 100."""
+        return round(self._current_capital() * self._daily_risk_pct() / 100.0, 2)
+
+    def _check_daily_loss_limit(self) -> None:
+        """v2.4 — one-shot check called from the main loop. Reads
+        realized PnL for today (IST), compares to the max-daily-loss
+        cap, and suspends AUTO with reason `MAX_DAILY_LOSS` when
+        breached. Idempotent — subsequent calls no-op once suspended."""
+        if self._auto_suspended_reason == "MAX_DAILY_LOSS":
+            return  # already suspended today
+        cap = self._max_daily_loss()
+        if cap <= 0:
+            return  # capital unknown → nothing to enforce
+        try:
+            today_ist = _now_ist().date().isoformat()
+            realized = float(self.db.realized_pnl_today(today_ist))
+        except Exception:
+            return
+        # Realized loss is negative. `realized ≤ -cap` means we've lost
+        # at least `cap` rupees.
+        if realized > -cap:
+            return
+        logger.critical(
+            "MAX DAILY LOSS breached — realized=₹%.2f cap=-₹%.2f — suspending AUTO",
+            realized, cap,
+        )
+        # Persist a rich payload so the UI banner + resume path know
+        # what the cap was without recomputing.
+        try:
+            import json as _json
+            self.db.set_state("daily_loss_hit", _json.dumps({
+                "date": today_ist,
+                "realized_pnl": round(realized, 2),
+                "max_loss": round(cap, 2),
+                "capital": round(self._current_capital(), 2),
+                "risk_pct": self._daily_risk_pct(),
+                "trading_mode": ("live" if not config.SIMULATE_ORDERS else "sim"),
+                "hit_at": _now_ist().strftime("%H:%M:%S"),
+            }))
+        except Exception:
+            pass
+        self._suspend_auto("MAX_DAILY_LOSS")
+        # Telegram — never let this crash the loop.
+        try:
+            tg = getattr(self, "telegram", None)
+            if tg is not None and hasattr(tg, "send_daily_loss_hit"):
+                tg.send_daily_loss_hit({
+                    "capital": self._current_capital(),
+                    "risk_pct": self._daily_risk_pct(),
+                    "max_loss": cap,
+                    "realized_pnl": realized,
+                })
+        except Exception:
+            logger.exception("Daily-loss Telegram raised (ignored)")
+
+    # ─────────────────────────── v2.4 — End-of-Day Telegram Summary
+    def _maybe_send_eod_summary(self) -> None:
+        """Fires once per trading day after 15:10 IST — sums today's
+        closed trades and per-trigger stats and pushes a single Telegram
+        summary. Idempotent via `bot_state.eod_summary_date`."""
+        try:
+            ist_now = _now_ist()
+            if ist_now.time() < dtime(15, 10):
+                return
+            today_iso = ist_now.date().isoformat()
+            r = self.db.get_state("eod_summary_date")
+            last_sent = r[0] if r else ""
+            if last_sent == today_iso:
+                return
+            per_trigger = self.db.trigger_stats(today_iso)
+            total_trades = sum(x["trades"] for x in per_trigger)
+            total_wins = sum(x["wins"] for x in per_trigger)
+            total_losses = sum(x["losses"] for x in per_trigger)
+            total_pnl = round(sum(x["net_pnl"] for x in per_trigger), 2)
+            summary = {
+                "date": ist_now.strftime("%d/%m/%Y"),
+                "trades": total_trades, "wins": total_wins, "losses": total_losses,
+                "win_rate_pct": round((total_wins / total_trades) * 100.0, 1) if total_trades else 0.0,
+                "realized_pnl": total_pnl,
+                "per_trigger": per_trigger,
+                "auto_suspended": bool(self._auto_suspended_reason),
+                "max_daily_loss_hit": self._auto_suspended_reason == "MAX_DAILY_LOSS",
+            }
+            try:
+                tg = getattr(self, "telegram", None)
+                if tg is not None and hasattr(tg, "send_eod_summary"):
+                    tg.send_eod_summary(summary)
+            except Exception:
+                logger.exception("EOD summary Telegram raised (ignored)")
+            self.db.set_state("eod_summary_date", today_iso)
+            logger.info("EOD summary sent for %s (trades=%d pnl=₹%.2f)",
+                        today_iso, total_trades, total_pnl)
+        except Exception:
+            logger.exception("EOD summary raised (ignored)")
+
     def _publish_broker_capital(self) -> None:
         try:
             import json as _json
@@ -1199,10 +1347,12 @@ class NiftyOptionsBot:
             engine = self._pending_engine if self._pending_engine else None
             confidence = self._pending_confidence
             reasons = self._pending_reasons or []
+            trigger_reason = getattr(self, "_pending_trigger", None) or "MANUAL"
             self._pending_source = None
             self._pending_engine = None
             self._pending_confidence = None
             self._pending_reasons = []
+            self._pending_trigger = None
             self.db.insert_trade_entry(
                 pos.trade_id, pos.direction.value, pos.qty, pos.entry_price,
                 source=source,
@@ -1218,6 +1368,7 @@ class NiftyOptionsBot:
                 expiry=pos.expiry or None,
                 option_type=pos.option_type or None,
                 lot_size=pos.lot_size or None,
+                trigger_reason=trigger_reason,
             )
             self._place_protective_legs(pos.target_price, pos.stop_price)
             self._transition(config.State.POSITION_OPEN)
@@ -2211,6 +2362,7 @@ class NiftyOptionsBot:
         ok, msg = self._handle_manual_entry(
             direction, lots_override=lots_override,
             engine="smc_bos_struct", confidence=confidence, reasons=reasons,
+            trigger="BOS_STRUCTURE",
         )
         if not ok:
             logger.warning("BOS+Structure AUTO entry failed: %s", msg)
@@ -2329,6 +2481,7 @@ class NiftyOptionsBot:
         ok, msg = self._handle_manual_entry(
             direction, lots_override=lots_override,
             engine="smc", confidence=confidence, reasons=reasons,
+            trigger="CONFIDENCE_THRESHOLD",
         )
         # v2.0.1 Bug 2/3 — on failure, record the signal signature so we
         # don't retry every tick, AND suspend AUTO so the operator sees a
@@ -3102,6 +3255,15 @@ class NiftyOptionsBot:
         self._trades_today = 0
         self._consecutive_losses = 0
         self._api_reject_count = 0
+        # v2.4 — auto-resume from MAX_DAILY_LOSS on the new trading day
+        if self._auto_suspended_reason == "MAX_DAILY_LOSS":
+            self._auto_suspended_reason = None
+            try:
+                self.db.set_state("auto_suspended_reason", "")
+                self.db.set_state("daily_loss_hit", "")
+            except Exception:
+                pass
+            logger.warning("Daily rollover → auto-resuming from MAX_DAILY_LOSS")
         if self.state is config.State.SHUTDOWN and not self.positions.has_open_position:
             self._transition(config.State.IDLE)
 
@@ -3179,6 +3341,8 @@ class NiftyOptionsBot:
                 #       rather than a background hammer.
                 self._publish_ws_health()
                 self._publish_broker_capital()
+                self._check_daily_loss_limit()
+                self._maybe_send_eod_summary()
                 self._maybe_eod_clear()
                 self._daily_rollover_if_needed()
 

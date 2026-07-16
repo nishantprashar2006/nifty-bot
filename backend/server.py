@@ -807,8 +807,8 @@ def set_sizing_config(req: SizingConfigRequest) -> dict[str, Any]:
             raise HTTPException(status_code=400, detail="sizing_mode must be 'manual' or 'auto_risk'")
         _write_bot_state("sizing_mode", req.sizing_mode)
     if req.risk_pct is not None:
-        if req.risk_pct <= 0 or req.risk_pct > 10:
-            raise HTTPException(status_code=400, detail="risk_pct must be >0 and <=10")
+        if req.risk_pct <= 0 or req.risk_pct > 100:
+            raise HTTPException(status_code=400, detail="risk_pct must be >0 and <=100")
         _write_bot_state("risk_pct", str(float(req.risk_pct)))
     if req.max_lots is not None:
         if req.max_lots < 1:
@@ -1022,6 +1022,87 @@ def bot_trades(limit: int = 50) -> list[dict[str, Any]]:
             d["lots"] = None
         out.append(d)
     return out
+
+
+# v2.4 — trigger analytics
+@api.get("/bot/trigger_stats")
+def bot_trigger_stats(scope: str = "all") -> dict[str, Any]:
+    """v2.4 Part 4 — per-trigger totals for the Dashboard stats card.
+
+    `scope=today` restricts to today's IST date; otherwise all-time."""
+    import json as _json
+    from database.sqlite_logger import get_logger
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    db = get_logger()
+    today_iso = None
+    if scope == "today":
+        ist = _dt.now(_tz.utc) + _td(hours=5, minutes=30)
+        today_iso = ist.date().isoformat()
+    rows = db.trigger_stats(today_iso)
+    # Ensure the three canonical triggers always appear, even with zero rows
+    canonical = ["CONFIDENCE_THRESHOLD", "BOS_STRUCTURE", "MANUAL"]
+    have = {r["trigger"] for r in rows}
+    for t in canonical:
+        if t not in have:
+            rows.append({
+                "trigger": t, "trades": 0, "wins": 0, "losses": 0,
+                "win_rate_pct": 0.0, "net_pnl": 0.0,
+            })
+    # canonical order
+    order = {t: i for i, t in enumerate(canonical)}
+    rows.sort(key=lambda r: order.get(r["trigger"], 999))
+    total = {
+        "trades": sum(r["trades"] for r in rows),
+        "wins": sum(r["wins"] for r in rows),
+        "losses": sum(r["losses"] for r in rows),
+        "net_pnl": round(sum(r["net_pnl"] for r in rows), 2),
+    }
+    total["win_rate_pct"] = round(
+        (total["wins"] / total["trades"]) * 100.0, 1
+    ) if total["trades"] else 0.0
+    return {"scope": scope, "per_trigger": rows, "total": total}
+
+
+@api.get("/bot/daily_loss_status")
+def bot_daily_loss_status() -> dict[str, Any]:
+    """v2.4 Part 1 — capital, risk%, max loss, today's realized PnL,
+    hit flag. Consumed by the dashboard banner + settings card."""
+    import json as _json
+    from database.sqlite_logger import get_logger
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    db = get_logger()
+    snap = _broker_capital_snapshot()
+    capital = float(snap.get("value") or 0.0)
+    try:
+        risk = float((db.get_state("risk_pct") or ("2.5",))[0])
+    except Exception:
+        risk = 2.5
+    max_loss = round(capital * risk / 100.0, 2) if capital > 0 else 0.0
+    ist = _dt.now(_tz.utc) + _td(hours=5, minutes=30)
+    today_iso = ist.date().isoformat()
+    realized = db.realized_pnl_today(today_iso)
+    breach_row = db.get_state("daily_loss_hit")
+    breach = {}
+    if breach_row and breach_row[0]:
+        try:
+            breach = _json.loads(breach_row[0])
+        except Exception:
+            breach = {}
+    auto_reason_row = db.get_state("auto_suspended_reason")
+    auto_reason = auto_reason_row[0] if auto_reason_row and auto_reason_row[0] else ""
+    return {
+        "capital": capital,
+        "risk_pct": risk,
+        "max_daily_loss": max_loss,
+        "realized_pnl_today": round(realized, 2),
+        "loss_remaining": round(max(0.0, max_loss + realized), 2),
+        "breached": auto_reason == "MAX_DAILY_LOSS",
+        "auto_suspended_reason": auto_reason,
+        "breach_details": breach,
+        "trading_mode": _current_trading_mode(),
+        "capital_source": snap.get("source", "unknown"),
+        "date_ist": today_iso,
+    }
 
 
 @api.get("/bot/equity")
