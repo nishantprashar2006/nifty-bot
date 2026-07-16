@@ -71,7 +71,7 @@ def test_auto_entry_noop_when_disabled():
 def test_auto_entry_fires_when_enabled_and_gates_pass():
     bot = _make_bot()
     bot.db.set_state("auto_trade_enabled", "true")
-    bot.db.set_state("sim_capital", "200000")   # → 6 lots via fixed mapping
+    bot.db.set_state("sim_capital", "200000")   # → 4 lots via fixed mapping (v2.3)
     # Force SIM mode so sim_capital is used.
     original_sim = config.SIMULATE_ORDERS
     try:
@@ -82,8 +82,8 @@ def test_auto_entry_fires_when_enabled_and_gates_pass():
     bot._handle_manual_entry.assert_called_once()
     call = bot._handle_manual_entry.call_args
     assert call.args[0] == config.Direction.SHORT
-    # v2.2 — capital ≥ 200k → 6 lots (fixed mapping).
-    assert call.kwargs["lots_override"] == 6
+    # v2.3 — capital = 200k → 4 lots (fixed mapping, boundary inclusive).
+    assert call.kwargs["lots_override"] == 4
     assert call.kwargs["engine"] == "smc"
     assert call.kwargs["confidence"] == 47
 

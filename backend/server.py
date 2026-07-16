@@ -634,54 +634,23 @@ def force_close_orphan() -> dict[str, Any]:
 
 @api.get("/bot/manual_lots")
 def manual_lots_default() -> dict[str, Any]:
-    """Return the operator's persisted manual lot count.
+    """v2.3 — return the deterministic slab-based lot count.
 
-    Prefers the value the user last saved via `POST /bot/default_lots`
-    (persisted in `bot_state.default_lots`). Falls back to the legacy
-    drawdown-aware auto-size only when the operator has never set a
-    preference — this preserves backward compatibility for a fresh
-    install but honours user intent for every established deployment.
+    Uses the SAME `calculate_execution_lots` helper as the trading loop,
+    so dashboard, execution, trade history and timeline never disagree.
     """
-    import math
-    saved = _read_bot_state("default_lots", "")
-    if saved:
-        try:
-            v = int(saved)
-            if v >= 1:
-                return {
-                    "default_lots": v,
-                    "current_equity": _current_paper_capital(),
-                    "drawdown_pct": 0.0,
-                    "trading_mode": _current_trading_mode(),
-                    "source": "user_saved",
-                }
-        except Exception:
-            pass
-    capital = _current_paper_capital()
-    with _conn() as c:
-        eq = c.execute(
-            "SELECT current_equity, peak_equity, drawdown_pct, effective_lots "
-            "FROM equity_curve WHERE trading_mode=? "
-            "ORDER BY timestamp DESC LIMIT 1",
-            (_current_trading_mode(),),
-        ).fetchone()
-    if eq and eq["effective_lots"]:
-        lots = int(eq["effective_lots"])
-        eff_eq = float(eq["current_equity"])
-        dd = float(eq["drawdown_pct"])
-    else:
-        try:
-            from config import CAPITAL_PER_LOT, MIN_LOTS, MAX_LOTS_DYNAMIC
-        except Exception:
-            CAPITAL_PER_LOT, MIN_LOTS, MAX_LOTS_DYNAMIC = 50_000, 1, 50
-        lots = max(MIN_LOTS, min(MAX_LOTS_DYNAMIC, math.floor(capital / CAPITAL_PER_LOT)))
-        eff_eq, dd = capital, 0.0
+    # Prefer bot_state.broker_capital (live snapshot) if present, else
+    # sim_capital in SIM, else fall back to equity_curve.
+    snap = _broker_capital_snapshot()
+    capital = float(snap.get("value") or 0.0)
+    from main import calculate_execution_lots
+    lots = calculate_execution_lots(capital)
     return {
         "default_lots": lots,
-        "current_equity": eff_eq,
-        "drawdown_pct": dd,
+        "current_equity": capital,
+        "drawdown_pct": 0.0,
         "trading_mode": _current_trading_mode(),
-        "source": "auto",
+        "source": snap.get("source", "unknown"),
     }
 
 

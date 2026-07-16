@@ -159,3 +159,15 @@ class CandleManager:
         s = self.series(token, interval_min)
         with s._lock:
             s.bars.extend(bars[-s.bars.maxlen :])
+
+    def reset_intraday(self) -> None:
+        """v2.3 Phase 4 — clear ALL cached bars + in-progress bars across
+        every registered (token, interval) series. Used at EOD so the
+        next trading day starts from a genuinely empty slate — no
+        yesterday-carrying-forward risk. Series registrations are
+        preserved so listeners (bar_close callbacks) stay wired."""
+        with self._lock:
+            for s in self._series.values():
+                with s._lock:
+                    s.bars.clear()
+                    s._current = None

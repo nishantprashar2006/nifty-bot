@@ -59,7 +59,7 @@ MAX_WS_RECONNECT_FAILS = 3       # consecutive WS connection failures
 # 4. Time windows (IST)
 # ────────────────────────────────────────────────────────────────────
 ENTRY_WINDOW_START = time(9, 45)
-ENTRY_WINDOW_END = time(14, 45)
+ENTRY_WINDOW_END = time(14, 55)   # v2.3: hard entry cutoff 14:55 IST (all paths)
 INTRADAY_SQUARE_OFF = time(15, 10)
 
 # ────────────────────────────────────────────────────────────────────
@@ -235,3 +235,17 @@ try:
 except ValueError:
     SMC_ALERT_THRESHOLD = 40
     SMC_AUTO_TRADE_THRESHOLD = 40
+
+# ────────────────────────────────────────────────────────────────────
+# 15. v2.3 Phase 2 — BOS + Structure dual-trigger AUTO path
+# ────────────────────────────────────────────────────────────────────
+# Independent AUTO entry path that fires the instant SMC's BOS + 5m
+# Structure align (Bullish BOS + HH+HL → CALL; Bearish BOS + LH+LL →
+# PUT). Ignores the confidence threshold. Coexists with the existing
+# confidence≥SMC_AUTO_TRADE_THRESHOLD path. Isolated behind a flag so
+# it can be flipped off without touching code.
+BOS_STRUCTURE_AUTO_ENABLED: bool = os.getenv("BOS_STRUCTURE_AUTO_ENABLED", "true").lower() == "true"
+# Telegram alert for the same condition fires regardless of the AUTO
+# flag — it is purely informational.
+BOS_STRUCTURE_ALERT_ENABLED: bool = os.getenv("BOS_STRUCTURE_ALERT_ENABLED", "true").lower() == "true"
+

@@ -327,6 +327,8 @@ def test_manual_entry_calls_refresh_atm_before_picking_contract():
     bot._pending_engine = None
     bot._pending_confidence = None
     bot._pending_reasons = []
+    # v2.3 P3 — bypass 14:55 entry cutoff for test independence.
+    bot._in_entry_window = lambda: True
 
     ok, msg = bot._handle_manual_entry(Direction.LONG, engine="indicator")
     assert ok, msg

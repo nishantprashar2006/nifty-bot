@@ -333,6 +333,8 @@ def test_manual_entry_returns_structured_precheck_reason():
     bot._ce = _make_contract()
     bot._pe = _make_contract()
     bot._refresh_atm_contracts = MagicMock()
+    # v2.3 P3 — bypass 14:55 entry cutoff for test independence.
+    bot._in_entry_window = lambda: True
     ok, msg = bot._handle_manual_entry(config.Direction.LONG, lots_override=1)
     assert ok is False
     assert msg.startswith("PRECHECK_FAILED: ")

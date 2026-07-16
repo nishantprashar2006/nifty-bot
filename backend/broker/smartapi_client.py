@@ -144,6 +144,49 @@ class _LiveSmartApiClient:
                 raise SmartApiError(f"ltpData failed: {resp}")
             return float(resp["data"]["ltp"])
 
+    # ------------------------------------------------------------ historical
+    def get_candles(
+        self,
+        exchange: str,
+        symboltoken: str,
+        interval: str,
+        from_ts: datetime,
+        to_ts: datetime,
+    ) -> list[list]:
+        """v2.3 Phase 4 — historical intraday candle backfill.
+
+        `interval` must be one of Angel's enum strings:
+            ONE_MINUTE, THREE_MINUTE, FIVE_MINUTE, FIFTEEN_MINUTE,
+            THIRTY_MINUTE, ONE_HOUR, ONE_DAY.
+
+        Returns Angel's raw rows: `[timestamp_iso, open, high, low, close, volume]`.
+        Empty list if the call fails or the day is a holiday.
+        """
+        # Angel expects "YYYY-MM-DD HH:MM" in IST.
+        from datetime import timedelta as _td
+        def _to_ist(dt: datetime) -> str:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ist = dt.astimezone(timezone(_td(hours=5, minutes=30)))
+            return ist.strftime("%Y-%m-%d %H:%M")
+        param = {
+            "exchange": exchange,
+            "symboltoken": symboltoken,
+            "interval": interval,
+            "fromdate": _to_ist(from_ts),
+            "todate": _to_ist(to_ts),
+        }
+        with self._lock:
+            try:
+                resp = self._api.getCandleData(param)
+            except Exception as exc:
+                logger.warning("getCandleData raised: %s", exc)
+                return []
+            if not resp or not resp.get("status"):
+                logger.warning("getCandleData failed: %s", resp)
+                return []
+            return list(resp.get("data") or [])
+
     def logout(self) -> None:
         with self._lock:
             try:
@@ -211,6 +254,17 @@ class _PaperSmartApiClient:
 
     def ltp(self, exchange: str, tradingsymbol: str, symboltoken: str) -> float:
         return 0.0
+
+    def get_candles(
+        self,
+        exchange: str,
+        symboltoken: str,
+        interval: str,
+        from_ts,
+        to_ts,
+    ) -> list[list]:
+        """Paper mode has no historical data — returns empty list."""
+        return []
 
     def logout(self) -> None:
         return None

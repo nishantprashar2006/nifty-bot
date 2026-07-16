@@ -162,16 +162,18 @@ function App() {
     try { window.localStorage?.setItem("selectedEngine", engine); } catch (_) { /* ignore */ }
   }, [engine]);
 
-  // v2.2 — lots are auto-computed from capital (see execution-lots on
+  // v2.3 — lots are auto-computed from capital (see execution-lots on
   // the sizing card). No manual override — Fixed Position Sizing is
-  // the single source of truth.
+  // the single source of truth. Slabs mirror
+  // backend/main.py::calculate_execution_lots.
   const executionLots = (() => {
     const c = status?.broker_capital?.value || 0;
-    if (c < 50000) return 2;
-    if (c < 80000) return 3;
-    if (c < 150000) return 4;
-    if (c < 200000) return 5;
-    return 6;
+    if (c <= 0) return 1;
+    if (c <= 50000) return 1;
+    if (c <= 100000) return 2;
+    if (c <= 150000) return 3;
+    if (c <= 200000) return 4;
+    return 5;
   })();
 
   const fetchAll = useCallback(async () => {
@@ -944,7 +946,7 @@ function App() {
             <div>
               <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono">Trading Execution Mode</div>
               <div className="text-[10px] font-mono text-zinc-600 mt-1">
-                AUTO fires SMC entries automatically when confidence ≥ {status?.smc_auto_trade_threshold ?? 40}%. MANUAL requires Buy Call / Buy Put click.
+                AUTO fires SMC entries automatically when confidence ≥ {status?.smc_auto_trade_threshold ?? 40}% OR when BOS + Structure aligns (ignores confidence). MANUAL requires Buy Call / Buy Put click.
               </div>
               {status?.auto_suspended_reason && (
                 <div data-testid="auto-suspended-banner" className="mt-2 text-[11px] text-red-300 border border-red-800 bg-red-950/20 px-2 py-1">
@@ -1063,14 +1065,7 @@ function App() {
               <div className="flex flex-col text-zinc-500 justify-end">
                 <span className="text-[9px] uppercase tracking-widest mb-1">Execution Lots</span>
                 <div className="text-amber-200 text-sm" data-testid="execution-lots">
-                  {(() => {
-                    const c = status?.broker_capital?.value || 0;
-                    if (c < 50000) return 2;
-                    if (c < 80000) return 3;
-                    if (c < 150000) return 4;
-                    if (c < 200000) return 5;
-                    return 6;
-                  })()}
+                  {executionLots}
                 </div>
               </div>
             </div>

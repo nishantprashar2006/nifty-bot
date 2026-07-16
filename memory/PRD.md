@@ -687,3 +687,54 @@ Combined bug fix + feature. Only lot-count arithmetic changes; SMC/execution/FSM
 - Part 2 — Restart recovery (historical candle backfill).
 - Part 3 — Full UI cleanup (remove Equity Curve panel, further label consolidation).
 - Backlog: `score_history` SQLite table; Time-to-fill/Time-in-trade on Execution Timeline modal.
+
+## v2.3 — Execution, Sizing & Reliability Update (2026-02-16)
+
+**Scope:** execution/sizing/alerts/lifecycle only — SMC engine, HTF, confidence, weights, SL/TP frozen per user directive.
+
+### Phase 1 — Position Sizing Rewrite
+- New slab (single source of truth in `main.py::calculate_execution_lots`):
+  ₹1–50k → 1 · 50,001–100k → 2 · 100,001–150k → 3 · 150,001–200k → 4 · >200k → 5.
+- Bug fixed: dashboard/execution/quantity/trade-history mismatch (₹49,999 → dash 2, qty 65). Root cause: `_place_entry` used `PositionSizer.premium_spike_guard` seeded from stale `_effective_lots` computed at boot from `math.floor(capital/CAPITAL_PER_LOT)`; frontend used a different inline slab. Both replaced with `calculate_execution_lots(capital)`. `_place_entry` now recomputes capital at execution time (SIM=sim_capital, LIVE=broker RMS) — no drift.
+- `/api/bot/manual_lots` rewritten to call the same slab helper.
+- Frontend inline slab in App.js mirrors the backend Python slab.
+
+### Phase 2 — BOS + Structure Dual-Trigger AUTO
+- SMC payload now exposes `bos` alongside `market_structure` (no engine changes — pulled from existing `SMCContext`).
+- New `_maybe_bos_structure_signal()` fires immediately when `bos == market_structure ∈ {CALL, PUT}`:
+  - Sends Telegram `⚡ BOS + STRUCTURE` alert (regardless of confidence, informational).
+  - Executes AUTO CALL/PUT when AUTO mode enabled (regardless of confidence).
+- Both alert + AUTO dedup on `(direction, bars_5m)` — same 5m candle can't fire twice.
+- Confidence≥threshold AUTO path (`_maybe_auto_entry`) is UNTOUCHED. The two paths coexist and are gated by the single-position lock.
+- Isolated behind `BOS_STRUCTURE_AUTO_ENABLED` (default true) and `BOS_STRUCTURE_ALERT_ENABLED` (default true) env flags for instant opt-out.
+
+### Phase 3 — Entry Cutoff
+- `ENTRY_WINDOW_END` moved 14:45 → **14:55 IST**.
+- Guard added to `_handle_manual_entry` so all three trigger paths (manual, confidence AUTO, BOS+Structure AUTO) block after 14:55 IST.
+- Existing 15:10 IST square-off unchanged.
+
+### Phase 4 — Intraday-Only Candle Lifecycle
+- `CandleManager.reset_intraday()` clears all series bars + in-progress bars across every registered (token, interval) tuple, preserving listener registrations.
+- `_load_intraday_history()` on boot: within market hours (09:15–15:15 IST), calls broker `getCandleData` for 3m/5m/15m Nifty spot candles from 09:15→now and seeds `CandleManager`. Then triggers `_update_smc_score()` once so the dashboard reflects the replay before the first live tick. Silently no-ops on any error → warms up from live ticks. Skips entirely before market open / after 15:15.
+- `_maybe_eod_clear()` runs each main-loop tick; after 15:15 IST it wipes `CandleManager` + `_smc_signal` + `_last_bos_structure_key*` + `_pending_signal` and republishes an empty `smc_score` payload. Fires exactly once per date.
+- New broker method `get_candles(exchange, symboltoken, interval, from_ts, to_ts)` wraps Angel `getCandleData` with IST conversion; paper client returns `[]`.
+
+### Postponed (per user's reduced scope)
+- Daily loss cap / AUTO suspension repurposing `risk_pct`
+- Trigger reason persistence in trades DB
+- Timeline audit
+- Trade timestamp fix (entry/exit 15:05 vs timeline 14:35 discrepancy)
+- Large refactor / removal of unused legacy sizing code
+
+### Regression
+- Added `tests/test_bos_structure_v23.py` (12 tests).
+- Added `tests/test_candle_lifecycle_v23.py` (7 tests).
+- Rewrote `tests/test_fixed_sizing_v22.py` with new slab boundary tests + ₹49,999 bug regression.
+- Updated `tests/test_auto_trade_v15.py`, `tests/test_execution_correctness.py`, `tests/test_preflight_and_rejection.py` for new slab + 14:55 cutoff.
+- **Full suite: 233/233 passing.**
+- End-to-end frontend Playwright verified all 9 slab boundaries (49999→1, 50000→1, 50001→2, 100000→2, 100001→3, 150000→3, 150001→4, 200000→4, 250000→5).
+
+### Env flags (all defaults keep current behaviour)
+- `BOS_STRUCTURE_AUTO_ENABLED` (default `true`) — off to disable BOS+Structure AUTO path.
+- `BOS_STRUCTURE_ALERT_ENABLED` (default `true`) — off to mute the informational Telegram alert.
+

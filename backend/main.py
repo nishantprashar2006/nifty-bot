@@ -75,30 +75,30 @@ FIXED_TRAIL_PCT_DISPLAY = 10.0
 
 
 def calculate_execution_lots(capital: float) -> int:
-    """v2.2 — deterministic capital→lots mapping.
+    """v2.3 — deterministic capital→lots mapping (revised 2026-02-16).
 
     Single implementation shared by manual entries, auto entries, SIM
     and LIVE. If capital cannot be determined (e.g. LIVE RMS lookup
     fails), the caller MUST refuse the trade — never fall back.
 
-        <  ₹50,000  → 2 lots
-       50-80k       → 3 lots
-       80-150k      → 4 lots
-      150-200k      → 5 lots
-       ≥ ₹200,000  → 6 lots
+        ₹1        – ₹50,000   → 1 lot
+        ₹50,001   – ₹100,000  → 2 lots
+        ₹100,001  – ₹150,000  → 3 lots
+        ₹150,001  – ₹200,000  → 4 lots
+        Above ₹200,000        → 5 lots
     """
     c = float(capital or 0.0)
-    if c < 0:
+    if c <= 0:
+        return 1
+    if c <= 50_000:
+        return 1
+    if c <= 100_000:
         return 2
-    if c < 50_000:
-        return 2
-    if c < 80_000:
+    if c <= 150_000:
         return 3
-    if c < 150_000:
+    if c <= 200_000:
         return 4
-    if c < 200_000:
-        return 5
-    return 6
+    return 5
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -228,6 +228,14 @@ class NiftyOptionsBot:
         # direction flip, user resume, mode toggle).
         self._last_auto_failure_key: Optional[tuple] = None
 
+        # v2.3 Phase 2 — BOS+Structure dedup. The SMC engine ticks every
+        # 0.5s but the underlying 5m bar count only advances on a new
+        # completed candle. Fire alerts / auto-entries at most once per
+        # (direction, bars_5m) so the same aligned signal doesn't spam
+        # Telegram nor stack retry attempts within a single 5m window.
+        self._last_bos_structure_key: Optional[tuple] = None
+        self._last_bos_structure_alert_key: Optional[tuple] = None
+
     def _tl(self, trade_id: str, event_type: str, message: str, payload: Optional[dict] = None) -> None:
         """v1.10 — SAFE timeline logging shim.
 
@@ -318,6 +326,14 @@ class NiftyOptionsBot:
         # mark it closed (bot lost in-memory state on restart). User can
         # re-open via Buy Call/Put manually.
         self._recover_orphan_trade()
+
+        # v2.3 Phase 4 — Intraday-only lifecycle. If the bot restarts DURING
+        # market hours, replay today's historical candles (09:15 IST → now)
+        # so the SMC engine doesn't lose its morning warm-up. If restarted
+        # before open or after 15:15, no-op.
+        self._load_intraday_history()
+        # EOD clear tracking — cleared at end of first day the bot sees.
+        self._eod_cleared_for_date: Optional[str] = None
 
         # One-off Telegram startup ping — proves the bot is alive and the
         # credentials are configured. No-op if TELEGRAM_ENABLED=false.
@@ -638,6 +654,11 @@ class NiftyOptionsBot:
         breach = self._trip_circuit_breakers()
         if breach:
             return False, f"circuit breaker: {breach}"
+        # v2.3 P3 — hard entry cutoff at 14:55 IST for ALL paths (manual,
+        # AUTO confidence, AUTO BOS+Structure). Existing positions
+        # continue normally; only NEW entries are blocked.
+        if not self._in_entry_window():
+            return False, f"entry window closed (>{config.ENTRY_WINDOW_END.strftime('%H:%M')} IST)"
         # v1.13 — clear any stale rejection context from a previous click
         # so the UI never shows a rejection banner for an unrelated attempt.
         self._last_reject_context = None
@@ -918,6 +939,130 @@ class NiftyOptionsBot:
     # sim_capital (SIM mode) as ONE authoritative value. We snapshot it into
     # bot_state.broker_capital so /api/bot/status returns a fresh number
     # without hammering the broker on every request.
+
+    # ─────────────────────────── v2.3 Phase 4 — intraday candle lifecycle
+    # Interval enum mapping from bot minutes → Angel One API string.
+    _ANGEL_INTERVAL: dict[int, str] = {
+        1: "ONE_MINUTE",
+        3: "THREE_MINUTE",
+        5: "FIVE_MINUTE",
+        15: "FIFTEEN_MINUTE",
+    }
+
+    def _load_intraday_history(self) -> None:
+        """v2.3 P4 — replay today's historical candles into CandleManager on
+        boot so a mid-day restart preserves the morning warm-up. Only fires
+        during market hours (09:15 → 15:15 IST). Silently no-ops on any
+        broker error — the bot then simply warms up from live ticks."""
+        try:
+            from datetime import time as _dtime
+            from data.candle_manager import Bar as _Bar
+
+            ist_now = _now_ist()
+            open_ist = ist_now.replace(hour=9, minute=15, second=0, microsecond=0)
+            eod_ist = ist_now.replace(hour=15, minute=15, second=0, microsecond=0)
+            if ist_now < open_ist:
+                logger.info("Intraday history: skipping (before market open)")
+                return
+            if ist_now > eod_ist:
+                logger.info("Intraday history: skipping (after 15:15 IST)")
+                return
+            if not config.NIFTY_SPOT_TOKEN:
+                return
+
+            # Cap history end at NOW so we don't request future bars.
+            from_ts = open_ist
+            to_ts = ist_now
+
+            intervals = [3, 5, 15]
+            loaded_counts: dict[int, int] = {}
+            for interval in intervals:
+                iname = self._ANGEL_INTERVAL.get(interval)
+                if not iname:
+                    continue
+                try:
+                    rows = self.broker.get_candles(
+                        exchange="NSE",
+                        symboltoken=config.NIFTY_SPOT_TOKEN,
+                        interval=iname,
+                        from_ts=from_ts,
+                        to_ts=to_ts,
+                    )
+                except Exception as exc:
+                    logger.warning("Intraday history %dm fetch raised: %s", interval, exc)
+                    rows = []
+                if not rows:
+                    loaded_counts[interval] = 0
+                    continue
+                bars: list[_Bar] = []
+                for r in rows:
+                    try:
+                        # Angel row: [ts_iso, o, h, l, c, v]
+                        ts_iso, o, h, lo, cl, vol = r[0], r[1], r[2], r[3], r[4], r[5]
+                        dt = datetime.fromisoformat(str(ts_iso))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        else:
+                            dt = dt.astimezone(timezone.utc)
+                        bars.append(_Bar(ts=dt, open=float(o), high=float(h),
+                                         low=float(lo), close=float(cl),
+                                         volume=int(vol or 0)))
+                    except Exception:
+                        continue
+                if bars:
+                    self.candles.seed_history(config.NIFTY_SPOT_TOKEN, interval, bars)
+                loaded_counts[interval] = len(bars)
+
+            summary = ", ".join(f"{k}m={v}" for k, v in loaded_counts.items())
+            logger.info("Intraday history loaded → %s (open→now)", summary)
+
+            # Rebuild SMC state once so the dashboard reflects the replay
+            # before the first live tick arrives.
+            try:
+                self._update_smc_score()
+            except Exception:
+                logger.exception("Post-history SMC refresh raised (ignored)")
+        except Exception:
+            logger.exception("Intraday history load raised (ignored)")
+
+    def _maybe_eod_clear(self) -> None:
+        """v2.3 P4 — after 15:15 IST clear all intraday candle caches +
+        SMC in-memory signal state. Fires ONCE per trading day. This
+        guarantees the next trading day starts from a completely fresh
+        intraday session."""
+        ist_now = _now_ist()
+        today_str = ist_now.date().isoformat()
+        if ist_now.time() < dtime(15, 15):
+            return
+        if getattr(self, "_eod_cleared_for_date", None) == today_str:
+            return
+        try:
+            self.candles.reset_intraday()
+            # SMC state — clear the freshness tracker so a stale signal
+            # doesn't survive into tomorrow.
+            self._smc_signal = None
+            self._last_bos_structure_key = None
+            self._last_bos_structure_alert_key = None
+            self._last_auto_failure_key = None
+            self._pending_signal = None
+            # Wipe the persisted SMC score so the dashboard reflects the
+            # clear (next tick will republish once market reopens).
+            try:
+                import json as _json
+                self.db.set_state("smc_score", _json.dumps({
+                    "direction": "NEUTRAL", "confidence": 0, "reasons": [],
+                    "notes": ["EOD cleared — starting fresh next session"],
+                    "market_structure": "NEUTRAL", "htf_trend": "NEUTRAL",
+                    "regime": "UNCLEAR", "bars_5m": 0, "bars_15m": 0,
+                    "timestamp": ist_now.strftime("%H:%M:%S"),
+                }))
+            except Exception:
+                pass
+            self._eod_cleared_for_date = today_str
+            logger.info("EOD candle/SMC state cleared for %s", today_str)
+        except Exception:
+            logger.exception("EOD clear raised (ignored)")
+
     def _publish_broker_capital(self) -> None:
         try:
             import json as _json
@@ -1131,18 +1276,33 @@ class NiftyOptionsBot:
             logger.info("No quote for %s yet; skipping.", contract.symbol)
             return False
 
-        # Premium-spike guard
+        # v2.3 — single source of truth for lot count at execution time.
+        # Dashboard, execution, trade history, timeline and telegram ALL
+        # derive from `calculate_execution_lots(capital)` — no drift.
+        if config.SIMULATE_ORDERS:
+            try:
+                r = self.db.get_state("sim_capital")
+                sizing_capital = float(r[0]) if r else 200_000.0
+            except Exception:
+                sizing_capital = 200_000.0
+        else:
+            try:
+                sizing_capital = float(self.broker.get_net_available_cash())
+            except Exception as exc:
+                logger.warning("LIVE lot sizing: RMS lookup failed (%s) — cancelling entry.", exc)
+                return False
+        lots = calculate_execution_lots(sizing_capital)
+        # Premium-spike guard clamps lots downward if the premium got so
+        # large that a full-slab position would exceed the per-position
+        # capital cap. Never increases lots.
         lots = self.sizer.premium_spike_guard(
             option_premium=premium,
-            effective_lots=self._effective_lots,
-            current_equity=self.broker.get_net_available_cash(),
+            effective_lots=lots,
+            current_equity=sizing_capital,
         )
-        # PART 3 §5 — user may override the auto-calculated lot size
-        # before clicking Buy. Honour their value (still subject to the
-        # spike guard so we never break capital limits).
-        if lot_override is not None and lot_override > 0:
-            lots = min(lots, lot_override) if lots > 0 else lot_override
-            lots = max(1, lots)
+        # v2.3 — lot_override removed from UI; ignore any stale value.
+        if lots < 1:
+            lots = 1
         qty = lots * config.LOT_SIZE_NIFTY
 
         # Build the entry payload — MARKET or LIMIT per config toggle
@@ -1904,6 +2064,7 @@ class NiftyOptionsBot:
                 "stop_loss": None if expired else result.stop_loss,
                 "target": None if expired else result.target,
                 "market_structure": (ctx.structure if ctx else "NEUTRAL"),
+                "bos": (ctx.bos if ctx else None),
                 "htf_trend": (ctx.htf_trend if ctx else "NEUTRAL"),
                 "regime": (ctx.regime if ctx else "UNCLEAR"),
                 "signal_age_sec": signal_age_sec,
@@ -1927,8 +2088,132 @@ class NiftyOptionsBot:
                 self._maybe_auto_entry(payload)
             except Exception:
                 logger.exception("auto_entry gate raised (ignored)")
+            # v2.3 Phase 2 — BOS+Structure alert + AUTO path. Fires the
+            # INSTANT SMC's BOS aligns with 5m structure (Bullish BOS +
+            # HH+HL → CALL, Bearish BOS + LH+LL → PUT). Ignores confidence
+            # threshold. Coexists with the confidence path above; single-
+            # position lock in `_handle_manual_entry` prevents double
+            # entry. Both alert + trade dedup on 5m bar count so we
+            # don't spam within the same candle.
+            try:
+                self._maybe_bos_structure_signal(payload)
+            except Exception:
+                logger.exception("bos_structure gate raised (ignored)")
         except Exception:
             logger.debug("SMC scoring tick failed (continuing)", exc_info=True)
+
+    # ─────────────────────────── v2.3 Phase 2 — BOS+Structure dual path
+    def _maybe_bos_structure_signal(self, payload: dict) -> None:
+        """Detect BOS+Structure alignment on the LATEST SMC output and:
+          (1) send an immediate Telegram alert (regardless of confidence)
+          (2) fire an AUTO entry (regardless of confidence) when AUTO
+              mode is enabled.
+
+        Reuses the SMC context fields ONLY — no new detection logic.
+        Both alert + trade dedup on (direction, bars_5m) so a single
+        aligned 5m candle only fires once.
+        """
+        bos = payload.get("bos")                      # "CALL" | "PUT" | None
+        struct = payload.get("market_structure")      # "CALL" | "PUT" | "NEUTRAL"
+        if bos not in ("CALL", "PUT") or bos != struct:
+            return  # alignment condition not met
+
+        bars_5m = int(payload.get("bars_5m") or 0)
+        dedup_key = (bos, bars_5m)
+
+        # ── (1) informational Telegram alert ───────────────────────
+        if config.BOS_STRUCTURE_ALERT_ENABLED and self._last_bos_structure_alert_key != dedup_key:
+            try:
+                tg = getattr(self, "telegram", None)
+                if tg is not None and hasattr(tg, "send_bos_structure_signal"):
+                    tg.send_bos_structure_signal(payload)
+            except Exception:
+                logger.exception("BOS+Structure telegram alert raised (ignored)")
+            self._last_bos_structure_alert_key = dedup_key
+
+        # ── (2) AUTO entry path (independent of confidence threshold) ─
+        if not config.BOS_STRUCTURE_AUTO_ENABLED:
+            return
+        # Standard AUTO gates — mirror _maybe_auto_entry so both paths
+        # respect the operator's dashboard toggles.
+        row = self.db.get_state("auto_trade_enabled")
+        if not row or str(row[0]).lower() not in ("1", "true", "yes"):
+            return
+        if self._auto_suspended_reason:
+            return
+        if self.positions.has_open_position or self.positions.has_pending_entry:
+            return
+        if self.state is not config.State.IDLE:
+            return
+        # Per-5m-candle single-entry lock. If the confidence path already
+        # fired (or attempted) in this candle, `has_pending_entry` /
+        # `has_open_position` above will short-circuit us naturally.
+        if self._last_bos_structure_key == dedup_key:
+            return
+        breach = self._trip_circuit_breakers()
+        if breach:
+            return
+
+        # Reuse the exact sizing pipeline used by the confidence path so
+        # the two triggers stay behavioural-siblings.
+        entry_ref = 0.0
+        try:
+            tick = self.ws.get_last_tick(payload.get("token"))
+            entry_ref = float(tick.ltp) if tick else 0.0
+        except Exception:
+            entry_ref = 0.0
+        if entry_ref <= 0:
+            try:
+                for _tk, _q in (self._last_option_quote or {}).items():
+                    _ltp = float(_q.get("ltp") or 0.0)
+                    if _ltp > 0:
+                        entry_ref = _ltp
+                        break
+            except Exception:
+                pass
+        calc = self._compute_auto_risk_lots(entry_ref)
+        if calc.get("error"):
+            try:
+                from execution_timeline import Event as _Ev
+                session_id = getattr(self, "_timeline_session", None) or "AUTO"
+                self._tl(session_id, _Ev.AUTO_ENTRY_CANCELLED,
+                         f"BOS+Structure AUTO cancelled — {calc['error']}", calc)
+            except Exception:
+                pass
+            self._last_bos_structure_key = dedup_key  # don't retry inside the same candle
+            return
+
+        lots_override = calc.get("final_lots") or 1
+        direction = (config.Direction.LONG if bos == "CALL"
+                     else config.Direction.SHORT)
+        reasons = list(payload.get("reasons") or [])
+        reasons.insert(0, "TRIGGER: BOS + Structure Rule")
+        confidence = int(payload.get("confidence") or 0)
+        logger.info("BOS+STRUCTURE AUTO firing: %s (conf=%d%% ignored) bars_5m=%d",
+                    bos, confidence, bars_5m)
+        try:
+            from execution_timeline import Event as _Ev
+            session = getattr(self, "_timeline_session", None) or "AUTO"
+            self._tl(session, _Ev.AUTO_ENTRY,
+                     f"BOS+Structure {bos} @ {confidence}% (threshold ignored)",
+                     {"direction": bos, "confidence": confidence,
+                      "trigger": "BOS_STRUCTURE",
+                      "bos": payload.get("bos"),
+                      "market_structure": payload.get("market_structure"),
+                      "bars_5m": bars_5m,
+                      "reasons": reasons[:5], "lots": lots_override})
+        except Exception:
+            pass
+
+        # Mark BEFORE firing so a fill-error inside the same 5m candle
+        # doesn't loop.
+        self._last_bos_structure_key = dedup_key
+        ok, msg = self._handle_manual_entry(
+            direction, lots_override=lots_override,
+            engine="smc_bos_struct", confidence=confidence, reasons=reasons,
+        )
+        if not ok:
+            logger.warning("BOS+Structure AUTO entry failed: %s", msg)
 
     # ─────────────────────────────────────────────── v1.15 auto trade
     def _maybe_auto_entry(self, smc_payload: dict) -> None:
@@ -2894,6 +3179,7 @@ class NiftyOptionsBot:
                 #       rather than a background hammer.
                 self._publish_ws_health()
                 self._publish_broker_capital()
+                self._maybe_eod_clear()
                 self._daily_rollover_if_needed()
 
                 breach = self._trip_circuit_breakers()
