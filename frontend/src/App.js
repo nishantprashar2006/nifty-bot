@@ -162,28 +162,17 @@ function App() {
     try { window.localStorage?.setItem("selectedEngine", engine); } catch (_) { /* ignore */ }
   }, [engine]);
 
-  // PART 3 §5 — editable lot size with STICKY semantics. The bot auto-
-  // calculates a default; once the user edits, their value becomes
-  // authoritative until they execute or dismiss the signal.
-  const [lots, setLots] = useState(null);          // current input value (null = use default)
-  const [lotsEdited, setLotsEdited] = useState(false);
-  const [defaultLots, setDefaultLots] = useState(null);
-
-  useEffect(() => {
-    let stop = false;
-    const tick = async () => {
-      try {
-        const { data } = await axios.get(`${API}/bot/manual_lots`);
-        if (stop) return;
-        setDefaultLots(data.default_lots);
-        // Only refresh the value when the user has NOT manually edited it.
-        if (!lotsEdited) setLots(data.default_lots);
-      } catch (_) { /* ignore */ }
-    };
-    tick();
-    const t = setInterval(tick, 5000);
-    return () => { stop = true; clearInterval(t); };
-  }, [lotsEdited]);
+  // v2.2 — lots are auto-computed from capital (see execution-lots on
+  // the sizing card). No manual override — Fixed Position Sizing is
+  // the single source of truth.
+  const executionLots = (() => {
+    const c = status?.broker_capital?.value || 0;
+    if (c < 50000) return 2;
+    if (c < 80000) return 3;
+    if (c < 150000) return 4;
+    if (c < 200000) return 5;
+    return 6;
+  })();
 
   const fetchAll = useCallback(async () => {
     try {
@@ -313,15 +302,14 @@ function App() {
       const { data } = await axios.post(`${API}/bot/manual_entry`, {
         direction,
         engine,
-        lots,
         confidence,
         reasons,
       });
       toast.success(`${direction} entry queued (#${data.cmd_id})`, {
-        description: `Engine: ${engine.toUpperCase()} · Lots: ${data.lots ?? lots} · SL ${status?.manual_sl_pct ?? 15}% / TP ${status?.manual_tp_pct ?? 30}% / Trail ${status?.trail_step_pct ?? 10}%`,
+        description: `Engine: ${engine.toUpperCase()} · Lots: ${data.lots ?? executionLots} · SL ${status?.manual_sl_pct ?? 15}% / TP ${status?.manual_tp_pct ?? 30}% / Trail ${status?.trail_step_pct ?? 10}%`,
       });
-      // Once submitted, the auto-default resumes for the next signal
-      setLotsEdited(false);
+      // v2.2 — Fixed Position Sizing is fully deterministic; no sticky
+      // override to reset.
       await fetchAll();
       // v1.13 — poll the command result so a broker-side rejection (RMS,
       // insufficient funds, exchange reject, invalid symbol, market closed)
@@ -619,7 +607,7 @@ function App() {
                   </div>
                   <div className="text-zinc-100" data-testid="hero-capital">
                     {status?.broker_capital?.value != null
-                      ? fmtINR(status.broker_capital.value)
+                      ? `₹${Math.round(status.broker_capital.value).toLocaleString("en-IN")}`
                       : (eqSnap ? fmtINR(eqSnap.current_equity) : "—")}
                   </div>
                 </div>
@@ -883,40 +871,6 @@ function App() {
               </div>
             ) : (
               <>
-                {/* PART 3 §5 — editable, sticky lot-size */}
-                <div className="flex flex-col items-end">
-                  <label className="text-[10px] uppercase tracking-[0.2em] font-mono text-zinc-500 mb-1" htmlFor="lots-input">
-                    Lots {lotsEdited && <span className="text-amber-300 ml-1">edited</span>}
-                  </label>
-                  <input
-                    id="lots-input"
-                    data-testid="lots-input"
-                    type="number"
-                    min={1}
-                    step={1}
-                    value={lots ?? ""}
-                    onChange={(e) => {
-                      const v = e.target.value === "" ? null : Math.max(1, parseInt(e.target.value, 10) || 1);
-                      setLots(v);
-                      setLotsEdited(true);
-                    }}
-                    onBlur={(e) => {
-                      // v1.15 — persist the operator's lot size so AUTO
-                      // entries after a restart use the same value.
-                      const v = e.target.value === "" ? null : Math.max(1, parseInt(e.target.value, 10) || 1);
-                      if (v && v > 0) {
-                        axios.post(`${API}/bot/default_lots`, { lots: v }).catch(() => {});
-                      }
-                    }}
-                    disabled={busy || !canTrade}
-                    className="w-20 bg-zinc-900 border border-zinc-800 px-2 py-1 font-mono text-sm text-zinc-100 text-right disabled:opacity-40 focus:outline-none focus:border-amber-500"
-                  />
-                  {defaultLots != null && (
-                    <div className="text-[10px] font-mono text-zinc-600 mt-0.5">
-                      auto {defaultLots}
-                    </div>
-                  )}
-                </div>
                 <Button
                   data-testid="btn-buy-call"
                   onClick={() => { setConfirmManual("CALL"); axios.post(`${API}/bot/refresh_atm`).catch(() => {}); }}
@@ -1714,7 +1668,7 @@ function App() {
               }
               <ul className="list-disc list-inside mt-3 space-y-1 text-zinc-300">
                 <li>Engine: <span className="text-amber-300 uppercase">{engine}</span> (drives the SL/TP/Trail policy)</li>
-                <li>Lots: <span className="text-amber-300">{lots ?? "auto"}</span> (locks once submitted)</li>
+                <li>Lots: <span className="text-amber-300">{executionLots}</span> (fixed by capital · SIM ₹{Math.round(status?.broker_capital?.value || 0).toLocaleString("en-IN")})</li>
                 <li>Stop Loss: <span className="text-red-300">{status?.manual_sl_pct ?? 15}%</span> of fill price</li>
                 <li>Target: <span className="text-emerald-300">{status?.manual_tp_pct ?? 30}%</span> of fill price</li>
                 <li>Trailing step: <span className="text-amber-300">{status?.trail_step_pct ?? 10}%</span></li>
