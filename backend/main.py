@@ -65,6 +65,43 @@ def _smc_grade(confidence: int) -> str:
 
 
 # ────────────────────────────────────────────────────────────────────
+# v2.2 — Fixed capital→lots sizing.
+# Single source of truth for every code path (manual + auto + sim + live).
+# ────────────────────────────────────────────────────────────────────
+FIXED_RISK_PCT       = 2.5   # locked, not user-editable
+FIXED_SL_PCT_DISPLAY = 15.0
+FIXED_TP_PCT_DISPLAY = 30.0
+FIXED_TRAIL_PCT_DISPLAY = 10.0
+
+
+def calculate_execution_lots(capital: float) -> int:
+    """v2.2 — deterministic capital→lots mapping.
+
+    Single implementation shared by manual entries, auto entries, SIM
+    and LIVE. If capital cannot be determined (e.g. LIVE RMS lookup
+    fails), the caller MUST refuse the trade — never fall back.
+
+        <  ₹50,000  → 2 lots
+       50-80k       → 3 lots
+       80-150k      → 4 lots
+      150-200k      → 5 lots
+       ≥ ₹200,000  → 6 lots
+    """
+    c = float(capital or 0.0)
+    if c < 0:
+        return 2
+    if c < 50_000:
+        return 2
+    if c < 80_000:
+        return 3
+    if c < 150_000:
+        return 4
+    if c < 200_000:
+        return 5
+    return 6
+
+
+# ────────────────────────────────────────────────────────────────────
 # v1.14 — Broker-safe tick rounding.
 #
 # NFO options exchange tick size is ₹0.05 (5 paise). Angel One rejects
@@ -1905,68 +1942,51 @@ class NiftyOptionsBot:
         breach = self._trip_circuit_breakers()
         if breach:
             return
-        # 7. Optional lot override from dashboard.
-        lots_override = None
-        # v2.0 — sizing mode selects between manual (user's `default_lots`)
-        # and auto-risk (compute lots from capital/risk_pct/SL). Both paths
-        # end at the SAME `_handle_manual_entry` call — no new execution
-        # code path, only different lot arithmetic.
-        sizing_mode_row = self.db.get_state("sizing_mode")
-        sizing_mode = (sizing_mode_row[0] if sizing_mode_row else "manual").lower()
-        sizing_snapshot: dict = {"mode": sizing_mode}
-        if sizing_mode == "auto_risk":
+        # 7. v2.2 — deterministic capital→lots. Always fixed mapping, no
+        # more manual / auto_risk mode branching. Same computation for
+        # SIM (uses sim_capital) and LIVE (uses broker capital).
+        entry_ref = 0.0
+        try:
+            tick = self.ws.get_last_tick(smc_payload.get("token"))
+            entry_ref = float(tick.ltp) if tick else 0.0
+        except Exception:
             entry_ref = 0.0
+        if entry_ref <= 0:
             try:
-                tick = self.ws.get_last_tick(smc_payload.get("token"))
-                entry_ref = float(tick.ltp) if tick else 0.0
+                qq = self._last_option_quote or {}
+                for _tk, _q in qq.items():
+                    _ltp = float(_q.get("ltp") or 0.0)
+                    if _ltp > 0:
+                        entry_ref = _ltp
+                        break
             except Exception:
-                entry_ref = 0.0
-            if entry_ref <= 0:
-                # Fallback to latest cached quote if available.
-                try:
-                    qq = self._last_option_quote or {}
-                    for _tk, _q in qq.items():
-                        _ltp = float(_q.get("ltp") or 0.0)
-                        if _ltp > 0:
-                            entry_ref = _ltp
-                            break
-                except Exception:
-                    pass
-            calc = self._compute_auto_risk_lots(entry_ref)
-            sizing_snapshot.update(calc)
+                pass
+        calc = self._compute_auto_risk_lots(entry_ref)
+        try:
+            from execution_timeline import Event as _Ev
+            session_id = getattr(self, "_timeline_session", None) or "AUTO"
+            self._tl(session_id, _Ev.AUTO_SIZING,
+                     f"Fixed sizing → {calc.get('final_lots')} lots "
+                     f"(cap ₹{calc.get('capital')})",
+                     calc)
+        except Exception:
+            pass
+        if calc.get("error"):
             try:
                 from execution_timeline import Event as _Ev
                 session_id = getattr(self, "_timeline_session", None) or "AUTO"
-                self._tl(session_id, _Ev.AUTO_SIZING,
-                         f"Auto sizing → {calc.get('final_lots')} lots "
-                         f"(risk {calc.get('risk_pct')}%, cap ₹{calc.get('capital')})",
-                         calc)
+                self._tl(session_id, _Ev.AUTO_ENTRY_CANCELLED,
+                         f"AUTO cancelled — {calc['error']}", calc)
             except Exception:
                 pass
-            if calc.get("error"):
-                try:
-                    from execution_timeline import Event as _Ev
-                    session_id = getattr(self, "_timeline_session", None) or "AUTO"
-                    self._tl(session_id, _Ev.AUTO_ENTRY_CANCELLED,
-                             f"AUTO cancelled — {calc['error']}",
-                             calc)
-                except Exception:
-                    pass
-                try:
-                    tg = getattr(self, "telegram", None)
-                    if tg is not None and hasattr(tg, "send_auto_cancelled"):
-                        tg.send_auto_cancelled(calc["error"], calc)
-                except Exception:
-                    pass
-                return
-            lots_override = calc.get("final_lots") or 1
-        else:
             try:
-                lots_row = self.db.get_state("default_lots")
-                if lots_row and int(lots_row[0]) > 0:
-                    lots_override = int(lots_row[0])
+                tg = getattr(self, "telegram", None)
+                if tg is not None and hasattr(tg, "send_auto_cancelled"):
+                    tg.send_auto_cancelled(calc["error"], calc)
             except Exception:
                 pass
+            return
+        lots_override = calc.get("final_lots") or 2
         direction = (config.Direction.LONG if direction_str == "CALL"
                      else config.Direction.SHORT)
         reasons = list(smc_payload.get("reasons") or [])
@@ -2032,51 +2052,36 @@ class NiftyOptionsBot:
 
     # ─────────────────────────────────────────── v2.0 auto risk sizing
     def _compute_auto_risk_lots(self, entry_ref_price: float) -> dict:
-        """v2.0 — compute lot count from capital × risk_pct ÷ per-lot loss.
+        """v2.2 — deterministic capital→lots (fixed mapping).
 
-        Reads settings from `bot_state`:
-          • risk_pct         (float, 0<x<=10)
-          • max_lots         (int, >=1)
-          • sim_capital      (float, SIM only)
-
-        In LIVE mode capital is fetched fresh from the broker; in SIM it
-        uses the persisted `sim_capital`. On any error the function
-        returns a payload with `error` populated — caller must cancel
-        the entry (never silently fall back).
-
-        Returns a plain dict suitable for the timeline payload.
+        The v2.0 configurable risk-%/max-lots/floor-formula has been
+        replaced by a single hard-coded mapping (`calculate_execution_lots`).
+        Same return shape so callers, tests, and timeline events are
+        unchanged. SIM uses `sim_capital`; LIVE fetches from broker; on
+        failure the trade is cancelled (never silently fall back).
         """
-        # --- config ---
-        try:
-            r = self.db.get_state("risk_pct")
-            risk_pct = float(r[0]) if r else 1.0
-        except Exception:
-            risk_pct = 1.0
-        try:
-            r = self.db.get_state("max_lots")
-            max_lots = int(r[0]) if r else 5
-        except Exception:
-            max_lots = 5
         try:
             r = self.db.get_state("sim_capital")
             sim_capital = float(r[0]) if r else 200_000.0
         except Exception:
             sim_capital = 200_000.0
-        sl_pct = float(config.MANUAL_SL_PCT)  # never changes strategy — same value used elsewhere
+        sl_pct = float(config.MANUAL_SL_PCT)
         lot_size = int(config.LOT_SIZE_NIFTY)
         entry = float(entry_ref_price or 0.0)
 
         payload: dict = {
-            "mode": "auto_risk",
-            "risk_pct": risk_pct,
-            "max_lots": max_lots,
+            "mode": "fixed",
+            "risk_pct": FIXED_RISK_PCT,
             "sl_pct": sl_pct,
             "entry_ref": entry,
             "lot_size": lot_size,
         }
 
-        # --- capital source ---
-        if config.USE_LIVE_BROKER and not config.TRADING_MODE == "sim":
+        # --- capital source (SIM never touches broker) ---
+        if config.SIMULATE_ORDERS:
+            capital = sim_capital
+            payload["capital_source"] = "sim"
+        else:
             try:
                 capital = float(self.broker.get_net_available_cash())
                 payload["capital_source"] = "broker"
@@ -2085,20 +2090,8 @@ class NiftyOptionsBot:
                 payload["capital"] = 0.0
                 payload["final_lots"] = 0
                 return payload
-        else:
-            capital = sim_capital
-            payload["capital_source"] = "sim"
         payload["capital"] = capital
 
-        # --- validation ---
-        if risk_pct <= 0 or risk_pct > 10:
-            payload["error"] = f"Invalid risk_pct={risk_pct} (must be >0 and <=10)"
-            payload["final_lots"] = 0
-            return payload
-        if max_lots < 1:
-            payload["error"] = f"Invalid max_lots={max_lots} (must be >=1)"
-            payload["final_lots"] = 0
-            return payload
         if capital <= 0:
             payload["error"] = f"Invalid capital={capital}"
             payload["final_lots"] = 0
@@ -2108,21 +2101,12 @@ class NiftyOptionsBot:
             payload["final_lots"] = 0
             return payload
 
-        # --- calculation ---
-        risk_amount = capital * (risk_pct / 100.0)
-        loss_per_lot = entry * sl_pct * lot_size
-        if loss_per_lot <= 0:
-            payload["error"] = "Zero per-lot loss (invalid entry/SL)"
-            payload["final_lots"] = 0
-            return payload
-        import math as _m
-        calculated = int(_m.floor(risk_amount / loss_per_lot))
-        final = max(1, min(max_lots, calculated))
+        final = calculate_execution_lots(capital)
         payload.update({
-            "risk_amount": round(risk_amount, 2),
-            "loss_per_lot": round(loss_per_lot, 2),
-            "calculated_lots": calculated,
+            "calculated_lots": final,
             "final_lots": final,
+            "risk_amount": round(capital * FIXED_RISK_PCT / 100.0, 2),
+            "loss_per_lot": round(entry * sl_pct * lot_size, 2),
         })
         return payload
 

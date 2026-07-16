@@ -35,6 +35,7 @@ def _make_bot():
     bot.state = config.State.IDLE
     bot._state_lock = threading.RLock()
     bot._auto_suspended_reason = None
+    bot._last_auto_failure_key = None
     bot._exit_reason_hint = None
     bot._timeline_session = None
     bot.timeline = MagicMock()
@@ -43,6 +44,12 @@ def _make_bot():
     bot.telegram = MagicMock()
     bot.telegram.enabled = False
     bot._tl = MagicMock()
+    # v2.2 — sizer requires a live tick for the fixed capital→lots calc.
+    bot.broker = MagicMock()
+    bot.broker.get_net_available_cash.return_value = 200000.0
+    bot.ws = MagicMock()
+    bot.ws.get_last_tick.return_value = MagicMock(ltp=100.0, ts=0.0)
+    bot._last_option_quote = {"55555": {"ltp": 100.0}}
     return bot
 
 
@@ -64,12 +71,19 @@ def test_auto_entry_noop_when_disabled():
 def test_auto_entry_fires_when_enabled_and_gates_pass():
     bot = _make_bot()
     bot.db.set_state("auto_trade_enabled", "true")
-    bot.db.set_state("default_lots", "2")
-    bot._maybe_auto_entry(_payload("PUT", 47))
+    bot.db.set_state("sim_capital", "200000")   # → 6 lots via fixed mapping
+    # Force SIM mode so sim_capital is used.
+    original_sim = config.SIMULATE_ORDERS
+    try:
+        config.SIMULATE_ORDERS = True
+        bot._maybe_auto_entry(_payload("PUT", 47))
+    finally:
+        config.SIMULATE_ORDERS = original_sim
     bot._handle_manual_entry.assert_called_once()
     call = bot._handle_manual_entry.call_args
     assert call.args[0] == config.Direction.SHORT
-    assert call.kwargs["lots_override"] == 2
+    # v2.2 — capital ≥ 200k → 6 lots (fixed mapping).
+    assert call.kwargs["lots_override"] == 6
     assert call.kwargs["engine"] == "smc"
     assert call.kwargs["confidence"] == 47
 
