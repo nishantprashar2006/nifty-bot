@@ -608,7 +608,7 @@ function App() {
               <div className="mt-6 grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-3 text-sm font-mono">
                 <div>
                   <div className="text-[10px] uppercase tracking-wider text-zinc-500">Lots</div>
-                  <div className="text-zinc-100">{eqSnap?.effective_lots ?? "—"}</div>
+                  <div className="text-zinc-100" data-testid="fsm-lots">{executionLots}</div>
                 </div>
                 <div>
                   <div className="text-[10px] uppercase tracking-wider text-zinc-500">
