@@ -643,3 +643,22 @@ Combined bug fix + feature. Only lot-count arithmetic changes; SMC/execution/FSM
 
 **Regression:** 7 new tests in `/app/backend/tests/test_bugfix_v201.py`. v1.13 pre-flight tests updated with `_force_live_preflight` autouse fixture. Full suite 199/199. Testing agent iteration_10 → **100% PASS** (all 4 bugs individually verified).
 
+
+## 2026-02-06 — v2.2 Production Hardening: Fixed Position Sizing (Part 1 + Part 4)
+
+**Delivered in this sprint (Parts 1 + 4):**
+- Module-level `calculate_execution_lots(capital)` in main.py: deterministic mapping <50k→2, 50-79999→3, 80-149999→4, 150-199999→5, ≥200k→6. Single source of truth.
+- `_compute_auto_risk_lots` rewritten to use the fixed mapping; return payload now `mode='fixed'`, capital, capital_source ('sim'|'broker'), calculated_lots=final_lots, risk_amount, loss_per_lot.
+- SIM path (`SIMULATE_ORDERS=True`) reads `bot_state.sim_capital`; NEVER calls broker. LIVE fetches from broker; on fail cancels trade (no silent fallback).
+- `_maybe_auto_entry` no longer branches on sizing_mode — always fixed sizing.
+- 4 new fixed-display constants: `FIXED_RISK_PCT=2.5`, `FIXED_SL_PCT_DISPLAY=15.0`, `FIXED_TP_PCT_DISPLAY=30.0`, `FIXED_TRAIL_PCT_DISPLAY=10.0`.
+- UI: Position Sizing card simplified — removed Manual/AUTO Risk toggle, Max Lots, Risk % inputs. Now shows fixed constants + Sim Capital (SIM-only) + derived Execution Lots.
+
+**Deferred to next sprint (Parts 2 + 3) per context/budget constraints:**
+- Part 2 — Restart recovery: fetch historical 3m/5m/15m candles at bootstrap so a mid-session restart doesn't lose SMC warm-up. Requires understanding + carefully modifying the existing candle_manager + broker historical-candles integration.
+- Part 3 — Full UI cleanup: remove Equity Curve panel; rename "Live Cash" → "Broker Capital"; complete lot-count display consolidation.
+
+**Untouched (per user directive, verified):** SMC engine, HTF, BOS/CHoCH/FVG/OB/sweeps/premium-discount, confidence weights, entry rules, exit rules, SL 15%/TP 30%/Trailing 10%, `_handle_fill`, `_place_protective_legs`, order placement, FSM, reconciliation.
+
+**Regression:** 15 new tests in `/app/backend/tests/test_fixed_sizing_v22.py`. Deprecated `test_position_sizing_v2.py` deleted; v15 auto-trade tests updated. Full suite **202/202** passing. Testing agent iteration_11 → **100% PASS**.
+
