@@ -662,3 +662,28 @@ Combined bug fix + feature. Only lot-count arithmetic changes; SMC/execution/FSM
 
 **Regression:** 15 new tests in `/app/backend/tests/test_fixed_sizing_v22.py`. Deprecated `test_position_sizing_v2.py` deleted; v15 auto-trade tests updated. Full suite **202/202** passing. Testing agent iteration_11 → **100% PASS**.
 
+
+
+## v2.2 P0 — Capital Display Consistency (2026-02-16)
+
+**User bugs fixed:**
+1. Duplicate labels "SIM Capital" + "SIM Capital in use" → consolidated into ONE authoritative field per mode.
+2. SIM Capital input reset on refresh → now correctly persists & re-hydrates from `bot_state.sim_capital`.
+3. LIVE mode "Live Cash" and "Broker Capital" showed different values → both now read the same `broker_capital` snapshot.
+4. Capital didn't dynamically update between trades → main-loop `_publish_broker_capital` now writes a fresh RMS snapshot every 30 s.
+
+**Implementation:**
+- **backend/main.py**: Added `_publish_broker_capital()` — throttled (30 s) writer that writes `{value, source, ts}` JSON to `bot_state.broker_capital`. SIM reads persisted `sim_capital`; LIVE calls `broker.get_net_available_cash()` (RMS). Called from `_main_loop` alongside `_publish_ws_health`. Broker failures are swallowed (never crashes the FSM).
+- **backend/server.py**: Added `_broker_capital_snapshot()` helper and exposed `broker_capital` field in `GET /api/bot/status`. LIVE prefers the fresh bot_state snapshot; falls back to latest `equity_curve.current_equity`; final fallback = 0.
+- **frontend/App.js**:
+  - Removed the duplicate "Sim Capital (in use)" row.
+  - Converted the SIM Capital input from `defaultValue` → controlled `value` with focus-guarded sync effect (edits during typing are not clobbered by 3s status polling).
+  - SIM: shows editable input. LIVE: shows read-only "Broker Capital (RMS)" that mirrors the hero card's "Live Cash (RMS)".
+  - Execution Lots and hero-card capital display now both read `status.broker_capital.value` — single source of truth.
+
+**Regression:** 8 new tests in `/app/backend/tests/test_broker_capital_snapshot_v22p0.py` covering SIM/LIVE snapshot semantics, 30 s throttle, broker-failure resilience, and end-to-end sim_capital persistence via POST/GET. Full suite **210/210** passing.
+
+**Deferred (unchanged):**
+- Part 2 — Restart recovery (historical candle backfill).
+- Part 3 — Full UI cleanup (remove Equity Curve panel, further label consolidation).
+- Backlog: `score_history` SQLite table; Time-to-fill/Time-in-trade on Execution Timeline modal.

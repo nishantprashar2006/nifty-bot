@@ -125,6 +125,12 @@ function App() {
   const [editingCap, setEditingCap] = useState(false);
   const [capInput, setCapInput] = useState("");
 
+  // v2.2 P0 — controlled SIM Capital input. Local edits during typing
+  // don't clobber the persisted value on the next status poll; blur
+  // pushes to backend and syncs back.
+  const [simCapInput, setSimCapInput] = useState("");
+  const [simCapFocused, setSimCapFocused] = useState(false);
+
   // Reset confirmation
   const [confirmReset, setConfirmReset] = useState(false);
 
@@ -206,6 +212,15 @@ function App() {
     const id = setInterval(fetchAll, 3000);
     return () => clearInterval(id);
   }, [fetchAll]);
+
+  // v2.2 P0 — keep the SIM Capital input in sync with the persisted
+  // value unless the user is actively editing it (focus guard).
+  useEffect(() => {
+    if (simCapFocused) return;
+    if (status?.sim_capital != null) {
+      setSimCapInput(String(Math.round(status.sim_capital)));
+    }
+  }, [status?.sim_capital, simCapFocused]);
 
   const control = async (action) => {
     if (busy) return;
@@ -600,9 +615,13 @@ function App() {
                 </div>
                 <div>
                   <div className="text-[10px] uppercase tracking-wider text-zinc-500">
-                    {status?.trading_mode === "paper" ? "Paper Equity" : "Live Cash (RMS)"}
+                    {status?.trading_mode === "live" ? "Live Cash (RMS)" : "Sim Capital"}
                   </div>
-                  <div className="text-zinc-100">{eqSnap ? fmtINR(eqSnap.current_equity) : "—"}</div>
+                  <div className="text-zinc-100" data-testid="hero-capital">
+                    {status?.broker_capital?.value != null
+                      ? fmtINR(status.broker_capital.value)
+                      : (eqSnap ? fmtINR(eqSnap.current_equity) : "—")}
+                  </div>
                 </div>
                 <div>
                   <div className="text-[10px] uppercase tracking-wider text-zinc-500">Peak</div>
@@ -1032,7 +1051,7 @@ function App() {
           </div>
         </Card>
 
-        {/* v2.2 — Fixed Position Sizing card (Sim Capital only) */}
+        {/* v2.2 — Fixed Position Sizing card (SIM Capital editable · LIVE = broker RMS mirror) */}
         <Card data-testid="sizing-card" className="border-zinc-800 bg-zinc-950/70 p-4 rounded-none">
           <div className="flex flex-wrap items-start gap-4">
             <div className="flex-1 min-w-[220px]">
@@ -1048,37 +1067,50 @@ function App() {
               </div>
             </div>
             <div className="flex flex-wrap gap-3 text-xs font-mono">
-              {status?.trading_mode !== "live" && (
+              {status?.trading_mode !== "live" ? (
                 <label className="flex flex-col text-zinc-500">
                   <span className="text-[9px] uppercase tracking-widest mb-1">Sim Capital ₹</span>
                   <input
                     data-testid="sim-capital-input"
                     type="number" min="1" step="1000"
-                    defaultValue={status?.sim_capital ?? 200000}
-                    className="w-32 bg-zinc-900 border border-zinc-800 px-2 py-1 text-amber-200"
+                    value={simCapInput}
+                    onFocus={() => setSimCapFocused(true)}
+                    onChange={(e) => setSimCapInput(e.target.value)}
                     onBlur={async (e) => {
+                      setSimCapFocused(false);
                       const v = parseFloat(e.target.value);
-                      if (v > 0) {
-                        try { await axios.post(`${API}/bot/sizing_config`, { sim_capital: v }); await fetchAll(); }
-                        catch (err) { toast.error(err?.response?.data?.detail || err.message); }
+                      const persisted = Math.round(status?.sim_capital || 0);
+                      if (!(v > 0)) {
+                        // Revert visually if user cleared or entered invalid value
+                        setSimCapInput(String(persisted));
+                        return;
+                      }
+                      if (Math.round(v) === persisted) return;  // no-op
+                      try {
+                        await axios.post(`${API}/bot/sizing_config`, { sim_capital: v });
+                        toast.success(`SIM Capital saved: ₹${Math.round(v).toLocaleString("en-IN")}`);
+                        await fetchAll();
+                      } catch (err) {
+                        toast.error(err?.response?.data?.detail || err.message);
+                        setSimCapInput(String(persisted));
                       }
                     }}
+                    className="w-32 bg-zinc-900 border border-zinc-800 px-2 py-1 text-amber-200"
                   />
                 </label>
-              )}
-              <div className="flex flex-col text-zinc-500 justify-end">
-                <span className="text-[9px] uppercase tracking-widest mb-1">
-                  {status?.trading_mode === "live" ? "Broker Capital" : "Sim Capital (in use)"}
-                </span>
-                <div className="text-amber-200">
-                  ₹{Math.round(status?.sim_capital || 0).toLocaleString("en-IN")}
+              ) : (
+                <div className="flex flex-col text-zinc-500 justify-end">
+                  <span className="text-[9px] uppercase tracking-widest mb-1">Broker Capital (RMS)</span>
+                  <div data-testid="broker-capital-display" className="text-amber-200 text-sm">
+                    ₹{Math.round(status?.broker_capital?.value || 0).toLocaleString("en-IN")}
+                  </div>
                 </div>
-              </div>
+              )}
               <div className="flex flex-col text-zinc-500 justify-end">
                 <span className="text-[9px] uppercase tracking-widest mb-1">Execution Lots</span>
                 <div className="text-amber-200 text-sm" data-testid="execution-lots">
                   {(() => {
-                    const c = status?.sim_capital || 0;
+                    const c = status?.broker_capital?.value || 0;
                     if (c < 50000) return 2;
                     if (c < 80000) return 3;
                     if (c < 150000) return 4;

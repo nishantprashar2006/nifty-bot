@@ -321,7 +321,56 @@ def bot_status() -> dict[str, Any]:
         "risk_pct": float(_read_bot_state("risk_pct", "1.0") or 1.0),
         "max_lots": int(_read_bot_state("max_lots", "5") or 5),
         "sim_capital": float(_read_bot_state("sim_capital", "200000") or 200000),
+        "broker_capital": _broker_capital_snapshot(),
     }
+
+
+def _broker_capital_snapshot() -> dict[str, Any]:
+    """v2.2 P0 — single authoritative capital number the UI displays.
+
+    In SIM mode this is the persisted sim_capital (user-editable).
+    In LIVE mode this is the latest broker RMS snapshot pushed by the
+    bot's main loop (`_publish_broker_capital`), falling back to the
+    most recent equity_curve.current_equity if the bot hasn't
+    written a snapshot yet.
+    """
+    import json as _json
+    mode = _current_trading_mode()
+    if mode == "sim":
+        try:
+            v = float(_read_bot_state("sim_capital", "200000") or 200000)
+        except Exception:
+            v = 200_000.0
+        return {"value": v, "source": "sim", "trading_mode": "sim"}
+    # LIVE mode
+    raw = _read_bot_state("broker_capital", "")
+    if raw:
+        try:
+            d = _json.loads(raw)
+            return {
+                "value": float(d.get("value") or 0.0),
+                "source": "broker",
+                "trading_mode": "live",
+                "ts": d.get("ts"),
+            }
+        except Exception:
+            pass
+    # Fallback: latest equity_curve row
+    try:
+        with _conn() as c:
+            row = c.execute(
+                "SELECT current_equity FROM equity_curve "
+                "ORDER BY timestamp DESC LIMIT 1"
+            ).fetchone()
+        if row:
+            return {
+                "value": float(row["current_equity"]),
+                "source": "equity_curve",
+                "trading_mode": "live",
+            }
+    except Exception:
+        pass
+    return {"value": 0.0, "source": "unknown", "trading_mode": "live"}
 
 
 def _feed_stale_threshold() -> int:

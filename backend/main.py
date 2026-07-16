@@ -913,6 +913,36 @@ class NiftyOptionsBot:
             # Diagnostics must never crash the main loop.
             pass
 
+    # ─────────────────────────────────────── v2.2 P0 — broker capital snapshot
+    # UI must always show the current broker RMS (LIVE mode) or the persisted
+    # sim_capital (SIM mode) as ONE authoritative value. We snapshot it into
+    # bot_state.broker_capital so /api/bot/status returns a fresh number
+    # without hammering the broker on every request.
+    def _publish_broker_capital(self) -> None:
+        try:
+            import json as _json
+            now = time.time()
+            last = getattr(self, "_broker_capital_last_ts", 0.0)
+            # LIVE snapshots hit the broker; throttle to 30s. SIM is a cheap
+            # DB read so still throttled to reduce write churn.
+            if now - last < 30.0:
+                return
+            if config.SIMULATE_ORDERS:
+                r = self.db.get_state("sim_capital")
+                cap = float(r[0]) if r else 200_000.0
+                source = "sim"
+            else:
+                cap = float(self.broker.get_net_available_cash())
+                source = "broker"
+            self.db.set_state(
+                "broker_capital",
+                _json.dumps({"value": cap, "source": source, "ts": now}),
+            )
+            self._broker_capital_last_ts = now
+        except Exception:
+            # Diagnostics must never crash the main loop.
+            pass
+
     def _persist_live_position_state(self) -> None:
         """v1.9 P1: snapshot the open position's mutable protection state
         into bot_state.live_position so an unexpected restart can resume
@@ -2863,6 +2893,7 @@ class NiftyOptionsBot:
                 #       the next tick — bounded REST usage tied to user intent
                 #       rather than a background hammer.
                 self._publish_ws_health()
+                self._publish_broker_capital()
                 self._daily_rollover_if_needed()
 
                 breach = self._trip_circuit_breakers()
