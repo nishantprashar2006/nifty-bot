@@ -305,6 +305,10 @@ def bot_status() -> dict[str, Any]:
         "manual_sl_pct": float(_read_env_value("MANUAL_SL_PCT") or (config.MANUAL_SL_PCT * 100)),
         "manual_tp_pct": float(_read_env_value("MANUAL_TP_PCT") or (config.MANUAL_TP_PCT * 100)),
         "trail_step_pct": float(_read_env_value("TRAIL_STEP_PCT") or (config.TRAIL_STEP_PCT * 100)),
+        # v2.5 — fixed-point execution parameters (dashboard consumes these)
+        "fixed_sl_points": float(config.FIXED_SL_POINTS),
+        "fixed_tp_points": float(config.FIXED_TP_POINTS),
+        "fixed_trail_activation_points": float(config.FIXED_TRAIL_ACTIVATION_POINTS),
         "smc_max_signal_age_min": int(_read_env_value("SMC_MAX_SIGNAL_AGE_MIN") or config.MAX_SIGNAL_AGE_MINUTES),
         "telegram_enabled": (
             _read_env_value("TELEGRAM_ENABLED") or "false"

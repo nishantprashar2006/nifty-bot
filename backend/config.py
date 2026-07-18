@@ -244,10 +244,12 @@ except ValueError:
 # PUT). Ignores the confidence threshold. Coexists with the existing
 # confidence≥SMC_AUTO_TRADE_THRESHOLD path. Isolated behind a flag so
 # it can be flipped off without touching code.
-BOS_STRUCTURE_AUTO_ENABLED: bool = os.getenv("BOS_STRUCTURE_AUTO_ENABLED", "true").lower() == "true"
-# Telegram alert for the same condition fires regardless of the AUTO
-# flag — it is purely informational.
-BOS_STRUCTURE_ALERT_ENABLED: bool = os.getenv("BOS_STRUCTURE_ALERT_ENABLED", "true").lower() == "true"
+# v2.5 — Part 1/2: BOS+Structure AUTO + informational alert are REMOVED.
+# The flags remain (default off) so any stale env config resolves cleanly
+# and old tests still import the names, but they no longer trigger any
+# code path. AUTO is now solely confidence≥SMC_AUTO_TRADE_THRESHOLD.
+BOS_STRUCTURE_AUTO_ENABLED: bool = False
+BOS_STRUCTURE_ALERT_ENABLED: bool = False
 
 # ────────────────────────────────────────────────────────────────────
 # 16. v2.4 — Daily Loss Protection (Risk % repurposed)
@@ -258,5 +260,22 @@ BOS_STRUCTURE_ALERT_ENABLED: bool = os.getenv("BOS_STRUCTURE_ALERT_ENABLED", "tr
 # Realized losses only (closed trades). When breached: AUTO suspended
 # with reason "MAX_DAILY_LOSS", Telegram alert, dashboard banner.
 # Auto-resumes at the next IST calendar-day rollover.
-RISK_PCT_DEFAULT: float = float(os.getenv("RISK_PCT_DEFAULT", "2.5"))
+RISK_PCT_DEFAULT: float = float(os.getenv("RISK_PCT_DEFAULT", "3.0"))
+
+# ────────────────────────────────────────────────────────────────────
+# 17. v2.5 — Fixed-point execution (₹ premium, not %)
+# ────────────────────────────────────────────────────────────────────
+# Execution is now anchored to the ACTUAL FILLED entry premium and
+# expressed in absolute ₹ points, not percentages. Applies to both
+# manual and AUTO entries.
+#
+#   Initial Stop Loss  = fill − FIXED_SL_POINTS
+#   Fixed Target       = fill + FIXED_TP_POINTS  (active throughout)
+#   Trailing Stop      = (highest_premium − FIXED_SL_POINTS)
+#                        ACTIVATES only after premium moves
+#                        FIXED_TRAIL_ACTIVATION_POINTS above fill.
+#                        Only moves upward, never downward.
+FIXED_SL_POINTS: float = float(os.getenv("FIXED_SL_POINTS", "11"))
+FIXED_TP_POINTS: float = float(os.getenv("FIXED_TP_POINTS", "25"))
+FIXED_TRAIL_ACTIVATION_POINTS: float = float(os.getenv("FIXED_TRAIL_ACTIVATION_POINTS", "15"))
 

@@ -1487,15 +1487,14 @@ class NiftyOptionsBot:
                 "quantity": qty,
             }
 
-        # Provisional SL/TP — will be re-anchored to actual fill in
-        # PositionManager.promote_to_open(). Manual mode uses % of premium;
-        # auto path stays on ATR-derived points.
-        if sl_pct > 0 and tp_pct > 0:
-            target_px = premium * (1 + tp_pct)
-            stop_px = max(0.05, premium * (1 - sl_pct))
-        else:
-            target_px = premium + tp_pts
-            stop_px = max(0.05, premium - sl_pts)
+        # v2.5 — Execution is now expressed in absolute ₹ points on the
+        # ACTUAL filled premium. SL = premium − FIXED_SL_POINTS,
+        # TP = premium + FIXED_TP_POINTS. Trailing activation and gap
+        # live on the OpenPosition (see promote_to_open + maybe_trail_stop).
+        # `sl_pct/tp_pct/trail_step_pct` kwargs are IGNORED but kept in the
+        # signature for backward-compatible callers.
+        target_px = premium + config.FIXED_TP_POINTS
+        stop_px = max(0.05, premium - config.FIXED_SL_POINTS)
         # v1.13 — pre-flight margin check (advisory).
         # v2.0.1 — SIM MUST NEVER call live broker funds. Only run the
         # pre-flight when TRADING_MODE is live (execution against the real
@@ -2239,133 +2238,17 @@ class NiftyOptionsBot:
                 self._maybe_auto_entry(payload)
             except Exception:
                 logger.exception("auto_entry gate raised (ignored)")
-            # v2.3 Phase 2 — BOS+Structure alert + AUTO path. Fires the
-            # INSTANT SMC's BOS aligns with 5m structure (Bullish BOS +
-            # HH+HL → CALL, Bearish BOS + LH+LL → PUT). Ignores confidence
-            # threshold. Coexists with the confidence path above; single-
-            # position lock in `_handle_manual_entry` prevents double
-            # entry. Both alert + trade dedup on 5m bar count so we
-            # don't spam within the same candle.
-            try:
-                self._maybe_bos_structure_signal(payload)
-            except Exception:
-                logger.exception("bos_structure gate raised (ignored)")
+            # v2.5 — BOS+Structure AUTO path REMOVED. Confidence ≥
+            # threshold is now the ONLY automatic entry rule (Part 1/2).
         except Exception:
             logger.debug("SMC scoring tick failed (continuing)", exc_info=True)
 
-    # ─────────────────────────── v2.3 Phase 2 — BOS+Structure dual path
-    def _maybe_bos_structure_signal(self, payload: dict) -> None:
-        """Detect BOS+Structure alignment on the LATEST SMC output and:
-          (1) send an immediate Telegram alert (regardless of confidence)
-          (2) fire an AUTO entry (regardless of confidence) when AUTO
-              mode is enabled.
-
-        Reuses the SMC context fields ONLY — no new detection logic.
-        Both alert + trade dedup on (direction, bars_5m) so a single
-        aligned 5m candle only fires once.
-        """
-        bos = payload.get("bos")                      # "CALL" | "PUT" | None
-        struct = payload.get("market_structure")      # "CALL" | "PUT" | "NEUTRAL"
-        if bos not in ("CALL", "PUT") or bos != struct:
-            return  # alignment condition not met
-
-        bars_5m = int(payload.get("bars_5m") or 0)
-        dedup_key = (bos, bars_5m)
-
-        # ── (1) informational Telegram alert ───────────────────────
-        if config.BOS_STRUCTURE_ALERT_ENABLED and self._last_bos_structure_alert_key != dedup_key:
-            try:
-                tg = getattr(self, "telegram", None)
-                if tg is not None and hasattr(tg, "send_bos_structure_signal"):
-                    tg.send_bos_structure_signal(payload)
-            except Exception:
-                logger.exception("BOS+Structure telegram alert raised (ignored)")
-            self._last_bos_structure_alert_key = dedup_key
-
-        # ── (2) AUTO entry path (independent of confidence threshold) ─
-        if not config.BOS_STRUCTURE_AUTO_ENABLED:
-            return
-        # Standard AUTO gates — mirror _maybe_auto_entry so both paths
-        # respect the operator's dashboard toggles.
-        row = self.db.get_state("auto_trade_enabled")
-        if not row or str(row[0]).lower() not in ("1", "true", "yes"):
-            return
-        if self._auto_suspended_reason:
-            return
-        if self.positions.has_open_position or self.positions.has_pending_entry:
-            return
-        if self.state is not config.State.IDLE:
-            return
-        # Per-5m-candle single-entry lock. If the confidence path already
-        # fired (or attempted) in this candle, `has_pending_entry` /
-        # `has_open_position` above will short-circuit us naturally.
-        if self._last_bos_structure_key == dedup_key:
-            return
-        breach = self._trip_circuit_breakers()
-        if breach:
-            return
-
-        # Reuse the exact sizing pipeline used by the confidence path so
-        # the two triggers stay behavioural-siblings.
-        entry_ref = 0.0
-        try:
-            tick = self.ws.get_last_tick(payload.get("token"))
-            entry_ref = float(tick.ltp) if tick else 0.0
-        except Exception:
-            entry_ref = 0.0
-        if entry_ref <= 0:
-            try:
-                for _tk, _q in (self._last_option_quote or {}).items():
-                    _ltp = float(_q.get("ltp") or 0.0)
-                    if _ltp > 0:
-                        entry_ref = _ltp
-                        break
-            except Exception:
-                pass
-        calc = self._compute_auto_risk_lots(entry_ref)
-        if calc.get("error"):
-            try:
-                from execution_timeline import Event as _Ev
-                session_id = getattr(self, "_timeline_session", None) or "AUTO"
-                self._tl(session_id, _Ev.AUTO_ENTRY_CANCELLED,
-                         f"BOS+Structure AUTO cancelled — {calc['error']}", calc)
-            except Exception:
-                pass
-            self._last_bos_structure_key = dedup_key  # don't retry inside the same candle
-            return
-
-        lots_override = calc.get("final_lots") or 1
-        direction = (config.Direction.LONG if bos == "CALL"
-                     else config.Direction.SHORT)
-        reasons = list(payload.get("reasons") or [])
-        reasons.insert(0, "TRIGGER: BOS + Structure Rule")
-        confidence = int(payload.get("confidence") or 0)
-        logger.info("BOS+STRUCTURE AUTO firing: %s (conf=%d%% ignored) bars_5m=%d",
-                    bos, confidence, bars_5m)
-        try:
-            from execution_timeline import Event as _Ev
-            session = getattr(self, "_timeline_session", None) or "AUTO"
-            self._tl(session, _Ev.AUTO_ENTRY,
-                     f"BOS+Structure {bos} @ {confidence}% (threshold ignored)",
-                     {"direction": bos, "confidence": confidence,
-                      "trigger": "BOS_STRUCTURE",
-                      "bos": payload.get("bos"),
-                      "market_structure": payload.get("market_structure"),
-                      "bars_5m": bars_5m,
-                      "reasons": reasons[:5], "lots": lots_override})
-        except Exception:
-            pass
-
-        # Mark BEFORE firing so a fill-error inside the same 5m candle
-        # doesn't loop.
-        self._last_bos_structure_key = dedup_key
-        ok, msg = self._handle_manual_entry(
-            direction, lots_override=lots_override,
-            engine="smc_bos_struct", confidence=confidence, reasons=reasons,
-            trigger="BOS_STRUCTURE",
-        )
-        if not ok:
-            logger.warning("BOS+Structure AUTO entry failed: %s", msg)
+    # ─────────────────────────── v2.5 — BOS+Structure REMOVED
+    # The previous dual-trigger path (BOS + 5m Structure alignment
+    # firing AUTO trades regardless of confidence) has been removed.
+    # AUTO is now solely: confidence ≥ SMC_AUTO_TRADE_THRESHOLD.
+    # The SMC engine STILL computes bos/market_structure as before —
+    # they simply do not drive execution or Telegram anymore.
 
     # ─────────────────────────────────────────────── v1.15 auto trade
     def _maybe_auto_entry(self, smc_payload: dict) -> None:

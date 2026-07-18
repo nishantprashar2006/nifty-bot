@@ -144,38 +144,53 @@ def test_directional_cooldown_after_stop():
     assert not pm.in_cooldown(Direction.SHORT)
 
 
-def test_trailing_stop_bumps_only_above_step():
+def test_trailing_stop_arms_only_after_activation_and_lifts_stop():
+    """v2.5 — Trailing does NOT arm until premium moves +₹15 above fill.
+    Once armed, stop = highest_premium − ₹11 and only moves UPWARD."""
     pm = PositionManager()
     p = PendingEntry(
         order_id="O1", direction=Direction.LONG, contract_symbol="X",
         contract_token="T", expected_price=100, lots=1, qty=65,
-        target_price=120, stop_price=90,
-    )
-    pm.register_pending_entry(p)
-    pm.promote_to_open(100.0)
-    assert pm.maybe_trail_stop(103.0) is None   # below step
-    new_stop = pm.maybe_trail_stop(106.0)        # 6pt advance → bump 5
-    assert new_stop == 95.0
-
-
-# ──────────────────────────────────────────────── manual-mode % trailing
-def test_manual_mode_percent_trail_step():
-    """A position opened with trail_step_pct=0.10 should bump SL by 10 %
-    of entry price on every advance ≥ that step."""
-    pm = PositionManager()
-    p = PendingEntry(
-        order_id="O1", direction=Direction.LONG, contract_symbol="X",
-        contract_token="T", expected_price=100, lots=1, qty=65,
-        target_price=130, stop_price=85,
-        sl_pct=0.15, tp_pct=0.30, trail_step_pct=0.10,
+        target_price=125, stop_price=89,
     )
     pm.register_pending_entry(p)
     pos = pm.promote_to_open(100.0)
-    # entry × 10 % = ₹10 step
-    assert pm.maybe_trail_stop(109.0) is None         # below step
-    new_stop = pm.maybe_trail_stop(112.0)             # 12pt advance → 1×10 bump
-    assert new_stop == round(pos.stop_price, 2)
-    assert pos.stop_price > 85.0
+    # Initial SL/TP wired from fill using ₹11 / ₹25 fixed points
+    assert pos.stop_price == 89.0
+    assert pos.target_price == 125.0
+    # Below activation → no trailing
+    assert pm.maybe_trail_stop(110.0) is None
+    assert pos.stop_price == 89.0
+    assert pm.maybe_trail_stop(114.99) is None
+    assert pos.stop_price == 89.0
+    # At activation → stop lifts to (high − ₹11)
+    new_stop = pm.maybe_trail_stop(115.0)
+    assert new_stop == 104.0
+    # Higher high → stop follows up
+    assert pm.maybe_trail_stop(120.0) == 109.0
+    assert pm.maybe_trail_stop(123.0) == 112.0
+    # Pullback below prior high → NO downward move
+    assert pm.maybe_trail_stop(118.0) is None
+    assert pos.stop_price == 112.0
+
+
+# ──────────────────────────────────────────────── v2.5 fixed-point execution
+def test_promote_to_open_uses_fixed_points_from_config():
+    """SL = fill − ₹11, TP = fill + ₹25 regardless of pending SL/TP hints."""
+    pm = PositionManager()
+    p = PendingEntry(
+        order_id="O1", direction=Direction.LONG, contract_symbol="X",
+        contract_token="T", expected_price=47, lots=1, qty=65,
+        target_price=999,  # stale hint — must be ignored
+        stop_price=1,
+        sl_pct=0.15, tp_pct=0.30, trail_step_pct=0.10,  # legacy kwargs ignored
+    )
+    pm.register_pending_entry(p)
+    pos = pm.promote_to_open(47.0)
+    assert pos.stop_price == 36.0
+    assert pos.target_price == 72.0
+    # trail_anchor sentinel — trailing not yet armed
+    assert pos.trail_anchor == 0.0
 
 
 # ──────────────────────────────────────────────── synthetic exit thresholds
@@ -202,10 +217,11 @@ def test_synthetic_exit_thresholds_fire_correctly():
         return "HOLD"
 
     assert synth_decision(100.0) == "HOLD"
-    assert synth_decision(129.9) == "HOLD"
-    assert synth_decision(130.0) == "TARGET"
+    # v2.5 — after promote_to_open, target=125 and stop=89 (fixed points)
+    assert synth_decision(124.9) == "HOLD"
+    assert synth_decision(125.0) == "TARGET"
     assert synth_decision(150.0) == "TARGET"
-    assert synth_decision(85.0)  == "STOP"
+    assert synth_decision(89.0)  == "STOP"
     assert synth_decision(70.0)  == "STOP"
 
 

@@ -180,40 +180,9 @@ class TelegramNotifier:
         )
 
 
-    # ─── v2.3 BOS + Structure informational alert ───────────────────
-    def send_bos_structure_signal(self, payload: dict) -> None:
-        """v2.3 Phase 2 — fires the instant BOS+Structure aligns
-        (Bullish BOS + HH+HL → CALL, Bearish BOS + LH+LL → PUT).
-        IGNORES confidence threshold — the whole point of this alert.
-        Caller is responsible for candle-level dedup (see main.py)."""
-        if not self.enabled:
-            return
-        direction = str(payload.get("direction") or "")
-        confidence = int(payload.get("confidence") or 0)
-        side = "BUY CALL" if direction == "CALL" else "BUY PUT"
-        htf_raw = payload.get("htf_trend")
-        htf = {"CALL": "Bullish", "PUT": "Bearish"}.get(htf_raw, htf_raw or "—")
-        struct_raw = payload.get("market_structure")
-        struct = {"CALL": "Bullish HH+HL", "PUT": "Bearish LH+LL"}.get(
-            struct_raw, struct_raw or "—"
-        )
-        bos_raw = payload.get("bos")
-        bos = {"CALL": "Bullish", "PUT": "Bearish"}.get(bos_raw, bos_raw or "—")
-        ts = payload.get("timestamp") or ""
-        text = (
-            "⚡ <b>BOS + STRUCTURE</b>\n\n"
-            f"<b>Direction:</b> {side}\n"
-            f"<b>Trigger:</b> BOS + Structure Rule\n"
-            f"<b>Confidence:</b> {confidence}%\n\n"
-            f"<b>BOS:</b> {bos}\n"
-            f"<b>Structure:</b> {struct}\n"
-            f"<b>HTF Trend:</b> {htf}\n\n"
-            f"<i>Time: {ts} IST</i>"
-        )
-        try:
-            self._send(text)
-        except Exception:
-            pass
+    # ─── v2.5 — BOS+Structure alert REMOVED
+    # Confidence ≥ threshold is now the ONLY Telegram signal rule.
+    # The former `send_bos_structure_signal` method has been deleted.
 
 
     # ─── v2.4 — Daily Loss + EOD Summary ────────────────────────────

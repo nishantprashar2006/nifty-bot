@@ -144,17 +144,13 @@ class PositionManager:
             if self._pending is None:
                 raise RuntimeError("No pending entry to promote.")
             p = self._pending
-            # Re-anchor SL/TP to ACTUAL fill price. Manual mode uses % of
-            # premium; auto path uses ATR-based points.
-            if p.sl_pct > 0 and p.tp_pct > 0:
-                target_price = fill_price * (1 + p.tp_pct)
-                stop_price = max(0.05, fill_price * (1 - p.sl_pct))
-            elif p.sl_points > 0 and p.tp_points > 0:
-                target_price = fill_price + p.tp_points
-                stop_price = max(0.05, fill_price - p.sl_points)
-            else:
-                target_price = p.target_price
-                stop_price = p.stop_price
+            # v2.5 — SL/TP re-anchored to ACTUAL fill using fixed ₹
+            # points from config. Percentage/legacy point kwargs on the
+            # pending entry are IGNORED but preserved in the field so
+            # any consumer that still reads them sees zeros safely.
+            import config as _cfg
+            target_price = fill_price + _cfg.FIXED_TP_POINTS
+            stop_price = max(0.05, fill_price - _cfg.FIXED_SL_POINTS)
             pos = OpenPosition(
                 trade_id=f"T-{uuid.uuid4().hex[:10]}",
                 direction=p.direction,
@@ -171,8 +167,12 @@ class PositionManager:
                 expiry=p.expiry,
                 option_type=p.option_type,
                 lot_size=p.lot_size,
-                trail_anchor=fill_price,
-                trail_step_pct=p.trail_step_pct,
+                # v2.5 — trail_anchor tracks the HIGHEST premium seen
+                # once trailing is armed. Sentinel 0.0 means "not yet
+                # armed" — maybe_trail_stop() only bumps once premium
+                # crosses fill + FIXED_TRAIL_ACTIVATION_POINTS.
+                trail_anchor=0.0,
+                trail_step_pct=0.0,  # legacy field; unused in v2.5
                 # v1.9 telemetry — freeze the initial protection state
                 # so audits can distinguish "initial SL hit" from
                 # "trailing SL hit" after N bumps.
@@ -207,26 +207,28 @@ class PositionManager:
 
     # ------------------------------------------------------------- trailing
     def maybe_trail_stop(self, current_premium: float) -> Optional[float]:
-        """If premium advanced ≥ trailing step since trail_anchor, bump the
-        stop by that step. Returns new stop or None.
+        """v2.5 — fixed-point trailing.
 
-        Manual-mode positions use a PERCENT step (`trail_step_pct` × entry
-        price). Auto-mode positions keep the legacy fixed-points step
-        (config.TRAILING_TRIGGER_STEP) so the original behaviour is preserved.
+        Trailing does NOT arm until premium moves at least
+        FIXED_TRAIL_ACTIVATION_POINTS above the actual fill.
+        Once armed, the stop is anchored to the HIGHEST premium
+        seen and lifted to `highest − FIXED_SL_POINTS`. The stop
+        only ever moves UPWARD, never downward.
         """
+        import config as _cfg
         with self._lock:
             pos = self._open
             if pos is None:
                 return None
-            if pos.trail_step_pct > 0:
-                step = max(0.05, pos.entry_price * pos.trail_step_pct)
-            else:
-                step = config.TRAILING_TRIGGER_STEP
-            delta = current_premium - pos.trail_anchor
-            if delta >= step:
-                bump = step * (delta // step)
-                pos.stop_price += bump
-                pos.trail_anchor += bump
+            activation_price = pos.entry_price + _cfg.FIXED_TRAIL_ACTIVATION_POINTS
+            if current_premium < activation_price:
+                return None  # not yet armed — initial SL stays
+            # Update the running high-water mark.
+            if current_premium > pos.trail_anchor:
+                pos.trail_anchor = current_premium
+            candidate_stop = pos.trail_anchor - _cfg.FIXED_SL_POINTS
+            if candidate_stop > pos.stop_price:
+                pos.stop_price = candidate_stop
                 pos.trail_bumps += 1     # v1.9 telemetry
                 return pos.stop_price
             return None

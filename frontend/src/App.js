@@ -315,7 +315,7 @@ function App() {
         reasons,
       });
       toast.success(`${direction} entry queued (#${data.cmd_id})`, {
-        description: `Engine: ${engine.toUpperCase()} · Lots: ${data.lots ?? executionLots} · SL ${status?.manual_sl_pct ?? 15}% / TP ${status?.manual_tp_pct ?? 30}% / Trail ${status?.trail_step_pct ?? 10}%`,
+        description: `Engine: ${engine.toUpperCase()} · Lots: ${data.lots ?? executionLots} · SL Entry−₹${status?.fixed_sl_points ?? 11} / TP Entry+₹${status?.fixed_tp_points ?? 25} / Trail arms at +₹${status?.fixed_trail_activation_points ?? 15}`,
       });
       // v2.2 — Fixed Position Sizing is fully deterministic; no sticky
       // override to reset.
@@ -620,16 +620,7 @@ function App() {
                       : (eqSnap ? fmtINR(eqSnap.current_equity) : "—")}
                   </div>
                 </div>
-                <div>
-                  <div className="text-[10px] uppercase tracking-wider text-zinc-500">Peak</div>
-                  <div className="text-zinc-100">{eqSnap ? fmtINR(eqSnap.peak_equity) : "—"}</div>
-                </div>
-                <div>
-                  <div className="text-[10px] uppercase tracking-wider text-zinc-500">Drawdown</div>
-                  <div className={(eqSnap?.drawdown_pct ?? 0) >= 0.1 ? "text-amber-300" : "text-zinc-100"}>
-                    {eqSnap ? `${(eqSnap.drawdown_pct * 100).toFixed(2)}%` : "—"}
-                  </div>
-                </div>
+                {/* v2.5 — Peak / Drawdown removed per user directive. */}
               </div>
 
               {/* Paper-mode editable capital removed — SIM uses real Angel cash */}
@@ -953,7 +944,7 @@ function App() {
             <div>
               <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono">Trading Execution Mode</div>
               <div className="text-[10px] font-mono text-zinc-600 mt-1">
-                AUTO fires SMC entries automatically when confidence ≥ {status?.smc_auto_trade_threshold ?? 40}% OR when BOS + Structure aligns (ignores confidence). MANUAL requires Buy Call / Buy Put click.
+                AUTO fires SMC entries automatically when confidence ≥ {status?.smc_auto_trade_threshold ?? 40}%. MANUAL requires Buy Call / Buy Put click.
               </div>
               {status?.auto_suspended_reason && (
                 <div data-testid="auto-suspended-banner" className="mt-2 text-[11px] text-red-300 border border-red-800 bg-red-950/20 px-2 py-1">
@@ -1020,13 +1011,15 @@ function App() {
             <div className="flex-1 min-w-[220px]">
               <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono mb-2">Position Sizing (Fixed)</div>
               <div className="text-[10px] font-mono text-zinc-600">
-                Deterministic capital→lots mapping. SIM uses Simulation Capital · LIVE uses broker capital. Risk 2.5% · SL 15% · TP 30% · Trail 10%.
+                Deterministic capital→lots mapping. SIM uses Simulation Capital · LIVE uses broker capital.{" "}
+                Execution: SL ₹{status?.fixed_sl_points ?? 11} · TP ₹{status?.fixed_tp_points ?? 25} ·
+                Trail arms at +₹{status?.fixed_trail_activation_points ?? 15} then follows high−₹{status?.fixed_sl_points ?? 11}.
               </div>
               <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] font-mono">
-                <div className="text-zinc-500">Risk:</div><div className="text-zinc-300">2.5%</div>
-                <div className="text-zinc-500">SL:</div><div className="text-zinc-300">15%</div>
-                <div className="text-zinc-500">TP:</div><div className="text-zinc-300">30%</div>
-                <div className="text-zinc-500">Trail:</div><div className="text-zinc-300">10%</div>
+                <div className="text-zinc-500">Initial SL:</div><div className="text-zinc-300">Entry − ₹{status?.fixed_sl_points ?? 11}</div>
+                <div className="text-zinc-500">Target:</div><div className="text-zinc-300">Entry + ₹{status?.fixed_tp_points ?? 25}</div>
+                <div className="text-zinc-500">Trail arms:</div><div className="text-zinc-300">At +₹{status?.fixed_trail_activation_points ?? 15}</div>
+                <div className="text-zinc-500">Trail SL:</div><div className="text-zinc-300">High − ₹{status?.fixed_sl_points ?? 11}</div>
               </div>
             </div>
             <div className="flex flex-wrap gap-3 text-xs font-mono">
@@ -1558,46 +1551,7 @@ function App() {
           />
         </section>
 
-        {/* Equity chart */}
-        <section>
-          <Card className="border-zinc-800 bg-zinc-950/70 p-6 rounded-none">
-            <div className="flex items-center justify-between mb-5">
-              <div>
-                <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono">Equity curve</div>
-                <div className="text-sm font-mono text-zinc-300 mt-1">{equity.length} sessions logged</div>
-              </div>
-            </div>
-            <div className="h-72">
-              {equity.length === 0 ? (
-                <div className="h-full grid place-items-center text-zinc-600 font-mono text-sm">
-                  No equity points yet — start the bot to begin logging.
-                </div>
-              ) : (
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={equityChartData} margin={{ top: 10, right: 20, left: 0, bottom: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                    <XAxis
-                      dataKey="t"
-                      type="number"
-                      domain={["dataMin", "dataMax"]}
-                      tickFormatter={(v) => fmtDateShort(v)}
-                      stroke="#52525b"
-                      style={{ fontSize: 11, fontFamily: "monospace" }}
-                    />
-                    <YAxis stroke="#52525b" style={{ fontSize: 11, fontFamily: "monospace" }} />
-                    <Tooltip
-                      contentStyle={{ background: "#0a0a0a", border: "1px solid #27272a", fontFamily: "monospace", fontSize: 12 }}
-                      labelFormatter={(v) => fmtDateTime(v)}
-                      formatter={(v) => fmtINR(v)}
-                    />
-                    <Line type="monotone" dataKey="peak" stroke="#71717a" strokeWidth={1.5} dot={false} strokeDasharray="4 4" />
-                    <Line type="monotone" dataKey="equity" stroke="#f59e0b" strokeWidth={2} dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
-              )}
-            </div>
-          </Card>
-        </section>
+        {/* v2.5 — Equity Curve widget REMOVED per user directive. */}
 
         {/* Tabs: trades + transitions */}
         <section>
@@ -1721,7 +1675,7 @@ function App() {
         </section>
 
         <footer className="text-center text-[10px] uppercase tracking-[0.2em] font-mono text-zinc-700 pt-8 pb-2">
-          Single-position FSM · 4-table SQLite ledger · ATR stops · drawdown-aware sizing
+          Single-position FSM · 4-table SQLite ledger · fixed-point execution
         </footer>
       </main>
 
@@ -1774,7 +1728,7 @@ function App() {
               current <span className="text-amber-300">{status?.trading_mode?.toUpperCase()}</span> mode
               and clears <span className="text-amber-300">all closed trades</span>.
               State transitions and indicators are kept.
-              <span className="block mt-2 text-zinc-500">Use this after switching modes so drawdown sizing starts fresh.</span>
+              <span className="block mt-2 text-zinc-500">Use this after switching modes so lot sizing starts fresh.</span>
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1848,9 +1802,9 @@ function App() {
               <ul className="list-disc list-inside mt-3 space-y-1 text-zinc-300">
                 <li>Engine: <span className="text-amber-300 uppercase">{engine}</span> (drives the SL/TP/Trail policy)</li>
                 <li>Lots: <span className="text-amber-300">{executionLots}</span> (fixed by capital · SIM ₹{Math.round(status?.broker_capital?.value || 0).toLocaleString("en-IN")})</li>
-                <li>Stop Loss: <span className="text-red-300">{status?.manual_sl_pct ?? 15}%</span> of fill price</li>
-                <li>Target: <span className="text-emerald-300">{status?.manual_tp_pct ?? 30}%</span> of fill price</li>
-                <li>Trailing step: <span className="text-amber-300">{status?.trail_step_pct ?? 10}%</span></li>
+                <li>Stop Loss: <span className="text-red-300">Entry − ₹{status?.fixed_sl_points ?? 11}</span></li>
+                <li>Target: <span className="text-emerald-300">Entry + ₹{status?.fixed_tp_points ?? 25}</span> (fixed)</li>
+                <li>Trail: arms after +₹{status?.fixed_trail_activation_points ?? 15}, then <span className="text-amber-300">High − ₹{status?.fixed_sl_points ?? 11}</span></li>
                 <li>Single-position lock + cooldown after exit</li>
               </ul>
             </AlertDialogDescription>

@@ -784,3 +784,60 @@ Combined bug fix + feature. Only lot-count arithmetic changes; SMC/execution/FSM
 ### Env flags
 - `RISK_PCT_DEFAULT` (default `2.5`) — bootstrap value if `bot_state.risk_pct` isn't set yet.
 
+
+## v2.5 — Execution Simplification & Dashboard Cleanup (2026-02-16)
+
+**Scope:** execution-layer + UI only. SMC engine, HTF, market structure, BOS, CHoCH, sweep, OB, FVG, premium/discount, ATR, regime, confidence, weights, grade, signal generation — ALL FROZEN AND UNMODIFIED. The engine still computes bos/market_structure exactly as before; those outputs simply no longer drive execution or Telegram.
+
+### Part 1 — BOS+Structure AUTO REMOVED
+- Deleted `_maybe_bos_structure_signal` on the bot and its call site from `_update_smc_score`.
+- Config flags `BOS_STRUCTURE_AUTO_ENABLED` + `BOS_STRUCTURE_ALERT_ENABLED` hardcoded to `False` (env override ignored). AUTO is now ONLY confidence ≥ `SMC_AUTO_TRADE_THRESHOLD` (Path A).
+
+### Part 2 — Telegram Simplified
+- Deleted `TelegramNotifier.send_bos_structure_signal`. Telegram now fires only for confidence-threshold matches (unchanged path).
+
+### Part 3 — Fixed-Point Execution
+- Added to `config.py`: `FIXED_SL_POINTS=11`, `FIXED_TP_POINTS=25`, `FIXED_TRAIL_ACTIVATION_POINTS=15` (env-overridable, never hardcoded).
+- `PositionManager.promote_to_open(fill)` now anchors on the ACTUAL filled premium:
+  - Initial SL = fill − 11
+  - Target = fill + 25 (fixed, active throughout)
+  - `trail_anchor = 0.0` sentinel (trailing not yet armed)
+- `PositionManager.maybe_trail_stop(current_premium)` rewritten:
+  - Below `entry + 15` → no change (initial SL holds).
+  - At/above `entry + 15` → running high-water mark maintained; stop lifted to `high − 11`. Only ever moves upward; pullbacks are ignored.
+- `_place_entry` computes provisional SL/TP the same way (re-anchored by `promote_to_open`).
+- `main.py` legacy `sl_pct/tp_pct/trail_step_pct` kwargs remain in the signature (backward compat) but are IGNORED.
+
+### Part 4 — Daily Loss = Risk × Capital
+- `RISK_PCT_DEFAULT` bumped 2.5 → 3.0.
+- Existing daily-loss suspension mechanism unchanged (realized-only, MAX_DAILY_LOSS reason, rollover clears next day).
+
+### Part 5 — Dashboard Cleanup
+- Removed **Peak** and **Drawdown** cells from Current FSM State card.
+- Removed **Equity Curve** chart section entirely.
+- Kept: Daily P&L, Total P&L, Win Rate, Trigger Statistics, Trade History, Execution Timeline, Indicator Advisory, SMC Advisory.
+- Position Sizing card now displays fixed-point execution parameters (Initial SL: Entry − ₹11 · Target: Entry + ₹25 · Trail arms at +₹15 · Trail SL: High − ₹11).
+- Trading Execution Mode text updated (no longer mentions BOS+Structure).
+- Manual entry confirmation modal / toast now shows fixed-point SL/TP.
+
+### API surface
+- `/api/bot/status` now includes: `fixed_sl_points`, `fixed_tp_points`, `fixed_trail_activation_points`.
+- `manual_sl_pct` / `manual_tp_pct` / `trail_step_pct` kept in the response for backward compat but the frontend no longer consumes them.
+
+### Regression
+- Deleted `tests/test_bos_structure_v23.py` (feature removed).
+- Rewrote 5 execution-correctness tests to reflect fixed-point SL/TP (89/125 instead of 85/130) and new trailing semantics.
+- Rewrote 2 FSM tests (`test_trailing_stop_arms_only_after_activation_and_lifts_stop`, `test_promote_to_open_uses_fixed_points_from_config`).
+- Added `tests/test_v25_execution_simplification.py` (13 tests): boundary math for SL/TP, activation gate, high-water tracking, no-downward invariant, config constants, method deletions, confidence-AUTO still wired.
+- **Full suite: 246/246 passing** (up from 233 after removing 12 obsolete BOS tests + adding 13 v2.5 tests + rewrites).
+
+### Verification of "no SMC changes"
+- `strategy/smc_engine.py` NOT touched (confirmed via git blame / diff).
+- SMC payload structure unchanged (`bos` + `market_structure` still emitted; they simply drive nothing on the execution side now).
+
+### Env flags (all backward-compatible)
+- `FIXED_SL_POINTS` (default `11`)
+- `FIXED_TP_POINTS` (default `25`)
+- `FIXED_TRAIL_ACTIVATION_POINTS` (default `15`)
+- `RISK_PCT_DEFAULT` (default `3.0`, was `2.5`)
+

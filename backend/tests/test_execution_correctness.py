@@ -156,8 +156,9 @@ def test_promote_to_open_carries_contract_identity():
     assert pos.lot_size == 65
     # SL/TP anchor to fill price (P0-3 downstream — verified elsewhere too)
     assert pos.entry_price == pytest.approx(124.70)
-    assert pos.stop_price == pytest.approx(124.70 * 0.85, rel=1e-6)
-    assert pos.target_price == pytest.approx(124.70 * 1.30, rel=1e-6)
+    # v2.5 — SL = fill − ₹11, TP = fill + ₹25 (fixed points from config)
+    assert pos.stop_price == pytest.approx(124.70 - 11.0, rel=1e-6)
+    assert pos.target_price == pytest.approx(124.70 + 25.0, rel=1e-6)
 
 
 # ─────────────────────────────────────────────── LIVE avg_price preference
@@ -205,8 +206,9 @@ def test_handle_fill_uses_avg_price_not_slot_price():
     pos = bot.positions.open_position
     assert pos is not None, "position should have been promoted"
     assert pos.entry_price == pytest.approx(100.0)
-    assert pos.stop_price == pytest.approx(85.0, rel=1e-6)
-    assert pos.target_price == pytest.approx(130.0, rel=1e-6)
+    # v2.5 — SL = 100 − 11 = 89, TP = 100 + 25 = 125
+    assert pos.stop_price == pytest.approx(89.0, rel=1e-6)
+    assert pos.target_price == pytest.approx(125.0, rel=1e-6)
 
 
 def test_handle_fill_falls_back_to_fill_price_when_avg_missing():
@@ -665,37 +667,41 @@ def test_promote_to_open_freezes_initial_sl_and_tp():
     )
     pm.register_pending_entry(p)
     pos = pm.promote_to_open(fill_price=100.0)
-    assert pos.initial_stop_price == pytest.approx(85.0)
-    assert pos.initial_target_price == pytest.approx(130.0)
+    # v2.5 — fixed points: SL = 100−11 = 89, TP = 100+25 = 125
+    assert pos.initial_stop_price == pytest.approx(89.0)
+    assert pos.initial_target_price == pytest.approx(125.0)
     assert pos.trail_bumps == 0
     assert pos.highest_ltp_seen == pytest.approx(100.0)
     assert pos.lowest_ltp_seen == pytest.approx(100.0)
 
 
 def test_maybe_trail_stop_increments_bump_counter():
-    """v1.9: every stop bump must increment `trail_bumps` so we can
-    distinguish 'stop untouched' from 'stop moved N times' after the fact."""
+    """v2.5: trailing arms only after +₹15; each fresh high past the
+    activation lifts the stop and increments trail_bumps."""
     pm = PositionManager()
     p = PendingEntry(
         order_id="O", direction=Direction.LONG,
         contract_symbol="X", contract_token="1",
         expected_price=100.0, lots=1, qty=65,
-        target_price=130.0, stop_price=85.0,
-        sl_pct=0.15, tp_pct=0.30, trail_step_pct=0.10,   # step = 10
+        target_price=125.0, stop_price=89.0,
     )
     pm.register_pending_entry(p)
     pos = pm.promote_to_open(fill_price=100.0)
     assert pos.trail_bumps == 0
-    # First bump: premium ≥ 110 → step of 10 → new stop 95
+    # Below activation (100 + 15 = 115) → no bump
+    assert pm.maybe_trail_stop(current_premium=114.99) is None
+    assert pos.trail_bumps == 0
+    # At activation → stop lifts to high − 11
     new_stop = pm.maybe_trail_stop(current_premium=115.0)
-    assert new_stop == pytest.approx(95.0)
+    assert new_stop == pytest.approx(104.0)
     assert pos.trail_bumps == 1
     # Same premium: no bump
     same = pm.maybe_trail_stop(current_premium=115.0)
     assert same is None
     assert pos.trail_bumps == 1
-    # Bigger jump: premium ≥ 125 relative to new anchor 110 → +10 bump
-    pm.maybe_trail_stop(current_premium=125.0)
+    # New high 120 → stop lifts to 109
+    pm.maybe_trail_stop(current_premium=120.0)
+    assert pos.stop_price == pytest.approx(109.0)
     assert pos.trail_bumps == 2
 
 
@@ -755,7 +761,8 @@ def test_finalize_exit_uses_trailing_stop_label_when_bumped():
     assert row["exit_trigger"] == "TRAILING_STOP"
     assert row["trail_bumps"] == 1
     assert row["final_stop_price"] == pytest.approx(79.895)
-    assert row["initial_sl_price"] == pytest.approx(71.485)
+    # v2.5 — initial SL = fill − ₹11 = 84.10 − 11 = 73.10
+    assert row["initial_sl_price"] == pytest.approx(73.10)
 
 
 def test_finalize_exit_keeps_stop_loss_label_when_never_bumped():
