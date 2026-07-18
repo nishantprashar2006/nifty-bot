@@ -1188,16 +1188,14 @@ function App() {
                 </span>
               </div>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               {triggerStats.per_trigger?.map((row) => {
                 const label = {
                   CONFIDENCE_THRESHOLD: "CONFIDENCE",
-                  BOS_STRUCTURE: "BOS+STRUCTURE",
                   MANUAL: "MANUAL",
                 }[row.trigger] || row.trigger;
                 const accent = {
                   CONFIDENCE_THRESHOLD: "border-emerald-800 text-emerald-300",
-                  BOS_STRUCTURE: "border-purple-800 text-purple-300",
                   MANUAL: "border-amber-800 text-amber-300",
                 }[row.trigger] || "border-zinc-800 text-zinc-400";
                 return (

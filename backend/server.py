@@ -1043,8 +1043,11 @@ def bot_trigger_stats(scope: str = "all") -> dict[str, Any]:
         ist = _dt.now(_tz.utc) + _td(hours=5, minutes=30)
         today_iso = ist.date().isoformat()
     rows = db.trigger_stats(today_iso)
-    # Ensure the three canonical triggers always appear, even with zero rows
-    canonical = ["CONFIDENCE_THRESHOLD", "BOS_STRUCTURE", "MANUAL"]
+    # v2.5 — BOS+Structure trigger removed. Filter out any historical
+    # rows so the dashboard doesn't render a stale/dead category.
+    rows = [r for r in rows if r["trigger"] != "BOS_STRUCTURE"]
+    # Ensure the two canonical triggers always appear, even with zero rows
+    canonical = ["CONFIDENCE_THRESHOLD", "MANUAL"]
     have = {r["trigger"] for r in rows}
     for t in canonical:
         if t not in have:
