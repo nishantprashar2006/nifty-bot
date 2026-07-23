@@ -73,7 +73,7 @@ ORDER_TIMEOUT_SEC = 20
 # pending; falls back cleanly to the 20s ORDER_TIMEOUT_SEC branch.
 PENDING_EARLY_RECONCILE_SEC = 5
 MAX_HOLD_TIME_MIN = 30
-REENTRY_BLOCK_MIN = 15           # directional cooldown on stop-out side
+REENTRY_BLOCK_MIN = 0           # v3.0: cooldown DISABLED — bot eligible immediately after exit
 COOLDOWN_AFTER_EXIT_MIN = 10     # post-exit system rest
 TRAILING_TRIGGER_STEP = 5.0      # premium points
 LIMIT_SLIP_BUFFER_PCT = 0.005    # 0.5% protective slip (only used in LIMIT mode)
@@ -143,6 +143,7 @@ class ExitReason(Enum):
     MANUAL = "MANUAL"
     REJECTED = "REJECTED"
     STALE_FEED = "STALE_FEED"                # quote stream frozen safety-exit
+    REVERSAL = "REVERSAL"                    # v3.0 — opposite SMC signal ≥ 25%
 
 
 # Stale-quote circuit breaker: force-exit if we have an open position and
@@ -231,10 +232,11 @@ try:
     SMC_ALERT_THRESHOLD: int = int(os.getenv("SMC_ALERT_THRESHOLD", "40"))
     # v1.15 — Auto trading uses the same signal threshold as advisory alerts.
     # Runtime toggle lives in `bot_state.auto_trade_enabled` (dashboard driven).
-    SMC_AUTO_TRADE_THRESHOLD: int = int(os.getenv("SMC_AUTO_TRADE_THRESHOLD", str(SMC_ALERT_THRESHOLD)))
+    # v3.0 — default threshold lowered 40 → 10 (Part 2 entry rule).
+    SMC_AUTO_TRADE_THRESHOLD: int = int(os.getenv("SMC_AUTO_TRADE_THRESHOLD", "10"))
 except ValueError:
     SMC_ALERT_THRESHOLD = 40
-    SMC_AUTO_TRADE_THRESHOLD = 40
+    SMC_AUTO_TRADE_THRESHOLD = 10
 
 # ────────────────────────────────────────────────────────────────────
 # 15. v2.3 Phase 2 — BOS + Structure dual-trigger AUTO path
@@ -262,20 +264,24 @@ BOS_STRUCTURE_ALERT_ENABLED: bool = False
 # Auto-resumes at the next IST calendar-day rollover.
 RISK_PCT_DEFAULT: float = float(os.getenv("RISK_PCT_DEFAULT", "3.0"))
 
+# v3.0 — Execution constants (fixed premium points).
+# Absolute ₹ points anchored on the ACTUAL filled premium.
+# SL = fill − FIXED_SL_POINTS, TP = fill + FIXED_TP_POINTS.
+# Both rounded DOWN (floor) to whole ₹ before placement.
+# Trailing stop REMOVED in v3.0 — TP or SL are the only exit levels.
+FIXED_SL_POINTS: float = float(os.getenv("FIXED_SL_POINTS", "6"))
+FIXED_TP_POINTS: float = float(os.getenv("FIXED_TP_POINTS", "12"))
+# Kept in the module namespace for backward-compat imports only; the
+# v3.0 execution layer never reads it (no trailing stop).
+FIXED_TRAIL_ACTIVATION_POINTS: float = float(os.getenv("FIXED_TRAIL_ACTIVATION_POINTS", "0"))
+
 # ────────────────────────────────────────────────────────────────────
-# 17. v2.5 — Fixed-point execution (₹ premium, not %)
+# 18. v3.0 — Simplified execution: entry + reversal
 # ────────────────────────────────────────────────────────────────────
-# Execution is now anchored to the ACTUAL FILLED entry premium and
-# expressed in absolute ₹ points, not percentages. Applies to both
-# manual and AUTO entries.
-#
-#   Initial Stop Loss  = fill − FIXED_SL_POINTS
-#   Fixed Target       = fill + FIXED_TP_POINTS  (active throughout)
-#   Trailing Stop      = (highest_premium − FIXED_SL_POINTS)
-#                        ACTIVATES only after premium moves
-#                        FIXED_TRAIL_ACTIVATION_POINTS above fill.
-#                        Only moves upward, never downward.
-FIXED_SL_POINTS: float = float(os.getenv("FIXED_SL_POINTS", "11"))
-FIXED_TP_POINTS: float = float(os.getenv("FIXED_TP_POINTS", "25"))
-FIXED_TRAIL_ACTIVATION_POINTS: float = float(os.getenv("FIXED_TRAIL_ACTIVATION_POINTS", "15"))
+# Entry gate: fresh completed-5m SMC signal AND confidence ≥ this.
+# Reversal gate: fresh completed-5m OPPOSITE-direction signal AND
+# confidence ≥ this. Both defaults kept as env-overridable so
+# operator can tune without touching code.
+SMC_ENTRY_THRESHOLD: int = int(os.getenv("SMC_ENTRY_THRESHOLD", "10"))
+SMC_REVERSAL_THRESHOLD: int = int(os.getenv("SMC_REVERSAL_THRESHOLD", "25"))
 

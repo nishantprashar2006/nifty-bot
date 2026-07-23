@@ -240,6 +240,9 @@ class NiftyOptionsBot:
         # Telegram nor stack retry attempts within a single 5m window.
         self._last_bos_structure_key: Optional[tuple] = None
         self._last_bos_structure_alert_key: Optional[tuple] = None
+        # v3.0 — reversal dedup. Ensures the same completed-5m SMC
+        # signal can never fire the reversal twice.
+        self._last_reversal_key: Optional[tuple] = None
 
     def _tl(self, trade_id: str, event_type: str, message: str, payload: Optional[dict] = None) -> None:
         """v1.10 — SAFE timeline logging shim.
@@ -1487,14 +1490,13 @@ class NiftyOptionsBot:
                 "quantity": qty,
             }
 
-        # v2.5 — Execution is now expressed in absolute ₹ points on the
-        # ACTUAL filled premium. SL = premium − FIXED_SL_POINTS,
-        # TP = premium + FIXED_TP_POINTS. Trailing activation and gap
-        # live on the OpenPosition (see promote_to_open + maybe_trail_stop).
-        # `sl_pct/tp_pct/trail_step_pct` kwargs are IGNORED but kept in the
-        # signature for backward-compatible callers.
-        target_px = premium + config.FIXED_TP_POINTS
-        stop_px = max(0.05, premium - config.FIXED_SL_POINTS)
+        # v3.0 — Execution SL/TP anchored on the ACTUAL filled premium and
+        # placed as whole ₹ orders (floored). `promote_to_open` re-computes
+        # them from the real fill once the entry completes; this provisional
+        # copy is only used for pre-fill order building.
+        import math as _math
+        target_px = _math.floor(premium + config.FIXED_TP_POINTS)
+        stop_px = max(1.0, _math.floor(premium - config.FIXED_SL_POINTS))
         # v1.13 — pre-flight margin check (advisory).
         # v2.0.1 — SIM MUST NEVER call live broker funds. Only run the
         # pre-flight when TRADING_MODE is live (execution against the real
@@ -2274,18 +2276,60 @@ class NiftyOptionsBot:
         # 2. Safety-suspended → refuse until operator resumes.
         if self._auto_suspended_reason:
             return
-        # 3. No existing position or pending order.
-        if self.positions.has_open_position or self.positions.has_pending_entry:
-            return
-        # 4. FSM must be IDLE (never fire from FORCED_EXIT / SHUTDOWN).
-        if self.state is not config.State.IDLE:
-            return
-        # 5. SMC signal must be actionable.
+        # 5. SMC signal must be actionable (evaluated early so the
+        # reversal branch below can consult direction/confidence).
         direction_str = smc_payload.get("direction")
         confidence = int(smc_payload.get("confidence") or 0)
         if direction_str not in ("CALL", "PUT"):
             return
-        if confidence < config.SMC_AUTO_TRADE_THRESHOLD:
+        # v3.0 Part 5 — REVERSAL. Only fires when a position is
+        # currently open, the SMC signal is on the OPPOSITE direction,
+        # confidence ≥ SMC_REVERSAL_THRESHOLD, and this SMC signal is
+        # fresh (dedup by generated_at). Never intrabar — the SMC
+        # engine only emits on completed 5m bars so freshness is
+        # already candle-anchored. Reversal is SEQUENTIAL: request the
+        # market exit and return; the new entry fires on the next
+        # SMC tick after the exit fill lands (positions.has_open_position
+        # is False by then).
+        pos = self.positions.open_position
+        if pos is not None:
+            cur_dir_str = "CALL" if pos.direction is config.Direction.LONG else "PUT"
+            opposite = (direction_str != cur_dir_str)
+            gen_at = str(smc_payload.get("generated_at") or smc_payload.get("timestamp") or "")
+            reversal_key = ("REVERSAL", cur_dir_str, direction_str, gen_at)
+            already_fired = getattr(self, "_last_reversal_key", None) == reversal_key
+            if (opposite
+                and confidence >= config.SMC_REVERSAL_THRESHOLD
+                and not already_fired
+                and self.state is config.State.POSITION_OPEN):
+                logger.critical(
+                    "REVERSAL: %s → %s (conf=%d%%) — exiting existing position first",
+                    cur_dir_str, direction_str, confidence,
+                )
+                self._last_reversal_key = reversal_key
+                self._exit_reason_hint = config.ExitReason.REVERSAL.value
+                try:
+                    from execution_timeline import Event as _Ev
+                    self._tl(pos.trade_id, _Ev.AUTO_ENTRY,
+                             f"Reversal signal {direction_str} @ {confidence}% — market exit",
+                             {"trigger": "REVERSAL",
+                              "from_direction": cur_dir_str,
+                              "to_direction": direction_str,
+                              "confidence": confidence})
+                except Exception:
+                    pass
+                # Route FSM to forced-exit; new entry will be picked up
+                # by the next _maybe_auto_entry tick after position closes.
+                self._transition(config.State.FORCED_EXIT)
+            return  # never open a second position while one is live
+        # 3. No existing position or pending order.
+        if self.positions.has_pending_entry:
+            return
+        # 4. FSM must be IDLE (never fire from FORCED_EXIT / SHUTDOWN).
+        if self.state is not config.State.IDLE:
+            return
+        # v3.0 — entry threshold check (10% by default).
+        if confidence < config.SMC_ENTRY_THRESHOLD:
             return
         # 6. Circuit breakers (single-position lock already handled above;
         # let _trip_circuit_breakers cover trade cap + ws health + PnL guard).

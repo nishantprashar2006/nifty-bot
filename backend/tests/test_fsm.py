@@ -130,7 +130,9 @@ def test_single_position_lock():
         pm.register_pending_entry(p)
 
 
-def test_directional_cooldown_after_stop():
+def test_directional_cooldown_disabled_v30():
+    """v3.0 — cooldown DISABLED (REENTRY_BLOCK_MIN=0). Bot must be
+    eligible for a new trade immediately after the previous one closes."""
     pm = PositionManager()
     p = PendingEntry(
         order_id="O1", direction=Direction.LONG, contract_symbol="X",
@@ -140,43 +142,35 @@ def test_directional_cooldown_after_stop():
     pm.register_pending_entry(p)
     pm.promote_to_open(100.0)
     pm.close_position(exit_was_stop=True)
-    assert pm.in_cooldown(Direction.LONG)
+    assert not pm.in_cooldown(Direction.LONG)
     assert not pm.in_cooldown(Direction.SHORT)
 
 
-def test_trailing_stop_arms_only_after_activation_and_lifts_stop():
-    """v2.5 — Trailing does NOT arm until premium moves +₹15 above fill.
-    Once armed, stop = highest_premium − ₹11 and only moves UPWARD."""
+def test_trailing_stop_is_removed_v30():
+    """v3.0 — trailing stop REMOVED. maybe_trail_stop is a no-op and
+    the initial SL from promote_to_open remains fixed for the trade
+    lifecycle regardless of premium movement."""
     pm = PositionManager()
     p = PendingEntry(
         order_id="O1", direction=Direction.LONG, contract_symbol="X",
         contract_token="T", expected_price=100, lots=1, qty=65,
-        target_price=125, stop_price=89,
+        target_price=112, stop_price=94,
     )
     pm.register_pending_entry(p)
     pos = pm.promote_to_open(100.0)
-    # Initial SL/TP wired from fill using ₹11 / ₹25 fixed points
-    assert pos.stop_price == 89.0
-    assert pos.target_price == 125.0
-    # Below activation → no trailing
-    assert pm.maybe_trail_stop(110.0) is None
-    assert pos.stop_price == 89.0
-    assert pm.maybe_trail_stop(114.99) is None
-    assert pos.stop_price == 89.0
-    # At activation → stop lifts to (high − ₹11)
-    new_stop = pm.maybe_trail_stop(115.0)
-    assert new_stop == 104.0
-    # Higher high → stop follows up
-    assert pm.maybe_trail_stop(120.0) == 109.0
-    assert pm.maybe_trail_stop(123.0) == 112.0
-    # Pullback below prior high → NO downward move
-    assert pm.maybe_trail_stop(118.0) is None
-    assert pos.stop_price == 112.0
+    # SL/TP wired via floor(fill ± fixed points) → 94 / 112
+    assert pos.stop_price == 94.0
+    assert pos.target_price == 112.0
+    # No matter how far premium runs, the stop stays fixed
+    for premium in (105, 110, 115, 120, 125, 150, 90, 80):
+        assert pm.maybe_trail_stop(premium) is None
+    assert pos.stop_price == 94.0
 
 
-# ──────────────────────────────────────────────── v2.5 fixed-point execution
-def test_promote_to_open_uses_fixed_points_from_config():
-    """SL = fill − ₹11, TP = fill + ₹25 regardless of pending SL/TP hints."""
+# ──────────────────────────────────────────────── v3.0 fixed-point execution
+def test_promote_to_open_uses_floored_fixed_points_from_config():
+    """v3.0 — SL = floor(fill − 6), TP = floor(fill + 12) regardless
+    of pending SL/TP hints or legacy percentage kwargs."""
     pm = PositionManager()
     p = PendingEntry(
         order_id="O1", direction=Direction.LONG, contract_symbol="X",
@@ -187,9 +181,9 @@ def test_promote_to_open_uses_fixed_points_from_config():
     )
     pm.register_pending_entry(p)
     pos = pm.promote_to_open(47.0)
-    assert pos.stop_price == 36.0
-    assert pos.target_price == 72.0
-    # trail_anchor sentinel — trailing not yet armed
+    assert pos.stop_price == 41.0
+    assert pos.target_price == 59.0
+    # trail_anchor sentinel — trailing never armed in v3.0
     assert pos.trail_anchor == 0.0
 
 
@@ -217,11 +211,11 @@ def test_synthetic_exit_thresholds_fire_correctly():
         return "HOLD"
 
     assert synth_decision(100.0) == "HOLD"
-    # v2.5 — after promote_to_open, target=125 and stop=89 (fixed points)
-    assert synth_decision(124.9) == "HOLD"
-    assert synth_decision(125.0) == "TARGET"
+    # v3.0 — after promote_to_open, target=112 and stop=94 (floored fixed points)
+    assert synth_decision(111.9) == "HOLD"
+    assert synth_decision(112.0) == "TARGET"
     assert synth_decision(150.0) == "TARGET"
-    assert synth_decision(89.0)  == "STOP"
+    assert synth_decision(94.0)  == "STOP"
     assert synth_decision(70.0)  == "STOP"
 
 

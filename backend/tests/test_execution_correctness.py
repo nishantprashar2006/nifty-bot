@@ -156,9 +156,9 @@ def test_promote_to_open_carries_contract_identity():
     assert pos.lot_size == 65
     # SL/TP anchor to fill price (P0-3 downstream — verified elsewhere too)
     assert pos.entry_price == pytest.approx(124.70)
-    # v2.5 — SL = fill − ₹11, TP = fill + ₹25 (fixed points from config)
-    assert pos.stop_price == pytest.approx(124.70 - 11.0, rel=1e-6)
-    assert pos.target_price == pytest.approx(124.70 + 25.0, rel=1e-6)
+    # v3.0 — SL = floor(fill − 6), TP = floor(fill + 12)
+    assert pos.stop_price == 118.0
+    assert pos.target_price == 136.0
 
 
 # ─────────────────────────────────────────────── LIVE avg_price preference
@@ -206,9 +206,9 @@ def test_handle_fill_uses_avg_price_not_slot_price():
     pos = bot.positions.open_position
     assert pos is not None, "position should have been promoted"
     assert pos.entry_price == pytest.approx(100.0)
-    # v2.5 — SL = 100 − 11 = 89, TP = 100 + 25 = 125
-    assert pos.stop_price == pytest.approx(89.0, rel=1e-6)
-    assert pos.target_price == pytest.approx(125.0, rel=1e-6)
+    # v3.0 — SL = floor(100 − 6) = 94, TP = floor(100 + 12) = 112
+    assert pos.stop_price == 94.0
+    assert pos.target_price == 112.0
 
 
 def test_handle_fill_falls_back_to_fill_price_when_avg_missing():
@@ -667,42 +667,31 @@ def test_promote_to_open_freezes_initial_sl_and_tp():
     )
     pm.register_pending_entry(p)
     pos = pm.promote_to_open(fill_price=100.0)
-    # v2.5 — fixed points: SL = 100−11 = 89, TP = 100+25 = 125
-    assert pos.initial_stop_price == pytest.approx(89.0)
-    assert pos.initial_target_price == pytest.approx(125.0)
+    # v3.0 — SL = 94, TP = 112 (floored fixed points)
+    assert pos.initial_stop_price == 94.0
+    assert pos.initial_target_price == 112.0
     assert pos.trail_bumps == 0
     assert pos.highest_ltp_seen == pytest.approx(100.0)
     assert pos.lowest_ltp_seen == pytest.approx(100.0)
 
 
 def test_maybe_trail_stop_increments_bump_counter():
-    """v2.5: trailing arms only after +₹15; each fresh high past the
-    activation lifts the stop and increments trail_bumps."""
+    """v3.0: trailing REMOVED — maybe_trail_stop always returns None and
+    trail_bumps stays 0 for the trade's entire lifecycle."""
     pm = PositionManager()
     p = PendingEntry(
         order_id="O", direction=Direction.LONG,
         contract_symbol="X", contract_token="1",
         expected_price=100.0, lots=1, qty=65,
-        target_price=125.0, stop_price=89.0,
+        target_price=112.0, stop_price=94.0,
     )
     pm.register_pending_entry(p)
     pos = pm.promote_to_open(fill_price=100.0)
+    for premium in (110.0, 115.0, 120.0, 130.0):
+        assert pm.maybe_trail_stop(current_premium=premium) is None
     assert pos.trail_bumps == 0
-    # Below activation (100 + 15 = 115) → no bump
-    assert pm.maybe_trail_stop(current_premium=114.99) is None
-    assert pos.trail_bumps == 0
-    # At activation → stop lifts to high − 11
-    new_stop = pm.maybe_trail_stop(current_premium=115.0)
-    assert new_stop == pytest.approx(104.0)
-    assert pos.trail_bumps == 1
-    # Same premium: no bump
-    same = pm.maybe_trail_stop(current_premium=115.0)
-    assert same is None
-    assert pos.trail_bumps == 1
-    # New high 120 → stop lifts to 109
-    pm.maybe_trail_stop(current_premium=120.0)
-    assert pos.stop_price == pytest.approx(109.0)
-    assert pos.trail_bumps == 2
+    # Stop price is frozen at initial value
+    assert pos.stop_price == 94.0
 
 
 def test_finalize_exit_uses_trailing_stop_label_when_bumped():
@@ -761,8 +750,8 @@ def test_finalize_exit_uses_trailing_stop_label_when_bumped():
     assert row["exit_trigger"] == "TRAILING_STOP"
     assert row["trail_bumps"] == 1
     assert row["final_stop_price"] == pytest.approx(79.895)
-    # v2.5 — initial SL = fill − ₹11 = 84.10 − 11 = 73.10
-    assert row["initial_sl_price"] == pytest.approx(73.10)
+    # v3.0 — initial SL = floor(fill − 6) = floor(84.10 − 6) = 78
+    assert row["initial_sl_price"] == pytest.approx(78.0)
 
 
 def test_finalize_exit_keeps_stop_loss_label_when_never_bumped():

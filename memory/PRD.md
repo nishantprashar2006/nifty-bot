@@ -841,3 +841,90 @@ Combined bug fix + feature. Only lot-count arithmetic changes; SMC/execution/FSM
 - `FIXED_TRAIL_ACTIVATION_POINTS` (default `15`)
 - `RISK_PCT_DEFAULT` (default `3.0`, was `2.5`)
 
+
+## v3.0 — Execution Layer Simplification (2026-02-16)
+
+**Scope:** execution layer + config only. SMC engine, HTF, market structure, BOS, CHoCH, sweep, OB, FVG, premium/discount, ATR, regime, confidence, weights, grade, signal generation — ALL FROZEN. `backend/strategy/smc_engine.py` last touched 2026-07-13, verified untouched via git.
+
+### Part 1 — One Position Only
+- Enforced pre-v3.0 via `PositionManager` single-position lock. No changes required.
+
+### Part 2 — Entry Rules (fresh SMC + conf ≥ 10%)
+- Added `SMC_ENTRY_THRESHOLD = 10` (env-overridable).
+- `SMC_AUTO_TRADE_THRESHOLD` default bumped 40 → 10 (backward-compat kept for existing callers).
+- `_maybe_auto_entry` now gates on `SMC_ENTRY_THRESHOLD`.
+- Cooldown DISABLED: `REENTRY_BLOCK_MIN` 15 → 0. The bot is eligible immediately after the previous trade closes.
+
+### Part 3 — Fixed Premium-Based Execution
+- `FIXED_SL_POINTS` 11 → 6 (env-overridable).
+- `FIXED_TP_POINTS` 25 → 12 (env-overridable).
+- `PositionManager.promote_to_open(fill)` now anchors on the ACTUAL fill and uses `math.floor` for BOTH legs:
+  - SL = `floor(fill − FIXED_SL_POINTS)` (safety-widened stop)
+  - TP = `floor(fill + FIXED_TP_POINTS)` (higher-probability target)
+  - SL clamped to minimum ₹1.
+  - Legacy `sl_pct/tp_pct/trail_step_pct/sl_points/tp_points` kwargs on `PendingEntry` ignored.
+- `_place_entry` computes provisional order legs the same way (re-anchored by `promote_to_open` on real fill).
+
+### Part 4 — No Trailing Stop
+- `PositionManager.maybe_trail_stop()` is now a permanent no-op. The stop set at `promote_to_open` is fixed for the trade lifecycle.
+- Exit only via: TP hit / SL hit / 15:10 forced square-off / reversal (Part 5).
+
+### Part 5 — Reversal Logic
+- New `_maybe_auto_entry` branch: if a position IS open AND the SMC signal is OPPOSITE direction AND `confidence ≥ SMC_REVERSAL_THRESHOLD` (25%) AND the signal is FRESH (dedup on `generated_at`), transition to `FORCED_EXIT` with `_exit_reason_hint = "REVERSAL"`. Sequential: exit fires, and the new entry is picked up by the next SMC tick after the exit lands.
+- Same-direction signals: ignored while a position is open.
+- Opposite signals below 25%: ignored.
+- Dedup: same `generated_at` can't fire the reversal twice.
+- New `ExitReason.REVERSAL = "REVERSAL"` enum value.
+
+### Part 6 — Lot Sizing (unchanged)
+- Fixed slabs untouched from v2.3. Single source of truth remains `main.py::calculate_execution_lots` — consumed by dashboard, `_place_entry`, `/api/bot/manual_lots`, timeline, telegram. `_compute_auto_risk_lots` continues to delegate to it.
+
+### Part 7 — Daily Loss Protection (unchanged behaviour, config only)
+- Risk% remains UI-editable (`bot_state.risk_pct`) — the ONLY source of truth. Backend never uses a hardcoded value: `_daily_risk_pct()` falls back to `RISK_PCT_DEFAULT` env var only when the operator hasn't set a value yet.
+- Realized-loss-only, auto-suspends AUTO, auto-resumes at next IST rollover, no Resume button.
+
+### Part 8 — Telegram (untouched)
+- No changes to `notifications/telegram.py`. Thresholds, formats, messages unchanged.
+
+### Part 9 — Time Rules (untouched)
+- Entry cutoff 14:55 IST, 15:10 square-off, intraday-only, candle reset, restart reconstruction all identical.
+
+### Part 10-11 — Trade History / Timeline (untouched)
+- Same columns, same rendering.
+
+### Config summary (v3.0)
+```
+FIXED_SL_POINTS = 6            # env: FIXED_SL_POINTS
+FIXED_TP_POINTS = 12           # env: FIXED_TP_POINTS
+FIXED_TRAIL_ACTIVATION_POINTS = 0   # deprecated, kept for import compat
+SMC_ENTRY_THRESHOLD = 10       # env: SMC_ENTRY_THRESHOLD
+SMC_REVERSAL_THRESHOLD = 25    # env: SMC_REVERSAL_THRESHOLD
+SMC_AUTO_TRADE_THRESHOLD = 10  # env: SMC_AUTO_TRADE_THRESHOLD (default lowered)
+REENTRY_BLOCK_MIN = 0          # cooldown disabled
+ExitReason.REVERSAL = "REVERSAL"
+```
+
+### Files modified
+- `backend/config.py` — new v3.0 constants, ExitReason.REVERSAL, deprecated trail flag.
+- `backend/strategy/position_manager.py` — `promote_to_open` uses floor rounding; `maybe_trail_stop` no-op.
+- `backend/main.py` — `_place_entry` uses floor rounding for order legs; `_maybe_auto_entry` adds reversal branch and lowered entry threshold; `_last_reversal_key` state.
+- `backend/tests/test_v25_execution_simplification.py` — DELETED (superseded).
+- `backend/tests/test_v30_execution_simplification.py` — NEW (18 tests: floor-rounding boundaries, trailing no-op, config sanity, reversal wiring).
+- `backend/tests/test_fsm.py` — 3 tests rewritten for v3.0 semantics (cooldown disabled, trailing removed, floored SL/TP).
+- `backend/tests/test_execution_correctness.py` — 5 tests updated with v3.0 SL/TP expected values.
+- `frontend/src/App.js` — Position Sizing card shows Entry−₹6 / Entry+₹12 / Trailing Disabled / Rounding Floor to ₹1. Manual entry toast/modal updated.
+
+### Regression
+- **Full suite: 251/251 passing** (was 246 before this release; +5 net after deletions/rewrites).
+- Verified via `git log -- backend/strategy/smc_engine.py`: last commit `06a92e1 2026-07-13`, untouched by any v2.x or v3.0 work.
+
+### Acceptance criteria verified
+- ✅ Confidence ≥10% (was ≥40%) triggers AUTO entry.
+- ✅ Position open + same direction → ignored.
+- ✅ Opposite signal, conf 21% → ignored.
+- ✅ Opposite signal, conf 31% → market exit + reversal enters new direction on next SMC tick.
+- ✅ Same-direction repeat signal after reversal → ignored (single-position lock).
+- ✅ SL/TP are floored whole ₹ numbers on the actual fill (100.25 → 94/112, 47 → 41/59, etc.).
+- ✅ Trailing stop removed — `maybe_trail_stop` returns None for all inputs, stop stays fixed.
+- ✅ No cooldown after any exit.
+

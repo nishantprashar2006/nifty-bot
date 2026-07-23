@@ -144,13 +144,16 @@ class PositionManager:
             if self._pending is None:
                 raise RuntimeError("No pending entry to promote.")
             p = self._pending
-            # v2.5 — SL/TP re-anchored to ACTUAL fill using fixed ₹
-            # points from config. Percentage/legacy point kwargs on the
-            # pending entry are IGNORED but preserved in the field so
-            # any consumer that still reads them sees zeros safely.
+            # v3.0 — SL/TP anchored on ACTUAL fill, expressed in whole
+            # ₹ points, both floored so:
+            #   SL = floor(fill − FIXED_SL_POINTS)  (wider stop → safer)
+            #   TP = floor(fill + FIXED_TP_POINTS)  (tighter target → higher fill prob)
+            # Legacy kwargs (sl_pct/tp_pct/trail_step_pct/sl_points/tp_points)
+            # on the pending entry are IGNORED.
+            import math
             import config as _cfg
-            target_price = fill_price + _cfg.FIXED_TP_POINTS
-            stop_price = max(0.05, fill_price - _cfg.FIXED_SL_POINTS)
+            stop_price = max(1.0, math.floor(fill_price - _cfg.FIXED_SL_POINTS))
+            target_price = math.floor(fill_price + _cfg.FIXED_TP_POINTS)
             pos = OpenPosition(
                 trade_id=f"T-{uuid.uuid4().hex[:10]}",
                 direction=p.direction,
@@ -160,24 +163,20 @@ class PositionManager:
                 lots=p.lots,
                 entry_price=fill_price,
                 entry_ts=datetime.now(timezone.utc),
-                target_price=target_price,
-                stop_price=stop_price,
+                target_price=float(target_price),
+                stop_price=float(stop_price),
                 # P0-4: carry the full contract identity from pending → open
                 strike=p.strike,
                 expiry=p.expiry,
                 option_type=p.option_type,
                 lot_size=p.lot_size,
-                # v2.5 — trail_anchor tracks the HIGHEST premium seen
-                # once trailing is armed. Sentinel 0.0 means "not yet
-                # armed" — maybe_trail_stop() only bumps once premium
-                # crosses fill + FIXED_TRAIL_ACTIVATION_POINTS.
+                # v3.0 — trailing stop REMOVED. `trail_anchor` sentinel
+                # kept for backward-compat in the dataclass but never
+                # updated by maybe_trail_stop (no-op).
                 trail_anchor=0.0,
-                trail_step_pct=0.0,  # legacy field; unused in v2.5
-                # v1.9 telemetry — freeze the initial protection state
-                # so audits can distinguish "initial SL hit" from
-                # "trailing SL hit" after N bumps.
-                initial_stop_price=stop_price,
-                initial_target_price=target_price,
+                trail_step_pct=0.0,
+                initial_stop_price=float(stop_price),
+                initial_target_price=float(target_price),
                 highest_ltp_seen=fill_price,
                 lowest_ltp_seen=fill_price,
             )
@@ -207,31 +206,12 @@ class PositionManager:
 
     # ------------------------------------------------------------- trailing
     def maybe_trail_stop(self, current_premium: float) -> Optional[float]:
-        """v2.5 — fixed-point trailing.
-
-        Trailing does NOT arm until premium moves at least
-        FIXED_TRAIL_ACTIVATION_POINTS above the actual fill.
-        Once armed, the stop is anchored to the HIGHEST premium
-        seen and lifted to `highest − FIXED_SL_POINTS`. The stop
-        only ever moves UPWARD, never downward.
+        """v3.0 — Trailing stop REMOVED. Kept as a no-op so existing
+        callers (main loop, tests) don't need to be rewritten. The
+        stop set at `promote_to_open` remains fixed for the trade's
+        entire lifecycle; exit is only via TP, SL, or 3:05 square-off.
         """
-        import config as _cfg
-        with self._lock:
-            pos = self._open
-            if pos is None:
-                return None
-            activation_price = pos.entry_price + _cfg.FIXED_TRAIL_ACTIVATION_POINTS
-            if current_premium < activation_price:
-                return None  # not yet armed — initial SL stays
-            # Update the running high-water mark.
-            if current_premium > pos.trail_anchor:
-                pos.trail_anchor = current_premium
-            candidate_stop = pos.trail_anchor - _cfg.FIXED_SL_POINTS
-            if candidate_stop > pos.stop_price:
-                pos.stop_price = candidate_stop
-                pos.trail_bumps += 1     # v1.9 telemetry
-                return pos.stop_price
-            return None
+        return None
 
     # ------------------------------------------------------------- cooldown
     def in_cooldown(self, direction: Direction) -> bool:

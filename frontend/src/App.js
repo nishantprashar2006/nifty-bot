@@ -315,7 +315,7 @@ function App() {
         reasons,
       });
       toast.success(`${direction} entry queued (#${data.cmd_id})`, {
-        description: `Engine: ${engine.toUpperCase()} · Lots: ${data.lots ?? executionLots} · SL Entry−₹${status?.fixed_sl_points ?? 11} / TP Entry+₹${status?.fixed_tp_points ?? 25} / Trail arms at +₹${status?.fixed_trail_activation_points ?? 15}`,
+        description: `Engine: ${engine.toUpperCase()} · Lots: ${data.lots ?? executionLots} · SL Entry−₹${status?.fixed_sl_points ?? 6} / TP Entry+₹${status?.fixed_tp_points ?? 12} (no trailing)`,
       });
       // v2.2 — Fixed Position Sizing is fully deterministic; no sticky
       // override to reset.
@@ -1012,14 +1012,13 @@ function App() {
               <div className="text-[10px] uppercase tracking-[0.2em] text-zinc-500 font-mono mb-2">Position Sizing (Fixed)</div>
               <div className="text-[10px] font-mono text-zinc-600">
                 Deterministic capital→lots mapping. SIM uses Simulation Capital · LIVE uses broker capital.{" "}
-                Execution: SL ₹{status?.fixed_sl_points ?? 11} · TP ₹{status?.fixed_tp_points ?? 25} ·
-                Trail arms at +₹{status?.fixed_trail_activation_points ?? 15} then follows high−₹{status?.fixed_sl_points ?? 11}.
+                Execution: SL ₹{status?.fixed_sl_points ?? 6} · TP ₹{status?.fixed_tp_points ?? 12}. No trailing stop.
               </div>
               <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] font-mono">
-                <div className="text-zinc-500">Initial SL:</div><div className="text-zinc-300">Entry − ₹{status?.fixed_sl_points ?? 11}</div>
-                <div className="text-zinc-500">Target:</div><div className="text-zinc-300">Entry + ₹{status?.fixed_tp_points ?? 25}</div>
-                <div className="text-zinc-500">Trail arms:</div><div className="text-zinc-300">At +₹{status?.fixed_trail_activation_points ?? 15}</div>
-                <div className="text-zinc-500">Trail SL:</div><div className="text-zinc-300">High − ₹{status?.fixed_sl_points ?? 11}</div>
+                <div className="text-zinc-500">Stop Loss:</div><div className="text-zinc-300">Entry − ₹{status?.fixed_sl_points ?? 6}</div>
+                <div className="text-zinc-500">Target:</div><div className="text-zinc-300">Entry + ₹{status?.fixed_tp_points ?? 12}</div>
+                <div className="text-zinc-500">Trailing:</div><div className="text-zinc-300">Disabled</div>
+                <div className="text-zinc-500">Rounding:</div><div className="text-zinc-300">Floor to ₹1</div>
               </div>
             </div>
             <div className="flex flex-wrap gap-3 text-xs font-mono">
@@ -1800,9 +1799,9 @@ function App() {
               <ul className="list-disc list-inside mt-3 space-y-1 text-zinc-300">
                 <li>Engine: <span className="text-amber-300 uppercase">{engine}</span> (drives the SL/TP/Trail policy)</li>
                 <li>Lots: <span className="text-amber-300">{executionLots}</span> (fixed by capital · SIM ₹{Math.round(status?.broker_capital?.value || 0).toLocaleString("en-IN")})</li>
-                <li>Stop Loss: <span className="text-red-300">Entry − ₹{status?.fixed_sl_points ?? 11}</span></li>
-                <li>Target: <span className="text-emerald-300">Entry + ₹{status?.fixed_tp_points ?? 25}</span> (fixed)</li>
-                <li>Trail: arms after +₹{status?.fixed_trail_activation_points ?? 15}, then <span className="text-amber-300">High − ₹{status?.fixed_sl_points ?? 11}</span></li>
+                <li>Stop Loss: <span className="text-red-300">Entry − ₹{status?.fixed_sl_points ?? 6}</span></li>
+                <li>Target: <span className="text-emerald-300">Entry + ₹{status?.fixed_tp_points ?? 12}</span> (fixed)</li>
+                <li>Trailing: <span className="text-zinc-500">Disabled (v3.0)</span></li>
                 <li>Single-position lock + cooldown after exit</li>
               </ul>
             </AlertDialogDescription>
